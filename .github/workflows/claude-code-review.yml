@@ -4,6 +4,9 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
+# Future jobs inherit no token authority unless they declare it explicitly.
+permissions: {}
+
 concurrency:
   # Every pushed head invalidates exact-head review evidence. Drafts are
   # intentionally included: they need early security feedback, and cancellation
