@@ -103,7 +103,7 @@ Create new proxy
     "content": {
         "user": {
             "user": <string>,
-            "metas": map<string>string
+            "metas": map<string>string,
             "run_id": <string>
         },
         "attempt_id": <string>,
@@ -196,9 +196,11 @@ the notification for as long as the FRPS process remains alive, using the exact
 same content, `attempt_id`, and request ID. Retry delay starts at 100 ms and
 doubles to a maximum of five seconds. A received HTTP response is terminal and
 is never retried, including a non-2xx status, an unreadable or malformed body,
-or a successful plugin response. Consumers must therefore make transport
-retries idempotent by `attempt_id` and return a response only after recording
-the close outcome in the state that governs their contract.
+or a successful plugin response. `CloseProxy` redirects are not followed; the
+first redirect response is itself a terminal non-2xx response. Consumers must
+therefore make transport retries idempotent by `attempt_id` and return a
+response only after recording the close outcome in the state that governs
+their contract.
 
 FRPS cancels the in-flight request and pending queue when it shuts down instead
 of attempting an unbounded drain. A plugin that maintains a live registration
@@ -209,7 +211,7 @@ snapshot must reconcile or unregister that snapshot in its own shutdown path.
     "content": {
         "user": {
             "user": <string>,
-            "metas": map<string>string
+            "metas": map<string>string,
             "run_id": <string>
         },
         "attempt_id": <string>,

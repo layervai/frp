@@ -142,18 +142,15 @@ func TestManagerCloseProxyAttemptIDCannotBeRewrittenByPluginResponses(t *testing
 	const attemptID = "0123456789abcdef0123456789abcdef"
 	manager := NewManager()
 	t.Cleanup(manager.Close)
-	delivered := make(chan struct{}, 2)
+	observedAttemptIDs := make(chan string, 2)
 	for _, name := range []string{"mutator", "observer"} {
 		manager.Register(&resultTestPlugin{
 			name:      name,
 			supported: []string{OpCloseProxy},
 			handle: func(_ context.Context, _ string, content any) (*Response, any, error) {
 				got := content.(CloseProxyContent)
-				if got.AttemptID != attemptID {
-					t.Fatalf("%s plugin AttemptID = %q, want immutable %q", name, got.AttemptID, attemptID)
-				}
+				observedAttemptIDs <- got.AttemptID
 				got.AttemptID = "aliased-attempt"
-				delivered <- struct{}{}
 				return &Response{Unchange: false}, &got, nil
 			},
 		})
@@ -168,7 +165,10 @@ func TestManagerCloseProxyAttemptIDCannotBeRewrittenByPluginResponses(t *testing
 	}
 	for range 2 {
 		select {
-		case <-delivered:
+		case got := <-observedAttemptIDs:
+			if got != attemptID {
+				t.Fatalf("CloseProxy plugin AttemptID = %q, want immutable %q", got, attemptID)
+			}
 		case <-time.After(time.Second):
 			t.Fatal("CloseProxy notification was not delivered")
 		}

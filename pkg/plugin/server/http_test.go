@@ -152,13 +152,33 @@ func TestHTTPPluginResponseWithClientErrorIsNotRetryable(t *testing.T) {
 		return errors.New("redirect rejected")
 	}
 
-	_, _, err := plugin.Handle(context.Background(), OpCloseProxy, CloseProxyContent{})
+	_, _, err := plugin.Handle(context.Background(), OpNewProxyResult, NewProxyResultContent{})
 	if err == nil {
 		t.Fatal("Handle() error = nil, want redirect-policy error")
 	}
 	var transportErr retryableNotificationTransportError
 	if errors.As(err, &transportErr) {
 		t.Fatalf("Handle() error = %v, must be terminal after receiving redirect response", err)
+	}
+	if got := transport.calls.Load(); got != 1 {
+		t.Fatalf("RoundTrip calls = %d, want 1", got)
+	}
+	if !body.closed.Load() {
+		t.Fatal("redirect response body was not closed")
+	}
+}
+
+func TestHTTPPluginDoesNotFollowCloseProxyRedirectResponses(t *testing.T) {
+	t.Parallel()
+
+	body := &closeTrackingBody{Reader: strings.NewReader("redirect")}
+	transport := &redirectRoundTripper{body: body}
+	plugin := NewHTTPPluginOptions(v1.HTTPPluginOptions{Addr: "http://plugin.invalid"}).(*httpPlugin)
+	plugin.client.Transport = transport
+
+	_, _, err := plugin.Handle(context.Background(), OpCloseProxy, CloseProxyContent{})
+	if err == nil || !strings.Contains(err.Error(), "error code: 302") {
+		t.Fatalf("Handle() error = %v, want terminal redirect status", err)
 	}
 	if got := transport.calls.Load(); got != 1 {
 		t.Fatalf("RoundTrip calls = %d, want 1", got)

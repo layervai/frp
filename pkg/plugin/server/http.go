@@ -45,12 +45,13 @@ type httpPlugin struct {
 	client *http.Client
 }
 
-// pluginNotificationTransportError marks a callback that failed before any
-// HTTP response was received. CloseProxy may retry this narrow failure class:
-// the plugin has not acknowledged the notification, and the immutable
-// attempt_id makes the qURL lifecycle consumer idempotent. Errors after an
-// HTTP response exists are deliberately unmarked because the plugin may have
-// already applied the notification; semantic responses are never retried.
+// pluginNotificationTransportError marks a callback for which http.Client
+// returned no response. CloseProxy does not follow redirects, so it may safely
+// retry this narrow failure class: the plugin has not acknowledged the
+// notification, and the immutable attempt_id makes the qURL lifecycle consumer
+// idempotent. Errors accompanied by a response are deliberately unmarked
+// because the plugin may have already applied the notification; semantic
+// responses are never retried.
 type pluginNotificationTransportError struct {
 	err error
 }
@@ -86,6 +87,14 @@ func NewHTTPPluginOptions(options v1.HTTPPluginOptions) Plugin {
 		url:     url,
 		client:  client,
 	}
+}
+
+// keepPluginRedirectResponse makes the first received CloseProxy response
+// terminal. Following a redirect could otherwise receive a response and then
+// surface a nil-response transport error from the redirected request, causing
+// CloseProxy to retry an already-acknowledged lifecycle notification.
+func keepPluginRedirectResponse(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
 }
 
 func (p *httpPlugin) Name() string {
@@ -125,7 +134,13 @@ func (p *httpPlugin) do(ctx context.Context, r *Request, res *Response) error {
 	req = req.WithContext(ctx)
 	req.Header.Set("X-Frp-Reqid", GetReqidFromContext(ctx))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := p.client.Do(req)
+	client := p.client
+	if r.Op == OpCloseProxy {
+		closeClient := *client
+		closeClient.CheckRedirect = keepPluginRedirectResponse
+		client = &closeClient
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		if resp == nil {
 			return &pluginNotificationTransportError{err: err}

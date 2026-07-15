@@ -266,6 +266,9 @@ func (m *Manager) startCloseProxyWorker() bool {
 func (m *Manager) runCloseProxyWorker() {
 	defer m.closeProxyWorkerWG.Done()
 	for {
+		// Give shutdown priority over a buffered task. A single select could
+		// randomly drain queued notifications after cancellation, contrary to
+		// the bounded-shutdown contract.
 		select {
 		case <-m.closeProxyCtx.Done():
 			return
@@ -331,11 +334,7 @@ func (m *Manager) deliverCloseProxy(task closeProxyNotification) {
 // errors are aggregated only for logging/observability and do not rewrite the
 // NewProxy response sent to the client.
 func (m *Manager) NewProxyResult(content *NewProxyResultContent) error {
-	return m.notifyPlugins(m.newProxyResultPlugins, OpNewProxyResult, *content)
-}
-
-func (m *Manager) notifyPlugins(plugins []Plugin, op string, content any) error {
-	if len(plugins) == 0 {
+	if len(m.newProxyResultPlugins) == 0 {
 		return nil
 	}
 
@@ -345,16 +344,16 @@ func (m *Manager) notifyPlugins(plugins []Plugin, op string, content any) error 
 	ctx := xlog.NewContext(context.Background(), xl)
 	ctx = NewReqidContext(ctx, reqid)
 
-	for _, p := range plugins {
-		_, _, err := p.Handle(ctx, op, content)
+	for _, p := range m.newProxyResultPlugins {
+		_, _, err := p.Handle(ctx, OpNewProxyResult, *content)
 		if err != nil {
-			xl.Warnf("send %s request to plugin [%s] error: %v", op, p.Name(), err)
+			xl.Warnf("send %s request to plugin [%s] error: %v", OpNewProxyResult, p.Name(), err)
 			errs = append(errs, fmt.Sprintf("[%s]: %v", p.Name(), err))
 		}
 	}
 
 	if len(errs) > 0 {
-		return fmt.Errorf("send %s request to plugin errors: %s", op, strings.Join(errs, "; "))
+		return fmt.Errorf("send %s request to plugin errors: %s", OpNewProxyResult, strings.Join(errs, "; "))
 	}
 	return nil
 }
