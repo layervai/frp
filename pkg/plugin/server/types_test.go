@@ -17,7 +17,28 @@ package server
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/fatedier/frp/pkg/msg"
 )
+
+func TestNewProxyContentAttemptIDWireFormat(t *testing.T) {
+	t.Parallel()
+
+	content := NewProxyContent{
+		User:      UserInfo{RunID: "0123456789abcdef"},
+		AttemptID: "0123456789abcdef0123456789abcdef",
+		NewProxy:  msg.NewProxy{ProxyName: "proxy-exact", ProxyType: "tcp"},
+	}
+	got, err := json.Marshal(content)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	const want = `{"user":{"user":"","metas":null,"run_id":"0123456789abcdef"},` +
+		`"attempt_id":"0123456789abcdef0123456789abcdef","proxy_name":"proxy-exact","proxy_type":"tcp"}`
+	if string(got) != want {
+		t.Fatalf("NewProxyContent JSON = %s, want %s", got, want)
+	}
+}
 
 func TestNewProxyResultContentWireFormat(t *testing.T) {
 	t.Parallel()
@@ -28,6 +49,7 @@ func TestNewProxyResultContentWireFormat(t *testing.T) {
 			Metas: map[string]string{"key": "value"},
 			RunID: " 0123456789abcdef ",
 		},
+		AttemptID: "0123456789abcdef0123456789abcdef",
 		ProxyName: " proxy-Exact ",
 		Admitted:  false,
 	}
@@ -35,7 +57,8 @@ func TestNewProxyResultContentWireFormat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("json.Marshal() error = %v", err)
 	}
-	const want = `{"user":{"user":"exact-user","metas":{"key":"value"},"run_id":" 0123456789abcdef "},"proxy_name":" proxy-Exact ","admitted":false}`
+	const want = `{"user":{"user":"exact-user","metas":{"key":"value"},"run_id":" 0123456789abcdef "},` +
+		`"attempt_id":"0123456789abcdef0123456789abcdef","proxy_name":" proxy-Exact ","admitted":false}`
 	if string(got) != want {
 		t.Fatalf("NewProxyResultContent JSON = %s, want %s", got, want)
 	}

@@ -56,7 +56,7 @@ func TestManagerNewProxyResultIgnoresResponsesAndNotifiesAllPlugins(t *testing.T
 				if !ok {
 					t.Fatalf("content type = %T, want NewProxyResultContent", content)
 				}
-				if got.User.RunID != "0123456789abcdef" || got.ProxyName != "proxy-exact" || !got.Admitted {
+				if got.User.RunID != "0123456789abcdef" || got.AttemptID != "0123456789abcdef0123456789abcdef" || got.ProxyName != "proxy-exact" || !got.Admitted {
 					t.Fatalf("content = %+v, want exact admitted identity", got)
 				}
 				// Notification responses are deliberately non-authoritative.
@@ -67,6 +67,7 @@ func TestManagerNewProxyResultIgnoresResponsesAndNotifiesAllPlugins(t *testing.T
 
 	err := manager.NewProxyResult(&NewProxyResultContent{
 		User:      UserInfo{RunID: "0123456789abcdef"},
+		AttemptID: "0123456789abcdef0123456789abcdef",
 		ProxyName: "proxy-exact",
 		Admitted:  true,
 	})
@@ -75,6 +76,42 @@ func TestManagerNewProxyResultIgnoresResponsesAndNotifiesAllPlugins(t *testing.T
 	}
 	if !slices.Equal(called, []string{"first", "second"}) {
 		t.Fatalf("notification order = %v, want [first second]", called)
+	}
+}
+
+func TestManagerNewProxyPreservesAttemptIDAcrossMutationChain(t *testing.T) {
+	t.Parallel()
+
+	const attemptID = "0123456789abcdef0123456789abcdef"
+	manager := NewManager()
+	manager.Register(&resultTestPlugin{
+		name:      "mutator",
+		supported: []string{OpNewProxy},
+		handle: func(_ context.Context, _ string, content any) (*Response, any, error) {
+			modified := content.(NewProxyContent)
+			modified.AttemptID = "aliased-attempt"
+			modified.ProxyName = "modified-proxy"
+			return &Response{Unchange: false}, &modified, nil
+		},
+	})
+	manager.Register(&resultTestPlugin{
+		name:      "observer",
+		supported: []string{OpNewProxy},
+		handle: func(_ context.Context, _ string, content any) (*Response, any, error) {
+			got := content.(NewProxyContent)
+			if got.AttemptID != attemptID {
+				t.Fatalf("second plugin AttemptID = %q, want immutable %q", got.AttemptID, attemptID)
+			}
+			return &Response{Unchange: true}, nil, nil
+		},
+	})
+
+	got, err := manager.NewProxy(&NewProxyContent{AttemptID: attemptID})
+	if err != nil {
+		t.Fatalf("NewProxy() error = %v", err)
+	}
+	if got.AttemptID != attemptID || got.ProxyName != "modified-proxy" {
+		t.Fatalf("NewProxy() content = %+v, want immutable attempt ID and mutable proxy name", got)
 	}
 }
 

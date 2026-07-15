@@ -45,14 +45,19 @@ type UserInfo struct {
 
 type NewProxyContent struct {
 	User UserInfo `json:"user"`
+	// AttemptID is immutable FRPS-owned correlation state. It is generated
+	// before the first NewProxy plugin call and repeated in NewProxyResult.
+	AttemptID string `json:"attempt_id"`
 	msg.NewProxy
 }
 
 // NewProxyResultContent reports the final FRPS admission outcome for one
-// NewProxy attempt after the NewProxy plugin chain has run. User.RunID and
-// ProxyName are preserved byte-for-byte from the effective NewProxy content
-// (or the original content when the plugin chain rejects it). Admitted is true
-// only after RegisterProxy completes successfully.
+// NewProxy attempt after the NewProxy plugin chain has run. AttemptID is the
+// immutable, cryptographically random identifier FRPS minted before invoking
+// the NewProxy plugin chain. User.RunID and ProxyName are preserved byte-for-
+// byte from the effective NewProxy content (or the original content when the
+// plugin chain rejects it). Admitted is true only after RegisterProxy completes
+// successfully.
 //
 // This is a notification, not another admission hook: plugin responses cannot
 // change the outcome. Consumers that prepare external state during NewProxy can
@@ -60,6 +65,7 @@ type NewProxyContent struct {
 // treating a failed admission as a CloseProxy event.
 type NewProxyResultContent struct {
 	User      UserInfo `json:"user"`
+	AttemptID string   `json:"attempt_id"`
 	ProxyName string   `json:"proxy_name"`
 	Admitted  bool     `json:"admitted"`
 }

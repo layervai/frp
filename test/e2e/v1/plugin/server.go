@@ -1,7 +1,9 @@
 package plugin
 
 import (
+	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/onsi/ginkgo/v2"
@@ -225,11 +227,17 @@ var _ = ginkgo.Describe("[Feature: Server-Plugins]", func() {
 			}
 
 			names := map[string]bool{}
+			attemptIDs := map[string]bool{}
 			admitted := 0
 			failed := 0
 			var runID string
 			for _, result := range got {
 				names[result.ProxyName] = true
+				framework.ExpectEqual(32, len(result.AttemptID))
+				framework.ExpectEqual(strings.ToLower(result.AttemptID), result.AttemptID)
+				_, err := hex.DecodeString(result.AttemptID)
+				framework.ExpectNoError(err)
+				attemptIDs[result.AttemptID] = true
 				framework.ExpectNotEqual("", result.User.RunID)
 				if runID == "" {
 					runID = result.User.RunID
@@ -243,6 +251,7 @@ var _ = ginkgo.Describe("[Feature: Server-Plugins]", func() {
 			}
 			framework.ExpectTrue(names["result-first"])
 			framework.ExpectTrue(names["result-second"])
+			framework.ExpectEqual(2, len(attemptIDs))
 			framework.ExpectEqual(1, admitted)
 			framework.ExpectEqual(1, failed)
 		})

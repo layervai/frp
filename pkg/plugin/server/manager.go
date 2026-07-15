@@ -108,6 +108,7 @@ func (m *Manager) NewProxy(content *NewProxyContent) (*NewProxyContent, error) {
 	if len(m.newProxyPlugins) == 0 {
 		return content, nil
 	}
+	attemptID := content.AttemptID
 
 	var (
 		res = &Response{
@@ -133,6 +134,10 @@ func (m *Manager) NewProxy(content *NewProxyContent) (*NewProxyContent, error) {
 		}
 		if !res.Unchange {
 			content = retContent.(*NewProxyContent)
+			// AttemptID is FRPS-owned correlation state, not mutable proxy
+			// configuration. Preserve it across every plugin in the chain so a
+			// response cannot alias a later NewProxyResult to another attempt.
+			content.AttemptID = attemptID
 		}
 	}
 	return content, nil

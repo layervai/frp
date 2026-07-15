@@ -106,6 +106,7 @@ Create new proxy
             "metas": map<string>string
             "run_id": <string>
         },
+        "attempt_id": <string>,
         "proxy_name": <string>,
         "proxy_type": <string>,
         "use_encryption": <bool>,
@@ -147,10 +148,13 @@ registration completed successfully.
 
 This operation is a notification. Its response cannot reject or modify the
 already-decided result. A plugin that prepares external state during `NewProxy`
-can use the exact, unnormalized `user.run_id` and `proxy_name` to commit that
-state when `admitted` is true or roll it back when false. A failed admission is
-not a `CloseProxy`: FRPS only sends `CloseProxy` for a proxy that was actually
-registered and later closed.
+can use `attempt_id` to correlate that preparation with this final result, then
+commit the exact, unnormalized `user.run_id` and `proxy_name` state when
+`admitted` is true or roll it back when false. FRPS generates a fresh
+cryptographically random 128-bit lowercase-hex `attempt_id` before invoking the
+`NewProxy` plugin chain and does not allow plugin responses to change it. A
+failed admission is not a `CloseProxy`: FRPS only sends `CloseProxy` for a proxy
+that was actually registered and later closed.
 
 ```
 {
@@ -160,6 +164,7 @@ registered and later closed.
             "metas": map<string>string,
             "run_id": <string>
         },
+        "attempt_id": <string>,
         "proxy_name": <string>,
         "admitted": <bool>
     }

@@ -16,6 +16,7 @@ package server
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"slices"
 	"strings"
@@ -46,12 +47,16 @@ func TestProcessNewProxyAttemptReportsSuccessfulAdmissionSynchronously(t *testin
 	t.Parallel()
 
 	var order []string
+	var preparedAttemptID string
 	var result plugin.NewProxyResultContent
 	manager := plugin.NewManager()
 	manager.Register(&controlResultPlugin{handle: func(op string, content any) (*plugin.Response, any, error) {
 		switch op {
 		case plugin.OpNewProxy:
 			order = append(order, "plugin")
+			prepared := content.(plugin.NewProxyContent)
+			assertValidNewProxyAttemptID(t, prepared.AttemptID)
+			preparedAttemptID = prepared.AttemptID
 			return &plugin.Response{Unchange: true}, nil, nil
 		case plugin.OpNewProxyResult:
 			order = append(order, "result")
@@ -82,7 +87,7 @@ func TestProcessNewProxyAttemptReportsSuccessfulAdmissionSynchronously(t *testin
 	if effective.ProxyName != "proxy-Exact" || remoteAddr != "127.0.0.1:8080" {
 		t.Fatalf("effective = %+v, remoteAddr = %q", effective, remoteAddr)
 	}
-	if result.User.RunID != "0123456789abcdef" || result.ProxyName != "proxy-Exact" || !result.Admitted {
+	if result.User.RunID != "0123456789abcdef" || result.AttemptID != preparedAttemptID || result.ProxyName != "proxy-Exact" || !result.Admitted {
 		t.Fatalf("result = %+v, want exact admitted identity", result)
 	}
 	if !slices.Equal(order, []string{"plugin", "register", "result"}) {
@@ -95,12 +100,17 @@ func TestProcessNewProxyAttemptReportsRegisterFailureOnce(t *testing.T) {
 
 	registerErr := errors.New("proxy registration failed")
 	resultCount := 0
+	var preparedAttemptID string
 	manager := plugin.NewManager()
 	manager.Register(&controlResultPlugin{handle: func(op string, content any) (*plugin.Response, any, error) {
-		if op == plugin.OpNewProxyResult {
+		switch op {
+		case plugin.OpNewProxy:
+			preparedAttemptID = content.(plugin.NewProxyContent).AttemptID
+			assertValidNewProxyAttemptID(t, preparedAttemptID)
+		case plugin.OpNewProxyResult:
 			resultCount++
 			result := content.(plugin.NewProxyResultContent)
-			if result.User.RunID != "fedcba9876543210" || result.ProxyName != "proxy-failed" || result.Admitted {
+			if result.User.RunID != "fedcba9876543210" || result.AttemptID != preparedAttemptID || result.ProxyName != "proxy-failed" || result.Admitted {
 				t.Fatalf("result = %+v, want exact failed identity", result)
 			}
 		}
@@ -125,15 +135,18 @@ func TestProcessNewProxyAttemptReportsPluginRejectionWithoutRegistering(t *testi
 
 	registerCalled := false
 	resultCount := 0
+	var preparedAttemptID string
 	manager := plugin.NewManager()
 	manager.Register(&controlResultPlugin{handle: func(op string, content any) (*plugin.Response, any, error) {
 		switch op {
 		case plugin.OpNewProxy:
+			preparedAttemptID = content.(plugin.NewProxyContent).AttemptID
+			assertValidNewProxyAttemptID(t, preparedAttemptID)
 			return &plugin.Response{Reject: true, RejectReason: "denied"}, nil, nil
 		case plugin.OpNewProxyResult:
 			resultCount++
 			result := content.(plugin.NewProxyResultContent)
-			if result.User.RunID != "0123456789abcdef" || result.ProxyName != "proxy-denied" || result.Admitted {
+			if result.User.RunID != "0123456789abcdef" || result.AttemptID != preparedAttemptID || result.ProxyName != "proxy-denied" || result.Admitted {
 				t.Fatalf("result = %+v, want original rejected identity", result)
 			}
 			return &plugin.Response{}, nil, nil
@@ -165,17 +178,21 @@ func TestProcessNewProxyAttemptReportsPluginRejectionWithoutRegistering(t *testi
 func TestProcessNewProxyAttemptUsesEffectivePluginIdentity(t *testing.T) {
 	t.Parallel()
 
+	var preparedAttemptID string
 	manager := plugin.NewManager()
 	manager.Register(&controlResultPlugin{handle: func(op string, content any) (*plugin.Response, any, error) {
 		switch op {
 		case plugin.OpNewProxy:
 			modified := content.(plugin.NewProxyContent)
+			preparedAttemptID = modified.AttemptID
+			assertValidNewProxyAttemptID(t, preparedAttemptID)
 			modified.User.RunID = "effective-run-id"
 			modified.ProxyName = "effective-proxy"
+			modified.AttemptID = "aliased-attempt"
 			return &plugin.Response{Unchange: false}, &modified, nil
 		case plugin.OpNewProxyResult:
 			result := content.(plugin.NewProxyResultContent)
-			if result.User.RunID != "effective-run-id" || result.ProxyName != "effective-proxy" || !result.Admitted {
+			if result.User.RunID != "effective-run-id" || result.AttemptID != preparedAttemptID || result.ProxyName != "effective-proxy" || !result.Admitted {
 				t.Fatalf("result = %+v, want effective admitted identity", result)
 			}
 			return &plugin.Response{}, nil, nil
@@ -200,6 +217,97 @@ func TestProcessNewProxyAttemptUsesEffectivePluginIdentity(t *testing.T) {
 	}
 	if effective.ProxyName != "effective-proxy" {
 		t.Fatalf("effective ProxyName = %q", effective.ProxyName)
+	}
+}
+
+func TestProcessNewProxyAttemptIDsAreFresh(t *testing.T) {
+	t.Parallel()
+
+	manager := plugin.NewManager()
+	var prepared []string
+	var results []string
+	manager.Register(&controlResultPlugin{handle: func(op string, content any) (*plugin.Response, any, error) {
+		switch op {
+		case plugin.OpNewProxy:
+			attemptID := content.(plugin.NewProxyContent).AttemptID
+			assertValidNewProxyAttemptID(t, attemptID)
+			prepared = append(prepared, attemptID)
+			return &plugin.Response{Unchange: true}, nil, nil
+		case plugin.OpNewProxyResult:
+			attemptID := content.(plugin.NewProxyResultContent).AttemptID
+			assertValidNewProxyAttemptID(t, attemptID)
+			results = append(results, attemptID)
+			return &plugin.Response{}, nil, nil
+		default:
+			t.Fatalf("unexpected op %q", op)
+			return nil, nil, nil
+		}
+	}})
+
+	for _, proxyName := range []string{"proxy-first", "proxy-second"} {
+		_, _, admissionErr, resultErr := processNewProxyAttempt(
+			manager,
+			newResultTestContent("0123456789abcdef", proxyName),
+			func(*msg.NewProxy) (string, error) { return "", nil },
+		)
+		if admissionErr != nil || resultErr != nil {
+			t.Fatalf("processNewProxyAttempt(%q) errors = admission %v, result %v", proxyName, admissionErr, resultErr)
+		}
+	}
+	if len(prepared) != 2 || len(results) != 2 || prepared[0] != results[0] || prepared[1] != results[1] {
+		t.Fatalf("attempt correlation = prepared %v, results %v", prepared, results)
+	}
+	if prepared[0] == prepared[1] {
+		t.Fatalf("attempt IDs were reused: %q", prepared[0])
+	}
+}
+
+func TestProcessNewProxyAttemptIDGenerationFailureFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	generationErr := errors.New("entropy unavailable")
+	pluginCalled := false
+	registerCalled := false
+	manager := plugin.NewManager()
+	manager.Register(&controlResultPlugin{handle: func(string, any) (*plugin.Response, any, error) {
+		pluginCalled = true
+		return &plugin.Response{Unchange: true}, nil, nil
+	}})
+	content := newResultTestContent("0123456789abcdef", "proxy-no-id")
+	effective, remoteAddr, admissionErr, resultErr := processNewProxyAttemptWithIDGenerator(
+		manager,
+		content,
+		func(*msg.NewProxy) (string, error) {
+			registerCalled = true
+			return "", nil
+		},
+		func() (string, error) { return "", generationErr },
+	)
+	if !errors.Is(admissionErr, generationErr) || !strings.Contains(admissionErr.Error(), "generate NewProxy attempt ID") {
+		t.Fatalf("admission error = %v, want explicit wrapped generation error", admissionErr)
+	}
+	if resultErr != nil || remoteAddr != "" || effective.ProxyName != "proxy-no-id" {
+		t.Fatalf("result = effective %+v, remoteAddr %q, resultErr %v", effective, remoteAddr, resultErr)
+	}
+	if content.AttemptID != "" || pluginCalled || registerCalled {
+		t.Fatalf("generation failure side effects: attemptID=%q pluginCalled=%v registerCalled=%v", content.AttemptID, pluginCalled, registerCalled)
+	}
+}
+
+func TestGenerateNewProxyAttemptIDFormatAndUniqueness(t *testing.T) {
+	t.Parallel()
+
+	seen := make(map[string]struct{}, 64)
+	for range 64 {
+		attemptID, err := generateNewProxyAttemptID()
+		if err != nil {
+			t.Fatalf("generateNewProxyAttemptID() error = %v", err)
+		}
+		assertValidNewProxyAttemptID(t, attemptID)
+		if _, duplicate := seen[attemptID]; duplicate {
+			t.Fatalf("generateNewProxyAttemptID() reused %q", attemptID)
+		}
+		seen[attemptID] = struct{}{}
 	}
 }
 
@@ -249,5 +357,15 @@ func newResultTestContent(runID, proxyName string) *plugin.NewProxyContent {
 			ProxyName: proxyName,
 			ProxyType: "tcp",
 		},
+	}
+}
+
+func assertValidNewProxyAttemptID(t *testing.T, attemptID string) {
+	t.Helper()
+	if len(attemptID) != 32 || attemptID != strings.ToLower(attemptID) {
+		t.Fatalf("AttemptID = %q, want 32 lowercase hexadecimal characters", attemptID)
+	}
+	if _, err := hex.DecodeString(attemptID); err != nil {
+		t.Fatalf("AttemptID = %q, want hexadecimal: %v", attemptID, err)
 	}
 }

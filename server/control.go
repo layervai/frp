@@ -16,6 +16,8 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"runtime/debug"
@@ -405,7 +407,10 @@ func (ctl *Control) handleNewProxy(m msg.Message) {
 	_ = ctl.msgDispatcher.Send(resp)
 }
 
-type registerProxyFunc func(*msg.NewProxy) (string, error)
+type (
+	registerProxyFunc     func(*msg.NewProxy) (string, error)
+	newProxyAttemptIDFunc func() (string, error)
+)
 
 // processNewProxyAttempt runs the mutable NewProxy plugin chain, attempts FRPS
 // registration when the chain accepts, then synchronously emits exactly one
@@ -420,6 +425,21 @@ func processNewProxyAttempt(
 	content *plugin.NewProxyContent,
 	register registerProxyFunc,
 ) (effectiveMsg *msg.NewProxy, remoteAddr string, admissionErr, resultErr error) {
+	return processNewProxyAttemptWithIDGenerator(manager, content, register, generateNewProxyAttemptID)
+}
+
+func processNewProxyAttemptWithIDGenerator(
+	manager *plugin.Manager,
+	content *plugin.NewProxyContent,
+	register registerProxyFunc,
+	generateAttemptID newProxyAttemptIDFunc,
+) (effectiveMsg *msg.NewProxy, remoteAddr string, admissionErr, resultErr error) {
+	attemptID, err := generateAttemptID()
+	if err != nil {
+		return &content.NewProxy, "", fmt.Errorf("generate NewProxy attempt ID: %w", err), nil
+	}
+	content.AttemptID = attemptID
+
 	effectiveContent := content
 	retContent, admissionErr := manager.NewProxy(content)
 	if admissionErr == nil {
@@ -429,10 +449,19 @@ func processNewProxyAttempt(
 
 	resultErr = manager.NewProxyResult(&plugin.NewProxyResultContent{
 		User:      effectiveContent.User,
+		AttemptID: attemptID,
 		ProxyName: effectiveContent.ProxyName,
 		Admitted:  admissionErr == nil,
 	})
 	return &effectiveContent.NewProxy, remoteAddr, admissionErr, resultErr
+}
+
+func generateNewProxyAttemptID() (string, error) {
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(random[:]), nil
 }
 
 func (ctl *Control) handlePing(m msg.Message) {
