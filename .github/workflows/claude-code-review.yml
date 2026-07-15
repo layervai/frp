@@ -23,36 +23,12 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    env:
-      # Defense in depth: the automatic path denies Bash entirely, and this
-      # also prevents any future scoped subprocess from inheriting secrets.
-      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1'
     permissions:
       contents: read
       issues: read
       pull-requests: write
 
     steps:
-      - name: Install Claude subprocess isolation dependencies
-        # Keep package installation outside the untrusted checkout and before
-        # the Anthropic secret enters a step.
-        run: |
-          set -euo pipefail
-          # Track the declared runner series' current security packages instead
-          # of pinning versions that Ubuntu removes from its rolling mirrors.
-          # Mirror/package failure stops before checkout or secret exposure.
-          for attempt in 1 2 3; do
-            if sudo apt-get update -qq &&
-              sudo apt-get install -y --no-install-recommends bubblewrap socat; then
-              break
-            fi
-            if [[ "$attempt" == 3 ]]; then
-              echo "::error::Unable to install Claude isolation dependencies after $attempt attempts."
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
-
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
