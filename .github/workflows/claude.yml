@@ -39,16 +39,12 @@ jobs:
       )
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    env:
-      # Tag mode needs narrowly-scoped local git commands. Force Claude Code's
-      # subprocess scrub even for trusted write actors so API/GitHub secrets
-      # are not inherited by those commands.
-      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1'
     permissions:
       # Review-only by design: this multi-event job needs both write scopes to
       # reply on pull requests and issues. The token scopes themselves are
       # broader; the enforced boundary is Claude's explicit tool allowlist,
-      # which exposes review comments but no close, label, edit, or push tool.
+      # which exposes review comments but no GitHub close, label,
+      # metadata-edit, merge, or push tool.
       contents: read
       pull-requests: write
       issues: write
@@ -131,27 +127,6 @@ jobs:
             echo "checkout_allowed=true"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Install Claude subprocess isolation dependencies
-        # Runs before any pull-request checkout and before the Anthropic secret
-        # enters a step. Claude Code requires both tools when its subprocess
-        # environment scrub is enabled on Linux.
-        run: |
-          set -euo pipefail
-          # Track the declared runner series' current security packages instead
-          # of pinning versions that Ubuntu removes from its rolling mirrors.
-          # Mirror/package failure stops before checkout or secret exposure.
-          for attempt in 1 2 3; do
-            if sudo apt-get update -qq &&
-              sudo apt-get install -y --no-install-recommends bubblewrap socat; then
-              break
-            fi
-            if [[ "$attempt" == 3 ]]; then
-              echo "::error::Unable to install Claude isolation dependencies after $attempt attempts."
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
-
       - name: Checkout repository
         id: checkout
         # Security invariant: this condition must remain implicitly
@@ -168,7 +143,7 @@ jobs:
           # Review one immutable pull-request snapshot. Ordinary issue commands
           # use the default-branch event SHA.
           ref: ${{ steps.claude_pr.outputs.sha != '' && steps.claude_pr.outputs.sha || github.sha }}
-          fetch-depth: ${{ steps.claude_pr.outputs.sha != '' && '0' || '1' }}
+          fetch-depth: 1
           persist-credentials: false
 
       - name: Run Claude Code
@@ -183,10 +158,9 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
           exclude_comments_by_actor: 'claude,github-actions,*[bot]'
-          # Commands are review-only. GitHub reads use the pinned action's MCP
-          # container, which receives the repository token but not the
-          # Anthropic key. Tag mode owns its scoped terminal comment. Local
-          # shell access stays limited to read-only git inspection; use the
-          # API-backed pull-request diff instead of an ambiguous detached-HEAD
-          # local diff.
-          claude_args: '--model claude-opus-4-8 --allowed-tools "Bash(git status:*),Bash(git log:*),Bash(git show:*),Bash(git rev-parse:*),mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github_inline_comment__create_inline_comment"'
+          # Commands are review-only. GitHub reads and inline feedback use the
+          # pinned action's MCP containers, which receive the repository token
+          # but not the Anthropic key. Tag mode owns its scoped terminal
+          # comment. Explicitly denying Bash overrides tag mode's generic git
+          # conveniences and removes the final secret-bearing shell boundary.
+          claude_args: '--model claude-opus-4-8 --disallowed-tools "Bash" --allowed-tools "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github_inline_comment__create_inline_comment"'
