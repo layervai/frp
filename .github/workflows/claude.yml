@@ -86,6 +86,34 @@ jobs:
 
           echo "authorized=true" >> "$GITHUB_OUTPUT"
 
+      - name: Materialize trusted Claude input validators
+        id: claude_validators
+        env:
+          VALIDATOR_SOURCE: |
+            validate_sha() {
+              local name="$1" sha="$2"
+              if [[ ! "$sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+                echo "::error::Invalid $name SHA."
+                return 1
+              fi
+            }
+            validate_ref() {
+              local name="$1" ref="$2"
+              if [[ ! "$ref" =~ ^[A-Za-z0-9@][A-Za-z0-9/_.#+,@-]*$ ]] ||
+                [[ "$ref" == "@" ]] ||
+                ! git check-ref-format "refs/heads/$ref" 2>/dev/null; then
+                echo "::error::Invalid $name ref."
+                return 1
+              fi
+            }
+        run: |
+          set -euo pipefail
+
+          validator_path="$RUNNER_TEMP/claude-input-validators.sh"
+          umask 077
+          printf '%s\n' "$VALIDATOR_SOURCE" > "$validator_path"
+          echo "path=$validator_path" >> "$GITHUB_OUTPUT"
+
       - name: Resolve Claude pull request context
         id: claude_pr
         if: |
@@ -95,10 +123,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
-          COMMIT_COUNT_QUERY: >-
-            query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){commits{totalCount}}}}
+          VALIDATORS: ${{ steps.claude_validators.outputs.path }}
         run: |
           set -euo pipefail
+          # shellcheck source=/dev/null
+          source "$VALIDATORS"
 
           if [[ -z "$PR_NUMBER" ]]; then
             echo "::error::Unable to resolve pull request number for Claude command."
@@ -114,22 +143,6 @@ jobs:
           head_ref="$(jq -r '.head.ref // ""' <<<"$pr")"
           base_sha="$(jq -r '.base.sha // ""' <<<"$pr")"
           base_ref="$(jq -r '.base.ref // ""' <<<"$pr")"
-          repo_owner="${GITHUB_REPOSITORY%%/*}"
-          repo_name="${GITHUB_REPOSITORY#*/}"
-          # Match the pinned action's GraphQL commits.totalCount. The REST
-          # pull-request object's commits field is capped at 250 and would make
-          # the fetch rehearsal diverge on a larger pull request. Matching depth
-          # proves action parity; it is not needed for object availability once
-          # the already-fetched snapshots have been pushed into the local origin.
-          if ! commit_count="$(gh api graphql \
-            -f query="$COMMIT_COUNT_QUERY" \
-            -F owner="$repo_owner" \
-            -F repo="$repo_name" \
-            -F number="$PR_NUMBER" \
-            --jq '.data.repository.pullRequest.commits.totalCount // ""')"; then
-            echo "::error::Unable to resolve pull request commit count; failing closed before checkout."
-            exit 1
-          fi
 
           # The job carries ANTHROPIC_API_KEY and a token that can write only
           # review comments. Never checkout a fork head across that boundary.
@@ -140,31 +153,14 @@ jobs:
             echo "::error::Claude command checkout is limited to same-repository pull requests."
             exit 1
           fi
-          # GitHub uses SHA-1 today; accept the documented SHA-256 object shape
-          # as well so a future repository-format migration still fails closed
-          # on every other value. Keep these validators aligned with the
-          # post-checkout validate_* functions, which also cover issue commands.
-          for named_sha in "head:$head_sha" "base:$base_sha"; do
-            name="${named_sha%%:*}"
-            sha="${named_sha#*:}"
-            if [[ ! "$sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
-              echo "::error::Invalid pull request $name SHA: $sha"
-              exit 1
-            fi
-          done
-          for named_ref in "head:$head_ref" "base:$base_ref"; do
-            name="${named_ref%%:*}"
-            ref="${named_ref#*:}"
-            # Mirror the pinned action's stricter branch-name grammar before it
-            # performs an unqualified fetch. git-check-ref-format alone permits
-            # leading characters (for example '+') that the action rejects.
-            if [[ ! "$ref" =~ ^[A-Za-z0-9@][A-Za-z0-9/_.#+,@-]*$ ]] ||
-              [[ "$ref" == "@" ]] ||
-              ! git check-ref-format "refs/heads/$ref" 2>/dev/null; then
-              echo "::error::Invalid pull request $name ref: $ref"
-              exit 1
-            fi
-          done
+          # SHA-1/SHA-256 shapes and the pinned action's stricter branch grammar
+          # are defined once in the trusted validator library used again after
+          # checkout. The ref grammar rejects leading '+' even though Git itself
+          # accepts it, because the pinned action's unqualified fetch does not.
+          validate_sha "pull request head" "$head_sha"
+          validate_sha "pull request base" "$base_sha"
+          validate_ref "pull request head" "$head_ref"
+          validate_ref "pull request base" "$base_ref"
           # The two immutable snapshots become distinct branches in the local
           # bare origin. Reject equality and directory/file prefix collisions
           # explicitly instead of leaving a malformed API response to fail with
@@ -175,18 +171,11 @@ jobs:
             echo "::error::Pull request head and base refs must be distinct and non-overlapping."
             exit 1
           fi
-          if [[ ! "$commit_count" =~ ^[0-9]+$ ]]; then
-            echo "::error::Invalid pull request commit count: $commit_count"
-            exit 1
-          fi
-          fetch_depth=$((commit_count > 20 ? commit_count : 20))
-
           {
             echo "sha=$head_sha"
             echo "head_ref=$head_ref"
             echo "base_sha=$base_sha"
             echo "base_ref=$base_ref"
-            echo "fetch_depth=$fetch_depth"
             echo "checkout_allowed=true"
           } >> "$GITHUB_OUTPUT"
 
@@ -229,37 +218,24 @@ jobs:
           PR_HEAD_REF: ${{ steps.claude_pr.outputs.head_ref }}
           PR_BASE_SHA: ${{ steps.claude_pr.outputs.base_sha }}
           PR_BASE_REF: ${{ steps.claude_pr.outputs.base_ref }}
-          PR_FETCH_DEPTH: ${{ steps.claude_pr.outputs.fetch_depth }}
           ISSUE_SHA: ${{ github.sha }}
           ISSUE_REF: ${{ github.event.repository.default_branch }}
+          VALIDATORS: ${{ steps.claude_validators.outputs.path }}
         run: |
           set -euo pipefail
-
-          validate_sha() {
-            # Keep this grammar aligned with Resolve Claude pull request context.
-            local name="$1" sha="$2"
-            if [[ ! "$sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
-              echo "::error::Invalid $name SHA: $sha"
-              exit 1
-            fi
-          }
-          validate_ref() {
-            # Keep this grammar aligned with Resolve Claude pull request context.
-            local name="$1" ref="$2"
-            if [[ ! "$ref" =~ ^[A-Za-z0-9@][A-Za-z0-9/_.#+,@-]*$ ]] ||
-              [[ "$ref" == "@" ]] ||
-              ! git check-ref-format "refs/heads/$ref" 2>/dev/null; then
-              echo "::error::Invalid $name ref: $ref"
-              exit 1
-            fi
-          }
+          # shellcheck source=/dev/null
+          source "$VALIDATORS"
 
           if [[ "$PR_MODE" == "true" ]]; then
             head_sha="$PR_HEAD_SHA"
             head_ref="$PR_HEAD_REF"
             base_sha="$PR_BASE_SHA"
             base_ref="$PR_BASE_REF"
-            fetch_depth="$PR_FETCH_DEPTH"
+            # The pinned action uses max(PR commit count, 20). A depth-20 proof
+            # exercises the same option/ref shape; the local origin already has
+            # complete reachable history, so a larger depth cannot affect auth
+            # or ref resolution.
+            fetch_depth=20
           else
             # Issue commands start from the event's immutable default-branch
             # snapshot. The pinned action's later same-ref fetch stays on this
@@ -282,10 +258,6 @@ jobs:
           if [[ "$PR_MODE" == "true" ]]; then
             validate_sha "Claude base" "$base_sha"
             validate_ref "Claude base" "$base_ref"
-            if [[ ! "$fetch_depth" =~ ^[0-9]+$ ]] || ((fetch_depth < 20)); then
-              echo "::error::Invalid Claude pull request fetch depth: $fetch_depth"
-              exit 1
-            fi
             git cat-file -e "$base_sha^{commit}"
             push_refspecs+=("${base_sha}:refs/heads/${base_ref}")
             default_ref="$base_ref"
@@ -334,9 +306,11 @@ jobs:
             fi
           fi
 
-          # Exercise the exact fetch shapes used by the pinned action before
-          # handing it control. Ref validation above makes the unqualified
-          # branch arguments safe from option/refspec injection. These --depth
+          # Exercise the pinned action's fetch shapes before handing it control.
+          # The action's setup head fetch intentionally lacks
+          # --no-recurse-submodules; only its trusted-base restore adds that
+          # flag, so the asymmetry below is deliberate. Ref validation makes
+          # the unqualified branch arguments safe from option/refspec injection. These --depth
           # fetches (and the action's repeats) make the working repository
           # shallow. That cannot truncate review context because this workflow
           # denies every local file/git tool and reads the complete PR diff via
@@ -392,7 +366,10 @@ jobs:
           # those explicitly too. On every pin change, re-derive the complete
           # injected write-tool set from tag mode and re-audit the action's
           # local-origin/configureGitAuth behavior; do not append by guesswork.
-          claude_args: '--model claude-opus-4-8 --disallowed-tools "Bash,Read,Glob,Grep,Task,Edit,Write,NotebookEdit,WebFetch,WebSearch,mcp__github_file_ops__commit_files,mcp__github_file_ops__delete_files,mcp__github__delete_file" --allowed-tools "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_file_contents,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github_inline_comment__create_inline_comment"'
+          claude_args: >-
+            --model claude-opus-4-8
+            --disallowed-tools "Bash,Read,Glob,Grep,Task,Edit,Write,NotebookEdit,WebFetch,WebSearch,mcp__github_file_ops__commit_files,mcp__github_file_ops__delete_files,mcp__github__delete_file"
+            --allowed-tools "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_file_contents,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github_inline_comment__create_inline_comment"
 
       - name: Verify credential-free Claude origin
         # This postcondition is intentionally always() checked after the action:
