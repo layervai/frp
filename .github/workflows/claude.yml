@@ -39,6 +39,11 @@ jobs:
       )
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      # Tag mode needs narrowly-scoped local git commands. Force Claude Code's
+      # subprocess scrub even for trusted write actors so API/GitHub secrets
+      # are not inherited by those commands.
+      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1'
     permissions:
       # Review-only by design: this multi-event job needs both write scopes to
       # reply on pull requests and issues, but Claude's tool allowlist exposes
@@ -112,7 +117,10 @@ jobs:
             echo "::error::Claude command checkout is limited to same-repository pull requests."
             exit 1
           fi
-          if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+          # GitHub uses SHA-1 today; accept the documented SHA-256 object shape
+          # as well so a future repository-format migration still fails closed
+          # on every other value.
+          if [[ ! "$head_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
             echo "::error::Invalid pull request head SHA: $head_sha"
             exit 1
           fi
@@ -153,7 +161,10 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
           exclude_comments_by_actor: 'claude,github-actions,*[bot]'
-          # Commands are review-only. Pre-approve repository inspection and
-          # GitHub comment reads/writes, but never repository scripts, tests,
-          # package managers, interpreters, or arbitrary shell execution.
-          claude_args: '--model claude-opus-4-8 --allowed-tools "Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(git show:*),Bash(git rev-parse:*),Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
+          # Commands are review-only. GitHub reads use the pinned action's MCP
+          # container, which receives the repository token but not the
+          # Anthropic key. Tag mode owns its scoped terminal comment. Local
+          # shell access stays limited to read-only git inspection; use the
+          # API-backed pull-request diff instead of an ambiguous detached-HEAD
+          # local diff.
+          claude_args: '--model claude-opus-4-8 --allowed-tools "Bash(git status:*),Bash(git log:*),Bash(git show:*),Bash(git rev-parse:*),mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests"'

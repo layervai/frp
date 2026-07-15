@@ -2,7 +2,7 @@ name: Claude Code Review
 
 on:
   pull_request:
-    types: [opened, synchronize]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
   # Every pushed head invalidates exact-head review evidence. Drafts are
@@ -22,6 +22,10 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      # Defense in depth: the automatic path denies Bash entirely, and this
+      # also prevents any future scoped subprocess from inheriting secrets.
+      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1'
     permissions:
       contents: read
       issues: read
@@ -63,11 +67,12 @@ jobs:
             Apply the review guidance in AGENTS.md when available, but do not
             attempt its repository build, test, or lint commands: this workflow
             deliberately withholds repository execution tools. State any
-            verification limits. Use `gh pr comment` to publish the review.
+            verification limits. Publish the final review as a pull-request
+            comment with the allowed GitHub add_issue_comment tool.
 
-          # Unlike the interactive command path, automatic review reads the
-          # diff through gh and does not need local git. No repository command,
-          # script, test, package manager, interpreter, or arbitrary shell
-          # command is available while the pull-request checkout and
-          # write-capable comment token share this job.
-          claude_args: '--model claude-opus-4-8 --allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
+          # Automatic review uses the pinned action's GitHub MCP container for
+          # all reads and the final comment. That subprocess receives only the
+          # repository token; it never receives the Anthropic API key. Bash is
+          # explicitly denied, so pull-request content cannot turn a permitted
+          # command prefix into environment-secret exfiltration.
+          claude_args: '--model claude-opus-4-8 --disallowed-tools "Bash" --allowed-tools "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github__add_issue_comment"'
