@@ -206,6 +206,7 @@ jobs:
           git push --quiet "$local_origin" \
             "${HEAD_SHA}:refs/heads/${HEAD_REF}" \
             "${BASE_SHA}:refs/heads/${BASE_REF}"
+          git --git-dir="$local_origin" symbolic-ref HEAD "refs/heads/${BASE_REF}"
           git remote set-url origin "$local_origin"
 
           if git config --local --get-regexp '^http\..*\.extraheader$' >/dev/null 2>&1; then
@@ -228,10 +229,11 @@ jobs:
           fi
           # Exercise the credential-free ref fetch before handing control to
           # the action. Use a fully qualified ref so an untrusted branch name
-          # can never be parsed as an option. The action performs its own
-          # bounded-depth fetch next; do not shallow this complete checkout twice.
+          # can never be parsed as an option for the base proof. The head ref's
+          # leading-dash guard above makes the action's exact unqualified fetch
+          # form safe to exercise. Do not shallow this complete checkout twice.
           git fetch --no-tags origin "refs/heads/${BASE_REF}"
-          git fetch --no-tags origin "refs/heads/${HEAD_REF}"
+          git fetch --no-tags origin "$HEAD_REF"
           echo "ready=true" >> "$GITHUB_OUTPUT"
 
       - name: Run Claude Code
