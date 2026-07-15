@@ -166,9 +166,13 @@ jobs:
             fi
           done
           # The two immutable snapshots become distinct branches in the local
-          # bare origin; a shared ref would make one overwrite the other.
-          if [[ "$head_ref" == "$base_ref" ]]; then
-            echo "::error::Pull request head and base refs must be distinct."
+          # bare origin. Reject equality and directory/file prefix collisions
+          # explicitly instead of leaving a malformed API response to fail with
+          # an opaque refs/heads/foo vs refs/heads/foo/bar Git error.
+          if [[ "$head_ref" == "$base_ref" ]] ||
+            [[ "$head_ref" == "$base_ref/"* ]] ||
+            [[ "$base_ref" == "$head_ref/"* ]]; then
+            echo "::error::Pull request head and base refs must be distinct and non-overlapping."
             exit 1
           fi
           if [[ ! "$commit_count" =~ ^[0-9]+$ ]]; then
