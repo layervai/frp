@@ -235,8 +235,8 @@ jobs:
             fetch_depth="$PR_FETCH_DEPTH"
           else
             # Issue commands start from the event's immutable default-branch
-            # snapshot. If the default branch changes mid-run, the pinned action
-            # will fail against this origin instead of crossing snapshots.
+            # snapshot. The pinned action's later same-ref fetch stays on this
+            # local snapshot even if the public default branch moves mid-run.
             head_sha="$ISSUE_SHA"
             head_ref="$ISSUE_REF"
             base_sha=""
@@ -307,9 +307,11 @@ jobs:
           # Exercise the exact fetch shapes used by the pinned action before
           # handing it control. Ref validation above makes the unqualified
           # branch arguments safe from option/refspec injection.
-          git fetch origin "--depth=$fetch_depth" "$head_ref"
           if [[ "$PR_MODE" == "true" ]]; then
+            git fetch origin "--depth=$fetch_depth" "$head_ref"
             git fetch origin "$base_ref" --depth=1 --no-recurse-submodules
+          else
+            git fetch origin "$head_ref" --depth=1
           fi
 
           if [[ "$(git rev-parse "refs/remotes/origin/$head_ref")" != "$head_sha" ]]; then
