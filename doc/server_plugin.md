@@ -181,6 +181,11 @@ the result callback therefore completes or times out before FRPS returns the
 
 A previously created proxy is closed.
 
+`attempt_id` is the same immutable FRPS-generated value that accompanied the
+successful `NewProxy` and `NewProxyResult` callbacks for this proxy. Consumers
+must use it to distinguish a delayed close from a replacement that reuses the
+same `user.run_id` and `proxy_name`.
+
 Please note that one request will be sent for every proxy that is closed, do **NOT** use this
 if you have too many proxies bound to a single client, as this may exhaust the server's resources.
 
@@ -192,6 +197,7 @@ if you have too many proxies bound to a single client, as this may exhaust the s
             "metas": map<string>string
             "run_id": <string>
         },
+        "attempt_id": <string>,
         "proxy_name": <string>
     }
 }
