@@ -25,22 +25,24 @@ import (
 )
 
 type Manager struct {
-	loginPlugins       []Plugin
-	newProxyPlugins    []Plugin
-	closeProxyPlugins  []Plugin
-	pingPlugins        []Plugin
-	newWorkConnPlugins []Plugin
-	newUserConnPlugins []Plugin
+	loginPlugins          []Plugin
+	newProxyPlugins       []Plugin
+	newProxyResultPlugins []Plugin
+	closeProxyPlugins     []Plugin
+	pingPlugins           []Plugin
+	newWorkConnPlugins    []Plugin
+	newUserConnPlugins    []Plugin
 }
 
 func NewManager() *Manager {
 	return &Manager{
-		loginPlugins:       make([]Plugin, 0),
-		newProxyPlugins:    make([]Plugin, 0),
-		closeProxyPlugins:  make([]Plugin, 0),
-		pingPlugins:        make([]Plugin, 0),
-		newWorkConnPlugins: make([]Plugin, 0),
-		newUserConnPlugins: make([]Plugin, 0),
+		loginPlugins:          make([]Plugin, 0),
+		newProxyPlugins:       make([]Plugin, 0),
+		newProxyResultPlugins: make([]Plugin, 0),
+		closeProxyPlugins:     make([]Plugin, 0),
+		pingPlugins:           make([]Plugin, 0),
+		newWorkConnPlugins:    make([]Plugin, 0),
+		newUserConnPlugins:    make([]Plugin, 0),
 	}
 }
 
@@ -50,6 +52,9 @@ func (m *Manager) Register(p Plugin) {
 	}
 	if p.IsSupport(OpNewProxy) {
 		m.newProxyPlugins = append(m.newProxyPlugins, p)
+	}
+	if p.IsSupport(OpNewProxyResult) {
+		m.newProxyResultPlugins = append(m.newProxyResultPlugins, p)
 	}
 	if p.IsSupport(OpCloseProxy) {
 		m.closeProxyPlugins = append(m.closeProxyPlugins, p)
@@ -134,7 +139,20 @@ func (m *Manager) NewProxy(content *NewProxyContent) (*NewProxyContent, error) {
 }
 
 func (m *Manager) CloseProxy(content *CloseProxyContent) error {
-	if len(m.closeProxyPlugins) == 0 {
+	return m.notifyPlugins(m.closeProxyPlugins, OpCloseProxy, *content)
+}
+
+// NewProxyResult synchronously notifies every interested plugin of the final
+// FRPS admission outcome. Responses are deliberately ignored: unlike NewProxy,
+// this operation reports an outcome that has already been decided. Transport
+// errors are aggregated only for logging/observability and do not rewrite the
+// NewProxy response sent to the client.
+func (m *Manager) NewProxyResult(content *NewProxyResultContent) error {
+	return m.notifyPlugins(m.newProxyResultPlugins, OpNewProxyResult, *content)
+}
+
+func (m *Manager) notifyPlugins(plugins []Plugin, op string, content any) error {
+	if len(plugins) == 0 {
 		return nil
 	}
 
@@ -144,16 +162,16 @@ func (m *Manager) CloseProxy(content *CloseProxyContent) error {
 	ctx := xlog.NewContext(context.Background(), xl)
 	ctx = NewReqidContext(ctx, reqid)
 
-	for _, p := range m.closeProxyPlugins {
-		_, _, err := p.Handle(ctx, OpCloseProxy, *content)
+	for _, p := range plugins {
+		_, _, err := p.Handle(ctx, op, content)
 		if err != nil {
-			xl.Warnf("send CloseProxy request to plugin [%s] error: %v", p.Name(), err)
+			xl.Warnf("send %s request to plugin [%s] error: %v", op, p.Name(), err)
 			errs = append(errs, fmt.Sprintf("[%s]: %v", p.Name(), err))
 		}
 	}
 
 	if len(errs) > 0 {
-		return fmt.Errorf("send CloseProxy request to plugin errors: %s", strings.Join(errs, "; "))
+		return fmt.Errorf("send %s request to plugin errors: %s", op, strings.Join(errs, "; "))
 	}
 	return nil
 }

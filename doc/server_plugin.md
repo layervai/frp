@@ -70,7 +70,7 @@ The response can look like any of the following:
 
 ### Operation
 
-Currently `Login`, `NewProxy`, `CloseProxy`, `Ping`, `NewWorkConn` and `NewUserConn` operations are supported.
+Currently `Login`, `NewProxy`, `NewProxyResult`, `CloseProxy`, `Ping`, `NewWorkConn` and `NewUserConn` operations are supported.
 
 #### Login
 
@@ -134,6 +134,34 @@ Create new proxy
         "multiplexer": <string>
 
         "metas": map<string>string
+    }
+}
+```
+
+#### NewProxyResult
+
+Reports the final FRPS admission result for a `NewProxy` attempt. The request is
+sent synchronously after the `NewProxy` plugin chain and, when that chain
+accepts, after FRPS attempts to register the proxy. `admitted` is true only when
+registration completed successfully.
+
+This operation is a notification. Its response cannot reject or modify the
+already-decided result. A plugin that prepares external state during `NewProxy`
+can use the exact, unnormalized `user.run_id` and `proxy_name` to commit that
+state when `admitted` is true or roll it back when false. A failed admission is
+not a `CloseProxy`: FRPS only sends `CloseProxy` for a proxy that was actually
+registered and later closed.
+
+```
+{
+    "content": {
+        "user": {
+            "user": <string>,
+            "metas": map<string>string,
+            "run_id": <string>
+        },
+        "proxy_name": <string>,
+        "admitted": <bool>
     }
 }
 ```

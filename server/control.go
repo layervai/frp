@@ -372,11 +372,17 @@ func (ctl *Control) handleNewProxy(m msg.Message) {
 		User:     ctl.loginUserInfo(),
 		NewProxy: *inMsg,
 	}
-	var remoteAddr string
-	retContent, err := ctl.sessionCtx.PluginManager.NewProxy(content)
-	if err == nil {
-		inMsg = &retContent.NewProxy
-		remoteAddr, err = ctl.RegisterProxy(inMsg)
+	inMsg, remoteAddr, err, resultErr := processNewProxyAttempt(
+		ctl.sessionCtx.PluginManager,
+		content,
+		ctl.RegisterProxy,
+	)
+	if resultErr != nil {
+		// NewProxyResult is a post-decision notification. A delivery error
+		// must not turn a successfully admitted proxy into a client-visible
+		// failure (the consumer may have processed the notification before
+		// the response was lost), nor mask the original admission error.
+		xl.Warnf("notify NewProxyResult for proxy [%s] error: %v", inMsg.ProxyName, resultErr)
 	}
 
 	// register proxy in this control
@@ -397,6 +403,36 @@ func (ctl *Control) handleNewProxy(m msg.Message) {
 		metrics.Server.NewProxy(inMsg.ProxyName, inMsg.ProxyType, ctl.sessionCtx.LoginMsg.User, clientID)
 	}
 	_ = ctl.msgDispatcher.Send(resp)
+}
+
+type registerProxyFunc func(*msg.NewProxy) (string, error)
+
+// processNewProxyAttempt runs the mutable NewProxy plugin chain, attempts FRPS
+// registration when the chain accepts, then synchronously emits exactly one
+// immutable NewProxyResult notification before returning. The result identity
+// is the effective content returned by the plugin chain; on a plugin-chain
+// rejection, it is the original content because no replacement was accepted.
+//
+// NewProxyResult delivery is intentionally independent from admissionErr. It
+// reports the decision and cannot rewrite it; callers log resultErr separately.
+func processNewProxyAttempt(
+	manager *plugin.Manager,
+	content *plugin.NewProxyContent,
+	register registerProxyFunc,
+) (effectiveMsg *msg.NewProxy, remoteAddr string, admissionErr, resultErr error) {
+	effectiveContent := content
+	retContent, admissionErr := manager.NewProxy(content)
+	if admissionErr == nil {
+		effectiveContent = retContent
+		remoteAddr, admissionErr = register(&effectiveContent.NewProxy)
+	}
+
+	resultErr = manager.NewProxyResult(&plugin.NewProxyResultContent{
+		User:      effectiveContent.User,
+		ProxyName: effectiveContent.ProxyName,
+		Admitted:  admissionErr == nil,
+	})
+	return &effectiveContent.NewProxy, remoteAddr, admissionErr, resultErr
 }
 
 func (ctl *Control) handlePing(m msg.Message) {

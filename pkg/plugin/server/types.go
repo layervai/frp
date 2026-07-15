@@ -48,6 +48,22 @@ type NewProxyContent struct {
 	msg.NewProxy
 }
 
+// NewProxyResultContent reports the final FRPS admission outcome for one
+// NewProxy attempt after the NewProxy plugin chain has run. User.RunID and
+// ProxyName are preserved byte-for-byte from the effective NewProxy content
+// (or the original content when the plugin chain rejects it). Admitted is true
+// only after RegisterProxy completes successfully.
+//
+// This is a notification, not another admission hook: plugin responses cannot
+// change the outcome. Consumers that prepare external state during NewProxy can
+// use the exact identity and outcome to commit or roll that state back without
+// treating a failed admission as a CloseProxy event.
+type NewProxyResultContent struct {
+	User      UserInfo `json:"user"`
+	ProxyName string   `json:"proxy_name"`
+	Admitted  bool     `json:"admitted"`
+}
+
 type CloseProxyContent struct {
 	User UserInfo `json:"user"`
 	msg.CloseProxy
