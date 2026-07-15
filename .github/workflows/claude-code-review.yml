@@ -64,6 +64,10 @@ jobs:
             - Security, input validation, and credential handling
             - Tests for protocol, race-sensitive, and failure paths
 
+            When reading surrounding files, pass the exact pull-request head
+            SHA returned by get_pull_request as the sha argument to
+            get_file_contents. Do not substitute default-branch contents.
+
             Apply the review guidance in AGENTS.md when available, but do not
             attempt its repository build, test, or lint commands: this workflow
             deliberately withholds repository execution tools. State any
@@ -75,4 +79,4 @@ jobs:
           # repository token; it never receives the Anthropic API key. Bash is
           # explicitly denied, so pull-request content cannot turn a permitted
           # command prefix into environment-secret exfiltration.
-          claude_args: '--model claude-opus-4-8 --disallowed-tools "Bash" --allowed-tools "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github__add_issue_comment"'
+          claude_args: '--model claude-opus-4-8 --disallowed-tools "Bash" --allowed-tools "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_file_contents,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github__add_issue_comment"'
