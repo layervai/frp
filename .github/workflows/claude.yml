@@ -13,6 +13,12 @@ on:
   pull_request_review:
     types: [submitted]
 
+concurrency:
+  # Serialize commands for one issue or pull request so repeated comments do
+  # not race duplicate terminal reviews. Never cancel an in-flight response.
+  group: claude-command-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   claude:
     if: |
