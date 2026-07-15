@@ -13,6 +13,10 @@ concurrency:
 
 jobs:
   review:
+    # A same-repository pull-request head can only be pushed by an actor with
+    # repository write access, so this gate is the automatic-review equivalent
+    # of the command workflow's live collaborator-permission lookup. Keep it if
+    # this workflow's trigger or trust model changes.
     if: |
       github.actor != 'dependabot[bot]' &&
       github.event.pull_request.head.repo.full_name == github.repository
