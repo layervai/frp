@@ -309,9 +309,12 @@ jobs:
           # Exercise the pinned action's fetch shapes before handing it control.
           # The action's setup head fetch intentionally lacks
           # --no-recurse-submodules; only its trusted-base restore adds that
-          # flag, so the asymmetry below is deliberate. Ref validation makes
-          # the unqualified branch arguments safe from option/refspec injection. These --depth
-          # fetches (and the action's repeats) make the working repository
+          # flag, so the asymmetry below is deliberate. This repository has no
+          # submodules; adding .gitmodules requires a pin/source re-audit, and
+          # any private submodule fetch would fail closed without credentials.
+          # Ref validation makes the unqualified branch arguments safe from
+          # option/refspec injection. These --depth fetches (and the action's
+          # repeats) make the working repository
           # shallow. That cannot truncate review context because this workflow
           # denies every local file/git tool and reads the complete PR diff via
           # GitHub MCP/API. Never enable a local-diff fallback without replacing
