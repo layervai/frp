@@ -10,7 +10,9 @@ permissions: {}
 concurrency:
   # Every pushed head invalidates exact-head review evidence. Drafts are
   # intentionally included: they need early security feedback, and cancellation
-  # prevents superseded heads from publishing competing terminal reviews.
+  # prevents superseded heads from publishing competing terminal reviews. Each
+  # completed head keeps its own top-level review as an immutable audit trail;
+  # comment accumulation across distinct heads is deliberate.
   group: claude-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
