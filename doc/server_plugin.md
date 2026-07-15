@@ -156,6 +156,12 @@ cryptographically random 128-bit lowercase-hex `attempt_id` before invoking the
 failed admission is not a `CloseProxy`: FRPS only sends `CloseProxy` for a proxy
 that was actually registered and later closed.
 
+Every server-plugin HTTP request, including both `NewProxy` and
+`NewProxyResult`, has a 25-second end-to-end timeout. `RegisterProxy` runs
+synchronously between those two callbacks and performs local FRPS registration;
+the result callback therefore completes or times out before FRPS returns the
+`NewProxy` response to the client.
+
 ```
 {
     "content": {

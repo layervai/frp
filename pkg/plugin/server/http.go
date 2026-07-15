@@ -26,9 +26,17 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"time"
 
 	v1 "github.com/fatedier/frp/pkg/config/v1"
 )
+
+// HTTPPluginRequestTimeout bounds one complete server-plugin HTTP exchange,
+// including connection setup, request upload, response headers, and response
+// body reads. Keep this below qURL Reverse Tunnel Server's 30-second HTTP write
+// timeout so FRPS has a deterministic upper bound instead of leaving a
+// NewProxy admission callback blocked indefinitely.
+const HTTPPluginRequestTimeout = 25 * time.Second
 
 type httpPlugin struct {
 	options v1.HTTPPluginOptions
@@ -45,9 +53,9 @@ func NewHTTPPluginOptions(options v1.HTTPPluginOptions) Plugin {
 		tr := &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: !options.TLSVerify},
 		}
-		client = &http.Client{Transport: tr}
+		client = &http.Client{Transport: tr, Timeout: HTTPPluginRequestTimeout}
 	} else {
-		client = &http.Client{}
+		client = &http.Client{Timeout: HTTPPluginRequestTimeout}
 	}
 
 	if !strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "http://") {
