@@ -123,6 +123,9 @@ jobs:
 
       - name: Checkout repository
         id: checkout
+        # Security invariant: this condition must remain implicitly
+        # success()-gated. Do not add always(), failure(), or cancelled(), or a
+        # failed authorization/head-resolution step could reach checkout.
         if: |
           steps.claude_actor.outputs.authorized == 'true' &&
           (
@@ -139,6 +142,7 @@ jobs:
 
       - name: Run Claude Code
         id: claude
+        # Keep the implicit success() guard here for the same fail-closed chain.
         if: steps.checkout.outcome == 'success'
         uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
         with:

@@ -5,6 +5,9 @@ on:
     types: [opened, synchronize]
 
 concurrency:
+  # Every pushed head invalidates exact-head review evidence. Drafts are
+  # intentionally included: they need early security feedback, and cancellation
+  # prevents superseded heads from publishing competing terminal reviews.
   group: claude-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
