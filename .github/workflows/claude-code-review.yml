@@ -1,0 +1,90 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# Future jobs inherit no token authority unless they declare it explicitly.
+permissions: {}
+
+concurrency:
+  # Every pushed head invalidates exact-head review evidence. Drafts are
+  # intentionally included: they need early security feedback, and cancellation
+  # prevents superseded heads from publishing competing terminal reviews. Each
+  # completed head keeps its own top-level review as an immutable audit trail;
+  # comment accumulation across distinct heads is deliberate.
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # A same-repository pull-request head contains code already written to this
+    # repository, even when the event actor differs from its original pusher.
+    # This provenance gate protects executable-code trust; it is deliberately
+    # distinct from the command workflow's trigger-actor authorization. Keep it
+    # if this workflow's trigger or trust model changes.
+    if: |
+      !endsWith(github.actor, '[bot]') &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # This workflow is PR-only: add_issue_comment publishes a PR conversation
+      # comment under pull-requests:write. A future issue trigger would also
+      # require issues:write and must not reuse this permission set silently.
+      issues: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Match the immutable head reviewed through the GitHub MCP tools;
+          # never substitute GitHub's base-drifting synthetic merge ref.
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Run Claude Code Review
+        # pull_request withholds secrets from forks, and the job-level gate
+        # rejects fork heads before checkout as defense in depth. Never convert
+        # this workflow to pull_request_target while checking out pull-request
+        # code or carrying a write-capable token.
+        # The pinned action also replaces PR-controlled Claude startup config
+        # with the trusted base version before CLI startup; preserve that
+        # protection on action upgrades so hooks cannot bypass tool policy.
+        uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          exclude_comments_by_actor: 'claude,github-actions,*[bot]'
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Review this pull request. Focus on:
+            - Idiomatic Go and clear, simple code
+            - FRP client/server protocol and wire compatibility
+            - Error propagation and fail-closed behavior
+            - Concurrency safety, goroutine lifecycle, and context cancellation
+            - Backpressure, retry, and bounded-shutdown behavior
+            - Security, input validation, and credential handling
+            - Tests for protocol, race-sensitive, and failure paths
+
+            When reading surrounding files, pass the exact pull-request head
+            SHA returned by get_pull_request as the sha argument to
+            get_file_contents. Do not substitute default-branch contents.
+
+            Apply the review guidance in AGENTS.md when available, but do not
+            attempt its repository build, test, or lint commands: this workflow
+            deliberately withholds repository execution tools. State any
+            verification limits. Publish the final review as a pull-request
+            comment with the allowed GitHub add_issue_comment tool.
+
+          # Automatic review uses the pinned action's GitHub MCP container for
+          # all reads and the final comment. That subprocess receives only the
+          # repository token; it never receives the Anthropic API key. Bash is
+          # explicitly denied, so pull-request content cannot turn a permitted
+          # command prefix into environment-secret exfiltration.
+          claude_args: '--model claude-opus-4-8 --disallowed-tools "Bash" --allowed-tools "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_file_contents,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github__add_issue_comment"'
