@@ -95,6 +95,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          COMMIT_COUNT_QUERY: >-
+            query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){commits{totalCount}}}}
         run: |
           set -euo pipefail
 
@@ -112,7 +114,20 @@ jobs:
           head_ref="$(jq -r '.head.ref // ""' <<<"$pr")"
           base_sha="$(jq -r '.base.sha // ""' <<<"$pr")"
           base_ref="$(jq -r '.base.ref // ""' <<<"$pr")"
-          commit_count="$(jq -r '.commits // ""' <<<"$pr")"
+          repo_owner="${GITHUB_REPOSITORY%%/*}"
+          repo_name="${GITHUB_REPOSITORY#*/}"
+          # Match the pinned action's GraphQL commits.totalCount. The REST
+          # pull-request object's commits field is capped at 250 and would make
+          # the fetch rehearsal diverge on a larger pull request.
+          if ! commit_count="$(gh api graphql \
+            -f query="$COMMIT_COUNT_QUERY" \
+            -F owner="$repo_owner" \
+            -F repo="$repo_name" \
+            -F number="$PR_NUMBER" \
+            --jq '.data.repository.pullRequest.commits.totalCount // ""')"; then
+            echo "::error::Unable to resolve pull request commit count; failing closed before checkout."
+            exit 1
+          fi
 
           # The job carries ANTHROPIC_API_KEY and a token that can write only
           # review comments. Never checkout a fork head across that boundary.
@@ -125,7 +140,8 @@ jobs:
           fi
           # GitHub uses SHA-1 today; accept the documented SHA-256 object shape
           # as well so a future repository-format migration still fails closed
-          # on every other value.
+          # on every other value. Keep these validators aligned with the
+          # post-checkout validate_* functions, which also cover issue commands.
           for named_sha in "head:$head_sha" "base:$base_sha"; do
             name="${named_sha%%:*}"
             sha="${named_sha#*:}"
@@ -186,9 +202,12 @@ jobs:
           ref: ${{ steps.claude_pr.outputs.sha != '' && steps.claude_pr.outputs.sha || github.sha }}
           # Depth 0 is intentional for PR commands: the local credential-free
           # origin needs both immutable head/base objects after checkout removes
-          # authentication. Ordinary issue commands remain shallow. Checkout
-          # uses the token transiently and removes it before any pull-request-
-          # authored content reaches Claude.
+          # authentication. At this checkout pin, depth 0 fetches every branch
+          # tip; the later base_sha cat-file/push depends on that behavior when
+          # base is not an ancestor of head. Re-audit on checkout pin changes.
+          # Ordinary issue commands remain shallow. Checkout uses the token
+          # transiently and removes it before any pull-request-authored content
+          # reaches Claude.
           fetch-depth: ${{ steps.claude_pr.outputs.checkout_allowed == 'true' && '0' || '1' }}
           persist-credentials: false
 
@@ -211,6 +230,7 @@ jobs:
           set -euo pipefail
 
           validate_sha() {
+            # Keep this grammar aligned with Resolve Claude pull request context.
             local name="$1" sha="$2"
             if [[ ! "$sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
               echo "::error::Invalid $name SHA: $sha"
@@ -218,6 +238,7 @@ jobs:
             fi
           }
           validate_ref() {
+            # Keep this grammar aligned with Resolve Claude pull request context.
             local name="$1" ref="$2"
             if [[ ! "$ref" =~ ^[A-Za-z0-9@][A-Za-z0-9/_.#+,@-]*$ ]] ||
               [[ "$ref" == "@" ]] ||
@@ -306,7 +327,12 @@ jobs:
 
           # Exercise the exact fetch shapes used by the pinned action before
           # handing it control. Ref validation above makes the unqualified
-          # branch arguments safe from option/refspec injection.
+          # branch arguments safe from option/refspec injection. These --depth
+          # fetches (and the action's repeats) make the working repository
+          # shallow. That cannot truncate review context because this workflow
+          # denies every local file/git tool and reads the complete PR diff via
+          # GitHub MCP/API. Never enable a local-diff fallback without replacing
+          # these fetches or proving merge-base traversal remains complete.
           if [[ "$PR_MODE" == "true" ]]; then
             git fetch origin "--depth=$fetch_depth" "$head_ref"
             git fetch origin "$base_ref" --depth=1 --no-recurse-submodules
