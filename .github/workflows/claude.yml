@@ -196,6 +196,8 @@ jobs:
           # local bare origin containing only the already-authenticated PR/base
           # snapshots so that fetch succeeds without leaving the reply-capable
           # job token in .git/config for Claude or a delegated subagent to read.
+          # A force-push that makes either API-resolved object unavailable
+          # mid-run deliberately fails here instead of reviewing a mixed snapshot.
           git cat-file -e "$HEAD_SHA^{commit}"
           git cat-file -e "$BASE_SHA^{commit}"
           local_origin="$RUNNER_TEMP/claude-origin.git"
@@ -228,6 +230,7 @@ jobs:
           # the action. Use a fully qualified ref so an untrusted branch name
           # can never be parsed as an option. The action performs its own
           # bounded-depth fetch next; do not shallow this complete checkout twice.
+          git fetch --no-tags origin "refs/heads/${BASE_REF}"
           git fetch --no-tags origin "refs/heads/${HEAD_REF}"
           echo "ready=true" >> "$GITHUB_OUTPUT"
 
@@ -256,4 +259,5 @@ jobs:
           # user-allowlisted general comment tool. Deny every current local
           # execution, file, delegation, and network builtin; review commands
           # must gather context only through the explicit GitHub MCP allowlist.
+          # Re-audit this denylist whenever the pinned action/Claude CLI changes.
           claude_args: '--model claude-opus-4-8 --disallowed-tools "Bash,Read,Glob,Grep,Task,Edit,Write,NotebookEdit,WebFetch,WebSearch" --allowed-tools "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_file_contents,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github_inline_comment__create_inline_comment"'
