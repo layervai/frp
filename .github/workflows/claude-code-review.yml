@@ -18,9 +18,9 @@ jobs:
     # of the command workflow's live collaborator-permission lookup. Keep it if
     # this workflow's trigger or trust model changes.
     if: |
-      github.actor != 'dependabot[bot]' &&
+      !endsWith(github.actor, '[bot]') &&
       github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
       # Defense in depth: the automatic path denies Bash entirely, and this
@@ -37,6 +37,9 @@ jobs:
         # the Anthropic secret enters a step.
         run: |
           set -euo pipefail
+          # Track the declared runner series' current security packages instead
+          # of pinning versions that Ubuntu removes from its rolling mirrors.
+          # Mirror/package failure stops before checkout or secret exposure.
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends bubblewrap socat
 

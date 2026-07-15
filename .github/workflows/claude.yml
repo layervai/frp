@@ -37,7 +37,7 @@ jobs:
         (startsWith(github.event.issue.body, '@claude') || startsWith(github.event.issue.title, '@claude')) &&
         contains(fromJson('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)
       )
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       # Tag mode needs narrowly-scoped local git commands. Force Claude Code's
@@ -46,8 +46,9 @@ jobs:
       CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1'
     permissions:
       # Review-only by design: this multi-event job needs both write scopes to
-      # reply on pull requests and issues, but Claude's tool allowlist exposes
-      # only comment publication; it cannot close, label, edit, or push.
+      # reply on pull requests and issues. The token scopes themselves are
+      # broader; the enforced boundary is Claude's explicit tool allowlist,
+      # which exposes review comments but no close, label, edit, or push tool.
       contents: read
       pull-requests: write
       issues: write
@@ -136,6 +137,9 @@ jobs:
         # environment scrub is enabled on Linux.
         run: |
           set -euo pipefail
+          # Track the declared runner series' current security packages instead
+          # of pinning versions that Ubuntu removes from its rolling mirrors.
+          # Mirror/package failure stops before checkout or secret exposure.
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends bubblewrap socat
 
@@ -176,4 +180,4 @@ jobs:
           # shell access stays limited to read-only git inspection; use the
           # API-backed pull-request diff instead of an ambiguous detached-HEAD
           # local diff.
-          claude_args: '--model claude-opus-4-8 --allowed-tools "Bash(git status:*),Bash(git log:*),Bash(git show:*),Bash(git rev-parse:*),mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests"'
+          claude_args: '--model claude-opus-4-8 --allowed-tools "Bash(git status:*),Bash(git log:*),Bash(git show:*),Bash(git rev-parse:*),mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github_inline_comment__create_inline_comment"'
