@@ -170,10 +170,11 @@ jobs:
           # Review one immutable pull-request snapshot. Ordinary issue commands
           # use the default-branch event SHA.
           ref: ${{ steps.claude_pr.outputs.sha != '' && steps.claude_pr.outputs.sha || github.sha }}
-          # PR commands need both immutable head/base objects for the local,
-          # credential-free origin built below. Ordinary issue commands remain
-          # shallow. Checkout uses the token transiently and removes it before
-          # any pull-request-authored content reaches Claude.
+          # Depth 0 is intentional for PR commands: the local credential-free
+          # origin needs both immutable head/base objects after checkout removes
+          # authentication. Ordinary issue commands remain shallow. Checkout
+          # uses the token transiently and removes it before any pull-request-
+          # authored content reaches Claude.
           fetch-depth: ${{ steps.claude_pr.outputs.checkout_allowed == 'true' && '0' || '1' }}
           persist-credentials: false
 
@@ -211,6 +212,13 @@ jobs:
           resolved_ref="${remote_line#*$'\t'}"
           if [[ "$resolved_sha" != "$HEAD_SHA" || "$resolved_ref" != "refs/heads/$HEAD_REF" ]]; then
             echo "::error::Local Claude origin resolved $resolved_ref at $resolved_sha, want refs/heads/$HEAD_REF at $HEAD_SHA."
+            exit 1
+          fi
+          base_line="$(git ls-remote --exit-code origin "refs/heads/$BASE_REF")"
+          resolved_base_sha="${base_line%%$'\t'*}"
+          resolved_base_ref="${base_line#*$'\t'}"
+          if [[ "$resolved_base_sha" != "$BASE_SHA" || "$resolved_base_ref" != "refs/heads/$BASE_REF" ]]; then
+            echo "::error::Local Claude origin resolved $resolved_base_ref at $resolved_base_sha, want refs/heads/$BASE_REF at $BASE_SHA."
             exit 1
           fi
           # Exercise the credential-free ref fetch before handing control to
