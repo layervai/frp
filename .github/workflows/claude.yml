@@ -118,7 +118,9 @@ jobs:
           repo_name="${GITHUB_REPOSITORY#*/}"
           # Match the pinned action's GraphQL commits.totalCount. The REST
           # pull-request object's commits field is capped at 250 and would make
-          # the fetch rehearsal diverge on a larger pull request.
+          # the fetch rehearsal diverge on a larger pull request. Matching depth
+          # proves action parity; it is not needed for object availability once
+          # the already-fetched snapshots have been pushed into the local origin.
           if ! commit_count="$(gh api graphql \
             -f query="$COMMIT_COUNT_QUERY" \
             -F owner="$repo_owner" \
@@ -258,6 +260,9 @@ jobs:
             # Issue commands start from the event's immutable default-branch
             # snapshot. The pinned action's later same-ref fetch stays on this
             # local snapshot even if the public default branch moves mid-run.
+            # Checkout is intentionally depth 1 here: pushing that shallow tip
+            # and fetching it again at depth 1 is part of the pinned proof. Re-
+            # audit if either the issue checkout depth or refspec shape changes.
             head_sha="$ISSUE_SHA"
             head_ref="$ISSUE_REF"
             base_sha=""
@@ -360,10 +365,7 @@ jobs:
         # base before Claude starts. Preserve that property on action upgrades.
         if: |
           steps.checkout.outcome == 'success' &&
-          (
-            steps.claude_pr.outcome == 'skipped' ||
-            steps.local_origin.outputs.ready == 'true'
-          )
+          steps.local_origin.outputs.ready == 'true'
         uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
