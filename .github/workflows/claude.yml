@@ -136,7 +136,7 @@ jobs:
           for named_ref in "head:$head_ref" "base:$base_ref"; do
             name="${named_ref%%:*}"
             ref="${named_ref#*:}"
-            if ! git check-ref-format "refs/heads/$ref"; then
+            if [[ "$ref" == -* ]] || ! git check-ref-format "refs/heads/$ref" 2>/dev/null; then
               echo "::error::Invalid pull request $name ref: $ref"
               exit 1
             fi
@@ -213,9 +213,11 @@ jobs:
             echo "::error::Local Claude origin resolved $resolved_ref at $resolved_sha, want refs/heads/$HEAD_REF at $HEAD_SHA."
             exit 1
           fi
-          # Exercise the exact private-repository fetch shape that failed in
-          # activation run 29435053448 before handing control to the action.
-          git fetch --no-tags --depth=20 origin "$HEAD_REF"
+          # Exercise the credential-free ref fetch before handing control to
+          # the action. Use a fully qualified ref so an untrusted branch name
+          # can never be parsed as an option. The action performs its own
+          # bounded-depth fetch next; do not shallow this complete checkout twice.
+          git fetch --no-tags origin "refs/heads/${HEAD_REF}"
           echo "ready=true" >> "$GITHUB_OUTPUT"
 
       - name: Run Claude Code
