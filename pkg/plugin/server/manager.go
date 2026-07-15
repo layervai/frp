@@ -18,11 +18,34 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/fatedier/frp/pkg/util/util"
 	"github.com/fatedier/frp/pkg/util/xlog"
 )
+
+const (
+	closeProxyNotificationQueueSize = 256
+	closeProxyRetryInitialDelay     = 100 * time.Millisecond
+	closeProxyRetryMaxDelay         = 5 * time.Second
+)
+
+var errPluginManagerClosed = errors.New("plugin manager is closed")
+
+type retryableNotificationTransportError interface {
+	error
+	retryableNotificationTransport()
+}
+
+type closeProxyNotification struct {
+	plugin  Plugin
+	content CloseProxyContent
+	ctx     context.Context
+	xl      *xlog.Logger
+}
 
 type Manager struct {
 	loginPlugins          []Plugin
@@ -32,9 +55,29 @@ type Manager struct {
 	pingPlugins           []Plugin
 	newWorkConnPlugins    []Plugin
 	newUserConnPlugins    []Plugin
+
+	closeProxyQueue      chan closeProxyNotification
+	closeProxyCtx        context.Context
+	closeProxyCancel     context.CancelFunc
+	closeProxyRetryDelay func(int) time.Duration
+	closeProxyWorkerMu   sync.Mutex
+	closeProxyWorkerWG   sync.WaitGroup
+	closeProxyWorkerOn   bool
+	closed               bool
 }
 
 func NewManager() *Manager {
+	return newManagerWithCloseProxyDelivery(
+		closeProxyNotificationQueueSize,
+		defaultCloseProxyRetryDelay,
+	)
+}
+
+func newManagerWithCloseProxyDelivery(queueSize int, retryDelay func(int) time.Duration) *Manager {
+	if queueSize < 1 {
+		queueSize = 1
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Manager{
 		loginPlugins:          make([]Plugin, 0),
 		newProxyPlugins:       make([]Plugin, 0),
@@ -43,7 +86,19 @@ func NewManager() *Manager {
 		pingPlugins:           make([]Plugin, 0),
 		newWorkConnPlugins:    make([]Plugin, 0),
 		newUserConnPlugins:    make([]Plugin, 0),
+		closeProxyQueue:       make(chan closeProxyNotification, queueSize),
+		closeProxyCtx:         ctx,
+		closeProxyCancel:      cancel,
+		closeProxyRetryDelay:  retryDelay,
 	}
+}
+
+func defaultCloseProxyRetryDelay(failureCount int) time.Duration {
+	delay := closeProxyRetryInitialDelay
+	for i := 1; i < failureCount && delay < closeProxyRetryMaxDelay; i++ {
+		delay = min(delay*2, closeProxyRetryMaxDelay)
+	}
+	return delay
 }
 
 func (m *Manager) Register(p Plugin) {
@@ -144,7 +199,130 @@ func (m *Manager) NewProxy(content *NewProxyContent) (*NewProxyContent, error) {
 }
 
 func (m *Manager) CloseProxy(content *CloseProxyContent) error {
-	return m.notifyPlugins(m.closeProxyPlugins, OpCloseProxy, *content)
+	if len(m.closeProxyPlugins) == 0 {
+		return nil
+	}
+	if !m.startCloseProxyWorker() {
+		return errPluginManagerClosed
+	}
+
+	reqid, _ := util.RandID()
+	for _, p := range m.closeProxyPlugins {
+		xl := xlog.New().AppendPrefix("reqid: " + reqid)
+		ctx := xlog.NewContext(m.closeProxyCtx, xl)
+		ctx = NewReqidContext(ctx, reqid)
+		task := closeProxyNotification{
+			plugin: p,
+			content: CloseProxyContent{
+				User: UserInfo{
+					User:  content.User.User,
+					Metas: maps.Clone(content.User.Metas),
+					RunID: content.User.RunID,
+				},
+				AttemptID:  content.AttemptID,
+				CloseProxy: content.CloseProxy,
+			},
+			ctx: ctx,
+			xl:  xl,
+		}
+
+		select {
+		case <-m.closeProxyCtx.Done():
+			return errPluginManagerClosed
+		case m.closeProxyQueue <- task:
+		}
+	}
+	return nil
+}
+
+// Close cancels any in-flight CloseProxy callback and releases calls blocked
+// on the bounded notification queue. Pending notifications are intentionally
+// not drained during process shutdown; consumers must reconcile their own
+// snapshot when they stop.
+func (m *Manager) Close() {
+	m.closeProxyWorkerMu.Lock()
+	if !m.closed {
+		m.closed = true
+		m.closeProxyCancel()
+	}
+	m.closeProxyWorkerMu.Unlock()
+	m.closeProxyWorkerWG.Wait()
+}
+
+func (m *Manager) startCloseProxyWorker() bool {
+	m.closeProxyWorkerMu.Lock()
+	defer m.closeProxyWorkerMu.Unlock()
+	if m.closed {
+		return false
+	}
+	if !m.closeProxyWorkerOn {
+		m.closeProxyWorkerOn = true
+		m.closeProxyWorkerWG.Add(1)
+		go m.runCloseProxyWorker()
+	}
+	return true
+}
+
+func (m *Manager) runCloseProxyWorker() {
+	defer m.closeProxyWorkerWG.Done()
+	for {
+		select {
+		case <-m.closeProxyCtx.Done():
+			return
+		default:
+		}
+
+		select {
+		case <-m.closeProxyCtx.Done():
+			return
+		case task := <-m.closeProxyQueue:
+			m.deliverCloseProxy(task)
+		}
+	}
+}
+
+func (m *Manager) deliverCloseProxy(task closeProxyNotification) {
+	for failureCount := 0; ; failureCount++ {
+		if task.ctx.Err() != nil {
+			return
+		}
+
+		_, _, err := task.plugin.Handle(task.ctx, OpCloseProxy, task.content)
+		if err == nil {
+			return
+		}
+		if task.ctx.Err() != nil {
+			return
+		}
+
+		var transportErr retryableNotificationTransportError
+		if !errors.As(err, &transportErr) {
+			task.xl.Warnf("send %s request to plugin [%s] error: %v", OpCloseProxy, task.plugin.Name(), err)
+			return
+		}
+
+		delay := m.closeProxyRetryDelay(failureCount + 1)
+		task.xl.Warnf(
+			"send %s request to plugin [%s] transport error (attempt %d), retrying in %s: %v",
+			OpCloseProxy,
+			task.plugin.Name(),
+			failureCount+1,
+			delay,
+			err,
+		)
+		timer := time.NewTimer(delay)
+		select {
+		case <-task.ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		case <-timer.C:
+		}
+	}
 }
 
 // NewProxyResult synchronously notifies every interested plugin of the final

@@ -20,6 +20,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 type resultTestPlugin struct {
@@ -36,6 +37,26 @@ func (p *resultTestPlugin) IsSupport(op string) bool {
 
 func (p *resultTestPlugin) Handle(ctx context.Context, op string, content any) (*Response, any, error) {
 	return p.handle(ctx, op, content)
+}
+
+func TestDefaultCloseProxyRetryDelayIsCapped(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		failureCount int
+		want         time.Duration
+	}{
+		{failureCount: 1, want: 100 * time.Millisecond},
+		{failureCount: 2, want: 200 * time.Millisecond},
+		{failureCount: 6, want: 3200 * time.Millisecond},
+		{failureCount: 7, want: 5 * time.Second},
+		{failureCount: 1000, want: 5 * time.Second},
+	}
+	for _, tt := range tests {
+		if got := defaultCloseProxyRetryDelay(tt.failureCount); got != tt.want {
+			t.Fatalf("defaultCloseProxyRetryDelay(%d) = %s, want %s", tt.failureCount, got, tt.want)
+		}
+	}
 }
 
 func TestManagerNewProxyResultIgnoresResponsesAndNotifiesAllPlugins(t *testing.T) {
@@ -120,6 +141,8 @@ func TestManagerCloseProxyAttemptIDCannotBeRewrittenByPluginResponses(t *testing
 
 	const attemptID = "0123456789abcdef0123456789abcdef"
 	manager := NewManager()
+	t.Cleanup(manager.Close)
+	delivered := make(chan struct{}, 2)
 	for _, name := range []string{"mutator", "observer"} {
 		manager.Register(&resultTestPlugin{
 			name:      name,
@@ -130,6 +153,7 @@ func TestManagerCloseProxyAttemptIDCannotBeRewrittenByPluginResponses(t *testing
 					t.Fatalf("%s plugin AttemptID = %q, want immutable %q", name, got.AttemptID, attemptID)
 				}
 				got.AttemptID = "aliased-attempt"
+				delivered <- struct{}{}
 				return &Response{Unchange: false}, &got, nil
 			},
 		})
@@ -141,6 +165,13 @@ func TestManagerCloseProxyAttemptIDCannotBeRewrittenByPluginResponses(t *testing
 	}
 	if content.AttemptID != attemptID {
 		t.Fatalf("CloseProxy() rewrote AttemptID to %q", content.AttemptID)
+	}
+	for range 2 {
+		select {
+		case <-delivered:
+		case <-time.After(time.Second):
+			t.Fatal("CloseProxy notification was not delivered")
+		}
 	}
 }
 

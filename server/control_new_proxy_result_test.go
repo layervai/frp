@@ -21,6 +21,7 @@ import (
 	"net"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -153,9 +154,14 @@ func TestCloseProxyKeepsOldAttemptIDWhenReplacementUsesSameIdentity(t *testing.T
 	)
 	oldStarted := make(chan struct{})
 	releaseOld := make(chan struct{})
+	var releaseOldOnce sync.Once
 	delivered := make(chan plugin.CloseProxyContent, 2)
 
 	manager := plugin.NewManager()
+	t.Cleanup(func() {
+		releaseOldOnce.Do(func() { close(releaseOld) })
+		manager.Close()
+	})
 	manager.Register(&controlResultPlugin{handle: func(_ string, content any) (*plugin.Response, any, error) {
 		got := content.(plugin.CloseProxyContent)
 		if got.AttemptID == oldAttempt {
@@ -194,14 +200,11 @@ func TestCloseProxyKeepsOldAttemptIDWhenReplacementUsesSameIdentity(t *testing.T
 	))
 	select {
 	case got := <-delivered:
-		if got.User.RunID != runID || got.ProxyName != proxyName || got.AttemptID != newAttempt {
-			t.Fatalf("replacement CloseProxy = %+v, want exact replacement identity", got)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("replacement CloseProxy callback was blocked by old callback")
+		t.Fatalf("CloseProxy callback %q overtook blocked old callback", got.AttemptID)
+	case <-time.After(50 * time.Millisecond):
 	}
 
-	close(releaseOld)
+	releaseOldOnce.Do(func() { close(releaseOld) })
 	select {
 	case got := <-delivered:
 		if got.User.RunID != runID || got.ProxyName != proxyName || got.AttemptID != oldAttempt {
@@ -209,6 +212,14 @@ func TestCloseProxyKeepsOldAttemptIDWhenReplacementUsesSameIdentity(t *testing.T
 		}
 	case <-time.After(time.Second):
 		t.Fatal("delayed old CloseProxy callback was not delivered")
+	}
+	select {
+	case got := <-delivered:
+		if got.User.RunID != runID || got.ProxyName != proxyName || got.AttemptID != newAttempt {
+			t.Fatalf("replacement CloseProxy = %+v, want exact replacement identity", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement CloseProxy callback was not delivered after old callback")
 	}
 }
 

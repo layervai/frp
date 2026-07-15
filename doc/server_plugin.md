@@ -186,8 +186,23 @@ successful `NewProxy` and `NewProxyResult` callbacks for this proxy. Consumers
 must use it to distinguish a delayed close from a replacement that reuses the
 same `user.run_id` and `proxy_name`.
 
-Please note that one request will be sent for every proxy that is closed, do **NOT** use this
-if you have too many proxies bound to a single client, as this may exhaust the server's resources.
+FRPS enqueues one notification for every interested plugin and proxy into a
+fixed 256-entry FIFO serviced by one worker. Enqueue blocks when the queue is
+full, applying backpressure to proxy teardown rather than dropping lifecycle
+events or creating an unbounded number of goroutines.
+
+If an HTTP attempt fails before FRPS receives any response, the worker retries
+the notification for as long as the FRPS process remains alive, using the exact
+same content, `attempt_id`, and request ID. Retry delay starts at 100 ms and
+doubles to a maximum of five seconds. A received HTTP response is terminal and
+is never retried, including a non-2xx status, an unreadable or malformed body,
+or a successful plugin response. Consumers must therefore make transport
+retries idempotent by `attempt_id` and return a response only after recording
+the close outcome in the state that governs their contract.
+
+FRPS cancels the in-flight request and pending queue when it shuts down instead
+of attempting an unbounded drain. A plugin that maintains a live registration
+snapshot must reconcile or unregister that snapshot in its own shutdown path.
 
 ```
 {

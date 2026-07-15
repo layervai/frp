@@ -349,9 +349,9 @@ func (ctl *Control) closeProxy(registered registeredProxy) {
 			ProxyName: pxy.GetName(),
 		},
 	}
-	go func() {
-		_ = ctl.sessionCtx.PluginManager.CloseProxy(notifyContent)
-	}()
+	if err := ctl.sessionCtx.PluginManager.CloseProxy(notifyContent); err != nil {
+		ctl.xl.Warnf("enqueue CloseProxy plugin notification for proxy [%s] error: %v", pxy.GetName(), err)
+	}
 }
 
 func (ctl *Control) worker() {

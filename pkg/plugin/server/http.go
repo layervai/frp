@@ -45,6 +45,26 @@ type httpPlugin struct {
 	client *http.Client
 }
 
+// pluginNotificationTransportError marks a callback that failed before any
+// HTTP response was received. CloseProxy may retry this narrow failure class:
+// the plugin has not acknowledged the notification, and the immutable
+// attempt_id makes the qURL lifecycle consumer idempotent. Errors after an
+// HTTP response exists are deliberately unmarked because the plugin may have
+// already applied the notification; semantic responses are never retried.
+type pluginNotificationTransportError struct {
+	err error
+}
+
+func (e *pluginNotificationTransportError) Error() string {
+	return e.err.Error()
+}
+
+func (e *pluginNotificationTransportError) Unwrap() error {
+	return e.err
+}
+
+func (e *pluginNotificationTransportError) retryableNotificationTransport() {}
+
 func NewHTTPPluginOptions(options v1.HTTPPluginOptions) Plugin {
 	url := fmt.Sprintf("%s%s", options.Addr, options.Path)
 
@@ -107,6 +127,16 @@ func (p *httpPlugin) do(ctx context.Context, r *Request, res *Response) error {
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := p.client.Do(req)
 	if err != nil {
+		if resp == nil {
+			return &pluginNotificationTransportError{err: err}
+		}
+		// net/http may return both a response and an error for redirect-policy
+		// failures. A response means the remote side answered, so this is not a
+		// retryable pre-delivery transport failure. Close defensively before
+		// returning the original semantic/client error.
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
 		return err
 	}
 	defer resp.Body.Close()
