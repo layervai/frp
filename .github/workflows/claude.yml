@@ -109,6 +109,9 @@ jobs:
           fi
           head_repo="$(jq -r '.head.repo.full_name // ""' <<<"$pr")"
           head_sha="$(jq -r '.head.sha // ""' <<<"$pr")"
+          head_ref="$(jq -r '.head.ref // ""' <<<"$pr")"
+          base_sha="$(jq -r '.base.sha // ""' <<<"$pr")"
+          base_ref="$(jq -r '.base.ref // ""' <<<"$pr")"
 
           # The job carries ANTHROPIC_API_KEY and a token that can write only
           # review comments. Never checkout a fork head across that boundary.
@@ -122,13 +125,32 @@ jobs:
           # GitHub uses SHA-1 today; accept the documented SHA-256 object shape
           # as well so a future repository-format migration still fails closed
           # on every other value.
-          if [[ ! "$head_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
-            echo "::error::Invalid pull request head SHA: $head_sha"
+          for named_sha in "head:$head_sha" "base:$base_sha"; do
+            name="${named_sha%%:*}"
+            sha="${named_sha#*:}"
+            if [[ ! "$sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+              echo "::error::Invalid pull request $name SHA: $sha"
+              exit 1
+            fi
+          done
+          for named_ref in "head:$head_ref" "base:$base_ref"; do
+            name="${named_ref%%:*}"
+            ref="${named_ref#*:}"
+            if ! git check-ref-format "refs/heads/$ref"; then
+              echo "::error::Invalid pull request $name ref: $ref"
+              exit 1
+            fi
+          done
+          if [[ "$head_ref" == "$base_ref" ]]; then
+            echo "::error::Pull request head and base refs must be distinct."
             exit 1
           fi
 
           {
             echo "sha=$head_sha"
+            echo "head_ref=$head_ref"
+            echo "base_sha=$base_sha"
+            echo "base_ref=$base_ref"
             echo "checkout_allowed=true"
           } >> "$GITHUB_OUTPUT"
 
@@ -148,15 +170,53 @@ jobs:
           # Review one immutable pull-request snapshot. Ordinary issue commands
           # use the default-branch event SHA.
           ref: ${{ steps.claude_pr.outputs.sha != '' && steps.claude_pr.outputs.sha || github.sha }}
-          fetch-depth: 1
-          # Tag mode performs its own `git fetch origin <PR branch>` after this
-          # checkout. This repository is private, so retain the job token for
-          # that authenticated read. contents:read keeps Git pushes impossible,
-          # but the persisted job token also carries the issue/PR write scopes
-          # required for replies. The explicit local-tool denylist below keeps
-          # Claude on the GitHub MCP review surface and prevents it, including
-          # through Task delegation, from reaching the credential in .git/config.
-          persist-credentials: true
+          # PR commands need both immutable head/base objects for the local,
+          # credential-free origin built below. Ordinary issue commands remain
+          # shallow. Checkout uses the token transiently and removes it before
+          # any pull-request-authored content reaches Claude.
+          fetch-depth: ${{ steps.claude_pr.outputs.checkout_allowed == 'true' && '0' || '1' }}
+          persist-credentials: false
+
+      - name: Prepare credential-free Claude origin
+        id: local_origin
+        if: steps.claude_pr.outputs.checkout_allowed == 'true'
+        env:
+          HEAD_SHA: ${{ steps.claude_pr.outputs.sha }}
+          HEAD_REF: ${{ steps.claude_pr.outputs.head_ref }}
+          BASE_SHA: ${{ steps.claude_pr.outputs.base_sha }}
+          BASE_REF: ${{ steps.claude_pr.outputs.base_ref }}
+        run: |
+          set -euo pipefail
+
+          # Tag mode performs its own `git fetch origin <PR branch>`. Build a
+          # local bare origin containing only the already-authenticated PR/base
+          # snapshots so that fetch succeeds without leaving the reply-capable
+          # job token in .git/config for Claude or a delegated subagent to read.
+          git cat-file -e "$HEAD_SHA^{commit}"
+          git cat-file -e "$BASE_SHA^{commit}"
+          local_origin="$RUNNER_TEMP/claude-origin.git"
+          object_format="$(git rev-parse --show-object-format)"
+          git init --bare --quiet --object-format="$object_format" "$local_origin"
+          git push --quiet "$local_origin" \
+            "${HEAD_SHA}:refs/heads/${HEAD_REF}" \
+            "${BASE_SHA}:refs/heads/${BASE_REF}"
+          git remote set-url origin "$local_origin"
+
+          if git config --local --get-regexp '^http\..*\.extraheader$' >/dev/null 2>&1; then
+            echo "::error::Checkout credential remained in local Git config."
+            exit 1
+          fi
+          remote_line="$(git ls-remote --exit-code origin "refs/heads/$HEAD_REF")"
+          resolved_sha="${remote_line%%$'\t'*}"
+          resolved_ref="${remote_line#*$'\t'}"
+          if [[ "$resolved_sha" != "$HEAD_SHA" || "$resolved_ref" != "refs/heads/$HEAD_REF" ]]; then
+            echo "::error::Local Claude origin resolved $resolved_ref at $resolved_sha, want refs/heads/$HEAD_REF at $HEAD_SHA."
+            exit 1
+          fi
+          # Exercise the exact private-repository fetch shape that failed in
+          # activation run 29435053448 before handing control to the action.
+          git fetch --no-tags --depth=20 origin "$HEAD_REF"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
 
       - name: Run Claude Code
         id: claude
@@ -164,7 +224,12 @@ jobs:
         # The pinned action restores PR-controlled startup configuration
         # (.claude/, .mcp.json, CLAUDE*.md, and related paths) from the trusted
         # base before Claude starts. Preserve that property on action upgrades.
-        if: steps.checkout.outcome == 'success'
+        if: |
+          steps.checkout.outcome == 'success' &&
+          (
+            steps.claude_pr.outcome == 'skipped' ||
+            steps.local_origin.outputs.ready == 'true'
+          )
         uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
