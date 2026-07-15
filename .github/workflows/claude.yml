@@ -149,7 +149,11 @@ jobs:
           # use the default-branch event SHA.
           ref: ${{ steps.claude_pr.outputs.sha != '' && steps.claude_pr.outputs.sha || github.sha }}
           fetch-depth: 1
-          persist-credentials: false
+          # Tag mode performs its own `git fetch origin <PR branch>` after this
+          # checkout. This repository is private, so retain the job token for
+          # that authenticated read. The job grants contents:read only, which
+          # keeps Git writes impossible; Claude itself still has no Bash tool.
+          persist-credentials: true
 
       - name: Run Claude Code
         id: claude
