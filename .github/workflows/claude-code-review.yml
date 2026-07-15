@@ -1,0 +1,58 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: |
+      github.actor != 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Run Claude Code Review
+        # pull_request withholds secrets from forks, and the job-level gate
+        # rejects fork heads before checkout as defense in depth. Never convert
+        # this workflow to pull_request_target while checking out pull-request
+        # code or carrying a write-capable token.
+        uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          exclude_comments_by_actor: 'claude,github-actions,*[bot]'
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Review this pull request. Focus on:
+            - Idiomatic Go and clear, simple code
+            - FRP client/server protocol and wire compatibility
+            - Error propagation and fail-closed behavior
+            - Concurrency safety, goroutine lifecycle, and context cancellation
+            - Backpressure, retry, and bounded-shutdown behavior
+            - Security, input validation, and credential handling
+            - Tests for protocol, race-sensitive, and failure paths
+
+            Follow AGENTS.md. Use `gh pr comment` to publish the review.
+
+          # No repository command, script, test, package manager, interpreter,
+          # or arbitrary shell command is available while the pull-request
+          # checkout and write-capable comment token share this job.
+          claude_args: '--model claude-opus-4-8 --allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'

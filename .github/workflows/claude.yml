@@ -1,0 +1,143 @@
+name: Claude Code
+
+# GitHub loads issue_comment workflows from the default branch, not from the
+# pull request that introduces them. Commands on existing PRs therefore remain
+# unavailable until this workflow is reviewed and merged to the default branch.
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  claude:
+    if: |
+      (
+        (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment') &&
+        contains(github.event.comment.body, '@claude') &&
+        contains(fromJson('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+      ) ||
+      (
+        github.event_name == 'pull_request_review' &&
+        contains(github.event.review.body, '@claude') &&
+        contains(fromJson('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association)
+      ) ||
+      (
+        github.event_name == 'issues' &&
+        (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
+        contains(fromJson('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      # Review-only by design: Claude may publish comments, but cannot mutate
+      # repository contents or push a patch.
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: read
+
+    steps:
+      - name: Validate Claude trigger actor permission
+        id: claude_actor
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRIGGER_ACTOR: ${{ github.event.comment.user.login || github.event.review.user.login || github.event.issue.user.login || github.actor }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$TRIGGER_ACTOR" ]]; then
+            echo "::error::Unable to resolve Claude trigger actor; failing closed before checkout."
+            exit 1
+          fi
+
+          if ! actor_permission="$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$TRIGGER_ACTOR/permission" --jq '.permission // ""')"; then
+            echo "::error::Unable to resolve Claude trigger actor permission; failing closed before checkout."
+            exit 1
+          fi
+
+          # GitHub's legacy permission field normally maps maintain to write;
+          # accept maintain explicitly as defense against API representation
+          # changes while continuing to reject triage/read contributors.
+          case "$actor_permission" in
+            admin|maintain|write) ;;
+            *)
+              echo "::error::Claude command trigger actor must have write access to this repository."
+              exit 1
+              ;;
+          esac
+
+          echo "authorized=true" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve Claude pull request context
+        id: claude_pr
+        if: |
+          (github.event_name == 'issue_comment' && github.event.issue.pull_request != null) ||
+          github.event_name == 'pull_request_review_comment' ||
+          github.event_name == 'pull_request_review'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$PR_NUMBER" ]]; then
+            echo "::error::Unable to resolve pull request number for Claude command."
+            exit 1
+          fi
+
+          if ! pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"; then
+            echo "::error::Unable to resolve pull request head; failing closed before checkout."
+            exit 1
+          fi
+          head_repo="$(jq -r '.head.repo.full_name // ""' <<<"$pr")"
+          head_sha="$(jq -r '.head.sha // ""' <<<"$pr")"
+
+          # The job carries ANTHROPIC_API_KEY and a token that can write only
+          # review comments. Never checkout a fork head across that boundary.
+          if [[ "$head_repo" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::Claude command checkout is limited to same-repository pull requests."
+            exit 1
+          fi
+          if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid pull request head SHA: $head_sha"
+            exit 1
+          fi
+
+          {
+            echo "sha=$head_sha"
+            echo "checkout_allowed=true"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout repository
+        id: checkout
+        if: |
+          steps.claude_actor.outputs.authorized == 'true' &&
+          (
+            steps.claude_pr.outcome == 'skipped' ||
+            steps.claude_pr.outputs.checkout_allowed == 'true'
+          )
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Review one immutable pull-request snapshot. Ordinary issue commands
+          # use the default-branch event SHA.
+          ref: ${{ steps.claude_pr.outputs.sha != '' && steps.claude_pr.outputs.sha || github.sha }}
+          fetch-depth: ${{ steps.claude_pr.outputs.sha != '' && '0' || '1' }}
+          persist-credentials: false
+
+      - name: Run Claude Code
+        id: claude
+        if: steps.checkout.outcome == 'success'
+        uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          exclude_comments_by_actor: 'claude,github-actions,*[bot]'
+          # Commands are review-only. Pre-approve repository inspection and
+          # GitHub comment reads/writes, but never repository scripts, tests,
+          # package managers, interpreters, or arbitrary shell execution.
+          claude_args: '--model claude-opus-4-8 --allowed-tools "Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(git show:*),Bash(git rev-parse:*),Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
