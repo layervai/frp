@@ -392,8 +392,8 @@ jobs:
             exit 1
           fi
 
-          credential_config_pattern='^(credential($|\.)|core\.askpass$|http\..*\.extraheader$|url\..*\.insteadof$)'
-          for scope in --local --global; do
+          credential_config_pattern='^(credential($|\.)|core\.askpass$|http\..*\.extraheader$|url\..*\.(insteadof|pushinsteadof)$)'
+          for scope in --local --global --system; do
             if git config "$scope" --get-regexp "$credential_config_pattern" >/dev/null 2>&1; then
               echo "::error::Claude action persisted a credential-bearing Git configuration in $scope scope."
               exit 1
