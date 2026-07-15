@@ -125,6 +125,49 @@ func TestHTTPPluginDoClosesResponseBody(t *testing.T) {
 	}
 }
 
+type redirectRoundTripper struct {
+	body  *closeTrackingBody
+	calls atomic.Int32
+}
+
+func (t *redirectRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	t.calls.Add(1)
+	header := make(http.Header)
+	header.Set("Location", "http://redirected.invalid")
+	return &http.Response{
+		StatusCode: http.StatusFound,
+		Header:     header,
+		Body:       t.body,
+	}, nil
+}
+
+func TestHTTPPluginResponseWithClientErrorIsNotRetryable(t *testing.T) {
+	t.Parallel()
+
+	body := &closeTrackingBody{Reader: strings.NewReader("redirect")}
+	transport := &redirectRoundTripper{body: body}
+	plugin := NewHTTPPluginOptions(v1.HTTPPluginOptions{Addr: "http://plugin.invalid"}).(*httpPlugin)
+	plugin.client.Transport = transport
+	plugin.client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return errors.New("redirect rejected")
+	}
+
+	_, _, err := plugin.Handle(context.Background(), OpCloseProxy, CloseProxyContent{})
+	if err == nil {
+		t.Fatal("Handle() error = nil, want redirect-policy error")
+	}
+	var transportErr retryableNotificationTransportError
+	if errors.As(err, &transportErr) {
+		t.Fatalf("Handle() error = %v, must be terminal after receiving redirect response", err)
+	}
+	if got := transport.calls.Load(); got != 1 {
+		t.Fatalf("RoundTrip calls = %d, want 1", got)
+	}
+	if !body.closed.Load() {
+		t.Fatal("redirect response body was not closed")
+	}
+}
+
 type closeProxyRequestObservation struct {
 	attemptID string
 	reqid     string

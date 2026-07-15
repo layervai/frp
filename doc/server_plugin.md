@@ -188,8 +188,8 @@ same `user.run_id` and `proxy_name`.
 
 FRPS enqueues one notification for every interested plugin and proxy into a
 fixed 256-entry FIFO serviced by one worker. Enqueue blocks when the queue is
-full, applying backpressure to proxy teardown rather than dropping lifecycle
-events or creating an unbounded number of goroutines.
+full, applying backpressure to the proxy-teardown path rather than dropping
+lifecycle events or creating an unbounded number of goroutines.
 
 If an HTTP attempt fails before FRPS receives any response, the worker retries
 the notification for as long as the FRPS process remains alive, using the exact
