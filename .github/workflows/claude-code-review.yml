@@ -39,6 +39,9 @@ jobs:
         # rejects fork heads before checkout as defense in depth. Never convert
         # this workflow to pull_request_target while checking out pull-request
         # code or carrying a write-capable token.
+        # The pinned action also replaces PR-controlled Claude startup config
+        # with the trusted base version before CLI startup; preserve that
+        # protection on action upgrades so hooks cannot bypass tool policy.
         uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -57,9 +60,14 @@ jobs:
             - Security, input validation, and credential handling
             - Tests for protocol, race-sensitive, and failure paths
 
-            Follow AGENTS.md. Use `gh pr comment` to publish the review.
+            Apply the review guidance in AGENTS.md when available, but do not
+            attempt its repository build, test, or lint commands: this workflow
+            deliberately withholds repository execution tools. State any
+            verification limits. Use `gh pr comment` to publish the review.
 
-          # No repository command, script, test, package manager, interpreter,
-          # or arbitrary shell command is available while the pull-request
-          # checkout and write-capable comment token share this job.
+          # Unlike the interactive command path, automatic review reads the
+          # diff through gh and does not need local git. No repository command,
+          # script, test, package manager, interpreter, or arbitrary shell
+          # command is available while the pull-request checkout and
+          # write-capable comment token share this job.
           claude_args: '--model claude-opus-4-8 --allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'

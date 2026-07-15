@@ -144,6 +144,9 @@ jobs:
       - name: Run Claude Code
         id: claude
         # Keep the implicit success() guard here for the same fail-closed chain.
+        # The pinned action restores PR-controlled startup configuration
+        # (.claude/, .mcp.json, CLAUDE*.md, and related paths) from the trusted
+        # base before Claude starts. Preserve that property on action upgrades.
         if: steps.checkout.outcome == 'success'
         uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
         with:
