@@ -130,6 +130,15 @@ jobs:
             echo "checkout_allowed=true"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Install Claude subprocess isolation dependencies
+        # Runs before any pull-request checkout and before the Anthropic secret
+        # enters a step. Claude Code requires both tools when its subprocess
+        # environment scrub is enabled on Linux.
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap socat
+
       - name: Checkout repository
         id: checkout
         # Security invariant: this condition must remain implicitly
