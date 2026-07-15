@@ -383,15 +383,17 @@ jobs:
           # execution, file, delegation, and network builtin; review commands
           # must gather context only through the explicit GitHub MCP allowlist.
           # API signing makes the action provision file-write MCP tools; deny
-          # those explicitly too. Re-audit both this list and the action's local-
-          # origin/configureGitAuth behavior whenever either pin changes.
+          # those explicitly too. On every pin change, re-derive the complete
+          # injected write-tool set from tag mode and re-audit the action's
+          # local-origin/configureGitAuth behavior; do not append by guesswork.
           claude_args: '--model claude-opus-4-8 --disallowed-tools "Bash,Read,Glob,Grep,Task,Edit,Write,NotebookEdit,WebFetch,WebSearch,mcp__github_file_ops__commit_files,mcp__github_file_ops__delete_files,mcp__github__delete_file" --allowed-tools "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_file_contents,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github_inline_comment__create_inline_comment"'
 
       - name: Verify credential-free Claude origin
         # This postcondition is intentionally always() checked after the action:
         # a future pin that rewrites origin or restores a checkout credential
         # must make the command job non-terminal instead of passing unnoticed.
-        # Never print the unexpected URL; it could contain a credential.
+        # Never print config values, environment values, or an unexpected URL;
+        # any of them could contain a credential.
         if: always() && steps.local_origin.outputs.ready == 'true'
         run: |
           set -euo pipefail
@@ -400,7 +402,44 @@ jobs:
             echo "::error::Claude action changed the credential-free local origin."
             exit 1
           fi
-          if git config --local --get-regexp '^http\..*\.extraheader$' >/dev/null 2>&1; then
-            echo "::error::Claude action restored an HTTP checkout credential."
+
+          remote_keys="$(git config --local --name-only --get-regexp '^remote\..*\.(url|pushurl)$' || true)"
+          if [[ "$remote_keys" != "remote.origin.url" ]]; then
+            echo "::error::Claude action added an unexpected Git remote URL or push URL."
             exit 1
           fi
+
+          credential_config_pattern='^(credential($|\.)|core\.askpass$|http\..*\.extraheader$|url\..*\.insteadof$)'
+          for scope in --local --global; do
+            if git config "$scope" --get-regexp "$credential_config_pattern" >/dev/null 2>&1; then
+              echo "::error::Claude action persisted a credential-bearing Git configuration in $scope scope."
+              exit 1
+            fi
+          done
+
+          credential_env_names=(
+            GH_TOKEN
+            GITHUB_TOKEN
+            OVERRIDE_GITHUB_TOKEN
+            DEFAULT_WORKFLOW_TOKEN
+            GIT_ASKPASS
+            SSH_ASKPASS
+            GIT_CONFIG
+            GIT_CONFIG_GLOBAL
+            GIT_CONFIG_SYSTEM
+            GIT_CONFIG_COUNT
+            GIT_CONFIG_PARAMETERS
+          )
+          for name in "${credential_env_names[@]}"; do
+            if [[ -n "${!name:-}" ]]; then
+              echo "::error::Claude action persisted a credential-capable environment variable: $name."
+              exit 1
+            fi
+          done
+
+          for credential_file in "$HOME/.git-credentials" "$GITHUB_WORKSPACE/.git-credentials"; do
+            if [[ -e "$credential_file" ]]; then
+              echo "::error::Claude action persisted a Git credential file."
+              exit 1
+            fi
+          done
