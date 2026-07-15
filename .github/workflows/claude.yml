@@ -180,6 +180,9 @@ jobs:
 
       - name: Prepare credential-free Claude origin
         id: local_origin
+        # Keep the implicit success() guard: never prepare or hand off a local
+        # origin after actor validation, PR resolution, or checkout has failed.
+        # Do not add always(), failure(), or cancelled() here.
         if: steps.claude_pr.outputs.checkout_allowed == 'true'
         env:
           HEAD_SHA: ${{ steps.claude_pr.outputs.sha }}
