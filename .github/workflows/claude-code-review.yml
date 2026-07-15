@@ -13,10 +13,11 @@ concurrency:
 
 jobs:
   review:
-    # A same-repository pull-request head can only be pushed by an actor with
-    # repository write access, so this gate is the automatic-review equivalent
-    # of the command workflow's live collaborator-permission lookup. Keep it if
-    # this workflow's trigger or trust model changes.
+    # A same-repository pull-request head contains code already written to this
+    # repository, even when the event actor differs from its original pusher.
+    # This provenance gate protects executable-code trust; it is deliberately
+    # distinct from the command workflow's trigger-actor authorization. Keep it
+    # if this workflow's trigger or trust model changes.
     if: |
       !endsWith(github.actor, '[bot]') &&
       github.event.pull_request.head.repo.full_name == github.repository
@@ -40,8 +41,17 @@ jobs:
           # Track the declared runner series' current security packages instead
           # of pinning versions that Ubuntu removes from its rolling mirrors.
           # Mirror/package failure stops before checkout or secret exposure.
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends bubblewrap socat
+          for attempt in 1 2 3; do
+            if sudo apt-get update -qq &&
+              sudo apt-get install -y --no-install-recommends bubblewrap socat; then
+              break
+            fi
+            if [[ "$attempt" == 3 ]]; then
+              echo "::error::Unable to install Claude isolation dependencies after $attempt attempts."
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
 
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
