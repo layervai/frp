@@ -112,6 +112,7 @@ jobs:
           head_ref="$(jq -r '.head.ref // ""' <<<"$pr")"
           base_sha="$(jq -r '.base.sha // ""' <<<"$pr")"
           base_ref="$(jq -r '.base.ref // ""' <<<"$pr")"
+          commit_count="$(jq -r '.commits // ""' <<<"$pr")"
 
           # The job carries ANTHROPIC_API_KEY and a token that can write only
           # review comments. Never checkout a fork head across that boundary.
@@ -136,21 +137,34 @@ jobs:
           for named_ref in "head:$head_ref" "base:$base_ref"; do
             name="${named_ref%%:*}"
             ref="${named_ref#*:}"
-            if [[ "$ref" == -* ]] || ! git check-ref-format "refs/heads/$ref" 2>/dev/null; then
+            # Mirror the pinned action's stricter branch-name grammar before it
+            # performs an unqualified fetch. git-check-ref-format alone permits
+            # leading characters (for example '+') that the action rejects.
+            if [[ ! "$ref" =~ ^[A-Za-z0-9@][A-Za-z0-9/_.#+,@-]*$ ]] ||
+              [[ "$ref" == "@" ]] ||
+              ! git check-ref-format "refs/heads/$ref" 2>/dev/null; then
               echo "::error::Invalid pull request $name ref: $ref"
               exit 1
             fi
           done
+          # The two immutable snapshots become distinct branches in the local
+          # bare origin; a shared ref would make one overwrite the other.
           if [[ "$head_ref" == "$base_ref" ]]; then
             echo "::error::Pull request head and base refs must be distinct."
             exit 1
           fi
+          if [[ ! "$commit_count" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid pull request commit count: $commit_count"
+            exit 1
+          fi
+          fetch_depth=$((commit_count > 20 ? commit_count : 20))
 
           {
             echo "sha=$head_sha"
             echo "head_ref=$head_ref"
             echo "base_sha=$base_sha"
             echo "base_ref=$base_ref"
+            echo "fetch_depth=$fetch_depth"
             echo "checkout_allowed=true"
           } >> "$GITHUB_OUTPUT"
 
@@ -183,57 +197,131 @@ jobs:
         # Keep the implicit success() guard: never prepare or hand off a local
         # origin after actor validation, PR resolution, or checkout has failed.
         # Do not add always(), failure(), or cancelled() here.
-        if: steps.claude_pr.outputs.checkout_allowed == 'true'
+        if: steps.checkout.outcome == 'success'
         env:
-          HEAD_SHA: ${{ steps.claude_pr.outputs.sha }}
-          HEAD_REF: ${{ steps.claude_pr.outputs.head_ref }}
-          BASE_SHA: ${{ steps.claude_pr.outputs.base_sha }}
-          BASE_REF: ${{ steps.claude_pr.outputs.base_ref }}
+          PR_MODE: ${{ steps.claude_pr.outputs.checkout_allowed }}
+          PR_HEAD_SHA: ${{ steps.claude_pr.outputs.sha }}
+          PR_HEAD_REF: ${{ steps.claude_pr.outputs.head_ref }}
+          PR_BASE_SHA: ${{ steps.claude_pr.outputs.base_sha }}
+          PR_BASE_REF: ${{ steps.claude_pr.outputs.base_ref }}
+          PR_FETCH_DEPTH: ${{ steps.claude_pr.outputs.fetch_depth }}
+          ISSUE_SHA: ${{ github.sha }}
+          ISSUE_REF: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
 
-          # Tag mode performs its own `git fetch origin <PR branch>`. Build a
-          # local bare origin containing only the already-authenticated PR/base
-          # snapshots so that fetch succeeds without leaving the reply-capable
-          # job token in .git/config for Claude or a delegated subagent to read.
-          # A force-push that makes either API-resolved object unavailable
-          # mid-run deliberately fails here instead of reviewing a mixed snapshot.
-          git cat-file -e "$HEAD_SHA^{commit}"
-          git cat-file -e "$BASE_SHA^{commit}"
+          validate_sha() {
+            local name="$1" sha="$2"
+            if [[ ! "$sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+              echo "::error::Invalid $name SHA: $sha"
+              exit 1
+            fi
+          }
+          validate_ref() {
+            local name="$1" ref="$2"
+            if [[ ! "$ref" =~ ^[A-Za-z0-9@][A-Za-z0-9/_.#+,@-]*$ ]] ||
+              [[ "$ref" == "@" ]] ||
+              ! git check-ref-format "refs/heads/$ref" 2>/dev/null; then
+              echo "::error::Invalid $name ref: $ref"
+              exit 1
+            fi
+          }
+
+          if [[ "$PR_MODE" == "true" ]]; then
+            head_sha="$PR_HEAD_SHA"
+            head_ref="$PR_HEAD_REF"
+            base_sha="$PR_BASE_SHA"
+            base_ref="$PR_BASE_REF"
+            fetch_depth="$PR_FETCH_DEPTH"
+          else
+            # Issue commands start from the event's immutable default-branch
+            # snapshot. If the default branch changes mid-run, the pinned action
+            # will fail against this origin instead of crossing snapshots.
+            head_sha="$ISSUE_SHA"
+            head_ref="$ISSUE_REF"
+            base_sha=""
+            base_ref=""
+            fetch_depth=1
+          fi
+
+          validate_sha "Claude head" "$head_sha"
+          validate_ref "Claude head" "$head_ref"
+          git cat-file -e "$head_sha^{commit}"
+          push_refspecs=("${head_sha}:refs/heads/${head_ref}")
+          default_ref="$head_ref"
+          if [[ "$PR_MODE" == "true" ]]; then
+            validate_sha "Claude base" "$base_sha"
+            validate_ref "Claude base" "$base_ref"
+            if [[ ! "$fetch_depth" =~ ^[0-9]+$ ]] || ((fetch_depth < 20)); then
+              echo "::error::Invalid Claude pull request fetch depth: $fetch_depth"
+              exit 1
+            fi
+            git cat-file -e "$base_sha^{commit}"
+            push_refspecs+=("${base_sha}:refs/heads/${base_ref}")
+            default_ref="$base_ref"
+          fi
+
+          # Tag mode performs its own branch fetches before Claude starts. Build
+          # a local bare origin containing only the already-authenticated exact
+          # snapshots so those fetches need no repository credential. Missing
+          # objects (for example after a force-push) deliberately fail here
+          # instead of reviewing a mixed snapshot.
           local_origin="$RUNNER_TEMP/claude-origin.git"
           object_format="$(git rev-parse --show-object-format)"
           git init --bare --quiet --object-format="$object_format" "$local_origin"
-          git push --quiet "$local_origin" \
-            "${HEAD_SHA}:refs/heads/${HEAD_REF}" \
-            "${BASE_SHA}:refs/heads/${BASE_REF}"
-          git --git-dir="$local_origin" symbolic-ref HEAD "refs/heads/${BASE_REF}"
+          git push --quiet "$local_origin" "${push_refspecs[@]}"
+          git --git-dir="$local_origin" symbolic-ref HEAD "refs/heads/${default_ref}"
           git remote set-url origin "$local_origin"
+
+          # The pinned action checks out these local branches and restores
+          # trusted startup files from origin/<base>. Pin both namespaces to the
+          # API/event snapshots; an unqualified fetch updates FETCH_HEAD only.
+          git branch -f "$head_ref" "$head_sha"
+          git update-ref "refs/remotes/origin/$head_ref" "$head_sha"
+          if [[ "$PR_MODE" == "true" ]]; then
+            git branch -f "$base_ref" "$base_sha"
+            git update-ref "refs/remotes/origin/$base_ref" "$base_sha"
+          fi
 
           if git config --local --get-regexp '^http\..*\.extraheader$' >/dev/null 2>&1; then
             echo "::error::Checkout credential remained in local Git config."
             exit 1
           fi
-          remote_line="$(git ls-remote --exit-code origin "refs/heads/$HEAD_REF")"
+          remote_line="$(git ls-remote --exit-code origin "refs/heads/$head_ref")"
           resolved_sha="${remote_line%%$'\t'*}"
           resolved_ref="${remote_line#*$'\t'}"
-          if [[ "$resolved_sha" != "$HEAD_SHA" || "$resolved_ref" != "refs/heads/$HEAD_REF" ]]; then
-            echo "::error::Local Claude origin resolved $resolved_ref at $resolved_sha, want refs/heads/$HEAD_REF at $HEAD_SHA."
+          if [[ "$resolved_sha" != "$head_sha" || "$resolved_ref" != "refs/heads/$head_ref" ]]; then
+            echo "::error::Local Claude origin resolved $resolved_ref at $resolved_sha, want refs/heads/$head_ref at $head_sha."
             exit 1
           fi
-          base_line="$(git ls-remote --exit-code origin "refs/heads/$BASE_REF")"
-          resolved_base_sha="${base_line%%$'\t'*}"
-          resolved_base_ref="${base_line#*$'\t'}"
-          if [[ "$resolved_base_sha" != "$BASE_SHA" || "$resolved_base_ref" != "refs/heads/$BASE_REF" ]]; then
-            echo "::error::Local Claude origin resolved $resolved_base_ref at $resolved_base_sha, want refs/heads/$BASE_REF at $BASE_SHA."
+          if [[ "$PR_MODE" == "true" ]]; then
+            base_line="$(git ls-remote --exit-code origin "refs/heads/$base_ref")"
+            resolved_base_sha="${base_line%%$'\t'*}"
+            resolved_base_ref="${base_line#*$'\t'}"
+            if [[ "$resolved_base_sha" != "$base_sha" || "$resolved_base_ref" != "refs/heads/$base_ref" ]]; then
+              echo "::error::Local Claude origin resolved $resolved_base_ref at $resolved_base_sha, want refs/heads/$base_ref at $base_sha."
+              exit 1
+            fi
+          fi
+
+          # Exercise the exact fetch shapes used by the pinned action before
+          # handing it control. Ref validation above makes the unqualified
+          # branch arguments safe from option/refspec injection.
+          git fetch origin "--depth=$fetch_depth" "$head_ref"
+          if [[ "$PR_MODE" == "true" ]]; then
+            git fetch origin "$base_ref" --depth=1 --no-recurse-submodules
+          fi
+
+          if [[ "$(git rev-parse "refs/remotes/origin/$head_ref")" != "$head_sha" ]]; then
+            echo "::error::Pinned Claude head tracking ref changed during fetch proof."
             exit 1
           fi
-          # Exercise the credential-free ref fetch before handing control to
-          # the action. Use a fully qualified ref so an untrusted branch name
-          # can never be parsed as an option for the base proof. The head ref's
-          # leading-dash guard above makes the action's exact unqualified fetch
-          # form safe to exercise. Do not shallow this complete checkout twice.
-          git fetch --no-tags origin "refs/heads/${BASE_REF}"
-          git fetch --no-tags origin "$HEAD_REF"
+          if [[ "$PR_MODE" == "true" ]] &&
+            [[ "$(git rev-parse "refs/remotes/origin/$base_ref")" != "$base_sha" ]]; then
+            echo "::error::Pinned Claude base tracking ref changed during fetch proof."
+            exit 1
+          fi
+
           echo "ready=true" >> "$GITHUB_OUTPUT"
 
       - name: Run Claude Code
@@ -253,6 +341,11 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
           exclude_comments_by_actor: 'claude,github-actions,*[bot]'
+          # At the exact action pin, API commit signing skips configureGitAuth,
+          # which would otherwise replace the proven local origin with an HTTPS
+          # URL embedding the reply-capable token before Claude starts. Review
+          # commands never commit, and contents:read is the final write backstop.
+          use_commit_signing: true
           # Commands are review-only. GitHub reads and inline feedback use the
           # pinned action's MCP containers, which receive the repository token
           # but not the Anthropic key. At this exact pin, tag mode creates the
@@ -261,5 +354,25 @@ jobs:
           # user-allowlisted general comment tool. Deny every current local
           # execution, file, delegation, and network builtin; review commands
           # must gather context only through the explicit GitHub MCP allowlist.
-          # Re-audit this denylist whenever the pinned action/Claude CLI changes.
-          claude_args: '--model claude-opus-4-8 --disallowed-tools "Bash,Read,Glob,Grep,Task,Edit,Write,NotebookEdit,WebFetch,WebSearch" --allowed-tools "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_file_contents,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github_inline_comment__create_inline_comment"'
+          # API signing makes the action provision file-write MCP tools; deny
+          # those explicitly too. Re-audit both this list and the action's local-
+          # origin/configureGitAuth behavior whenever either pin changes.
+          claude_args: '--model claude-opus-4-8 --disallowed-tools "Bash,Read,Glob,Grep,Task,Edit,Write,NotebookEdit,WebFetch,WebSearch,mcp__github_file_ops__commit_files,mcp__github_file_ops__delete_files,mcp__github__delete_file" --allowed-tools "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_file_contents,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github_inline_comment__create_inline_comment"'
+
+      - name: Verify credential-free Claude origin
+        # This postcondition is intentionally always() checked after the action:
+        # a future pin that rewrites origin or restores a checkout credential
+        # must make the command job non-terminal instead of passing unnoticed.
+        # Never print the unexpected URL; it could contain a credential.
+        if: always() && steps.local_origin.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+
+          if [[ "$(git remote get-url origin)" != "$RUNNER_TEMP/claude-origin.git" ]]; then
+            echo "::error::Claude action changed the credential-free local origin."
+            exit 1
+          fi
+          if git config --local --get-regexp '^http\..*\.extraheader$' >/dev/null 2>&1; then
+            echo "::error::Claude action restored an HTTP checkout credential."
+            exit 1
+          fi
