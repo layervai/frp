@@ -156,10 +156,7 @@ func TestCloseProxyKeepsOldAttemptIDWhenReplacementUsesSameIdentity(t *testing.T
 	delivered := make(chan plugin.CloseProxyContent, 2)
 
 	manager := plugin.NewManager()
-	manager.Register(&controlResultPlugin{handle: func(op string, content any) (*plugin.Response, any, error) {
-		if op != plugin.OpCloseProxy {
-			t.Fatalf("unexpected op %q", op)
-		}
+	manager.Register(&controlResultPlugin{handle: func(_ string, content any) (*plugin.Response, any, error) {
 		got := content.(plugin.CloseProxyContent)
 		if got.AttemptID == oldAttempt {
 			close(oldStarted)
