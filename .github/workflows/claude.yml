@@ -24,24 +24,25 @@ jobs:
     if: |
       (
         (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment') &&
-        contains(github.event.comment.body, '@claude') &&
+        startsWith(github.event.comment.body, '@claude') &&
         contains(fromJson('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
       ) ||
       (
         github.event_name == 'pull_request_review' &&
-        contains(github.event.review.body, '@claude') &&
+        startsWith(github.event.review.body, '@claude') &&
         contains(fromJson('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association)
       ) ||
       (
         github.event_name == 'issues' &&
-        (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
+        (startsWith(github.event.issue.body, '@claude') || startsWith(github.event.issue.title, '@claude')) &&
         contains(fromJson('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)
       )
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
-      # Review-only by design: Claude may publish comments, but cannot mutate
-      # repository contents or push a patch.
+      # Review-only by design: this multi-event job needs both write scopes to
+      # reply on pull requests and issues, but Claude's tool allowlist exposes
+      # only comment publication; it cannot close, label, edit, or push.
       contents: read
       pull-requests: write
       issues: write
