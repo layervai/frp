@@ -72,6 +72,11 @@ type NewProxyResultContent struct {
 
 type CloseProxyContent struct {
 	User UserInfo `json:"user"`
+	// AttemptID is the immutable FRPS-owned identifier minted for the
+	// successful NewProxy attempt that created this proxy. It lets consumers
+	// distinguish a delayed teardown from a replacement proxy with the same
+	// RunID and ProxyName.
+	AttemptID string `json:"attempt_id"`
 	msg.CloseProxy
 }
 

@@ -115,6 +115,35 @@ func TestManagerNewProxyPreservesAttemptIDAcrossMutationChain(t *testing.T) {
 	}
 }
 
+func TestManagerCloseProxyAttemptIDCannotBeRewrittenByPluginResponses(t *testing.T) {
+	t.Parallel()
+
+	const attemptID = "0123456789abcdef0123456789abcdef"
+	manager := NewManager()
+	for _, name := range []string{"mutator", "observer"} {
+		manager.Register(&resultTestPlugin{
+			name:      name,
+			supported: []string{OpCloseProxy},
+			handle: func(_ context.Context, _ string, content any) (*Response, any, error) {
+				got := content.(CloseProxyContent)
+				if got.AttemptID != attemptID {
+					t.Fatalf("%s plugin AttemptID = %q, want immutable %q", name, got.AttemptID, attemptID)
+				}
+				got.AttemptID = "aliased-attempt"
+				return &Response{Unchange: false}, &got, nil
+			},
+		})
+	}
+
+	content := &CloseProxyContent{AttemptID: attemptID}
+	if err := manager.CloseProxy(content); err != nil {
+		t.Fatalf("CloseProxy() error = %v", err)
+	}
+	if content.AttemptID != attemptID {
+		t.Fatalf("CloseProxy() rewrote AttemptID to %q", content.AttemptID)
+	}
+}
+
 func TestManagerNewProxyResultAggregatesErrorsWithoutShortCircuit(t *testing.T) {
 	t.Parallel()
 

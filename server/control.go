@@ -19,6 +19,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"net"
 	"runtime/debug"
 	"sync"
@@ -136,7 +137,7 @@ type Control struct {
 	workConnCh chan net.Conn
 
 	// proxies in one client
-	proxies map[string]proxy.Proxy
+	proxies map[string]registeredProxy
 
 	// pool count
 	poolCount int
@@ -159,12 +160,34 @@ type Control struct {
 	doneCh chan struct{}
 }
 
+// registeredProxy couples the live proxy with the immutable attempt ID that
+// admitted it. The identity lives in FRPS state rather than mutable plugin
+// content so a delayed CloseProxy notification cannot be mistaken for the
+// teardown of a replacement proxy with the same run ID and proxy name.
+type registeredProxy struct {
+	proxy     proxy.Proxy
+	attemptID string
+	user      plugin.UserInfo
+}
+
+func newRegisteredProxy(pxy proxy.Proxy, user plugin.UserInfo, attemptID string) registeredProxy {
+	return registeredProxy{
+		proxy:     pxy,
+		attemptID: attemptID,
+		user: plugin.UserInfo{
+			User:  user.User,
+			Metas: maps.Clone(user.Metas),
+			RunID: user.RunID,
+		},
+	}
+}
+
 func NewControl(ctx context.Context, sessionCtx *SessionContext) (*Control, error) {
 	poolCount := min(sessionCtx.LoginMsg.PoolCount, int(sessionCtx.ServerCfg.Transport.MaxPoolCount))
 	ctl := &Control{
 		sessionCtx:   sessionCtx,
 		workConnCh:   make(chan net.Conn, poolCount+10),
-		proxies:      make(map[string]proxy.Proxy),
+		proxies:      make(map[string]registeredProxy),
 		poolCount:    poolCount,
 		portsUsedNum: 0,
 		runID:        sessionCtx.LoginMsg.RunID,
@@ -313,13 +336,15 @@ func (ctl *Control) loginUserInfo() plugin.UserInfo {
 	}
 }
 
-func (ctl *Control) closeProxy(pxy proxy.Proxy) {
+func (ctl *Control) closeProxy(registered registeredProxy) {
+	pxy := registered.proxy
 	pxy.Close()
 	ctl.sessionCtx.PxyManager.Del(pxy.GetName())
 	metrics.Server.CloseProxy(pxy.GetName(), pxy.GetConfigurer().GetBaseConfig().Type)
 
 	notifyContent := &plugin.CloseProxyContent{
-		User: ctl.loginUserInfo(),
+		User:      registered.user,
+		AttemptID: registered.attemptID,
 		CloseProxy: msg.CloseProxy{
 			ProxyName: pxy.GetName(),
 		},
@@ -344,7 +369,7 @@ func (ctl *Control) worker() {
 		workConn.Close()
 	}
 	proxies := ctl.proxies
-	ctl.proxies = make(map[string]proxy.Proxy)
+	ctl.proxies = make(map[string]registeredProxy)
 	ctl.mu.Unlock()
 
 	for _, pxy := range proxies {
@@ -408,7 +433,7 @@ func (ctl *Control) handleNewProxy(m msg.Message) {
 }
 
 type (
-	registerProxyFunc     func(*msg.NewProxy) (string, error)
+	registerProxyFunc     func(*msg.NewProxy, plugin.UserInfo, string) (string, error)
 	newProxyAttemptIDFunc func() (string, error)
 )
 
@@ -444,7 +469,7 @@ func processNewProxyAttemptWithIDGenerator(
 	retContent, admissionErr := manager.NewProxy(content)
 	if admissionErr == nil {
 		effectiveContent = retContent
-		remoteAddr, admissionErr = register(&effectiveContent.NewProxy)
+		remoteAddr, admissionErr = register(&effectiveContent.NewProxy, effectiveContent.User, attemptID)
 	}
 
 	resultErr = manager.NewProxyResult(&plugin.NewProxyResultContent{
@@ -511,7 +536,11 @@ func (ctl *Control) handleCloseProxy(m msg.Message) {
 	xl.Infof("close proxy [%s] success", inMsg.ProxyName)
 }
 
-func (ctl *Control) RegisterProxy(pxyMsg *msg.NewProxy) (remoteAddr string, err error) {
+func (ctl *Control) RegisterProxy(
+	pxyMsg *msg.NewProxy,
+	user plugin.UserInfo,
+	attemptID string,
+) (remoteAddr string, err error) {
 	var pxyConf v1.ProxyConfigurer
 	// Load configures from NewProxy message and validate.
 	pxyConf, err = config.NewProxyConfigurerFromMsg(pxyMsg, ctl.sessionCtx.ServerCfg)
@@ -583,25 +612,25 @@ func (ctl *Control) RegisterProxy(pxyMsg *msg.NewProxy) (remoteAddr string, err 
 	}
 
 	ctl.mu.Lock()
-	ctl.proxies[pxy.GetName()] = pxy
+	ctl.proxies[pxy.GetName()] = newRegisteredProxy(pxy, user, attemptID)
 	ctl.mu.Unlock()
 	return
 }
 
 func (ctl *Control) CloseProxy(closeMsg *msg.CloseProxy) (err error) {
 	ctl.mu.Lock()
-	pxy, ok := ctl.proxies[closeMsg.ProxyName]
+	registered, ok := ctl.proxies[closeMsg.ProxyName]
 	if !ok {
 		ctl.mu.Unlock()
 		return
 	}
 
 	if ctl.sessionCtx.ServerCfg.MaxPortsPerClient > 0 {
-		ctl.portsUsedNum -= pxy.GetUsedPortsNum()
+		ctl.portsUsedNum -= registered.proxy.GetUsedPortsNum()
 	}
 	delete(ctl.proxies, closeMsg.ProxyName)
 	ctl.mu.Unlock()
 
-	ctl.closeProxy(pxy)
+	ctl.closeProxy(registered)
 	return
 }

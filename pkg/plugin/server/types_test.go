@@ -63,3 +63,28 @@ func TestNewProxyResultContentWireFormat(t *testing.T) {
 		t.Fatalf("NewProxyResultContent JSON = %s, want %s", got, want)
 	}
 }
+
+func TestCloseProxyContentAttemptIDWireFormat(t *testing.T) {
+	t.Parallel()
+
+	content := CloseProxyContent{
+		User: UserInfo{
+			User:  "exact-user",
+			Metas: map[string]string{"key": "value"},
+			RunID: "0123456789abcdef",
+		},
+		AttemptID: "fedcba9876543210fedcba9876543210",
+		CloseProxy: msg.CloseProxy{
+			ProxyName: "proxy-exact",
+		},
+	}
+	got, err := json.Marshal(content)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	const want = `{"user":{"user":"exact-user","metas":{"key":"value"},"run_id":"0123456789abcdef"},` +
+		`"attempt_id":"fedcba9876543210fedcba9876543210","proxy_name":"proxy-exact"}`
+	if string(got) != want {
+		t.Fatalf("CloseProxyContent JSON = %s, want %s", got, want)
+	}
+}
