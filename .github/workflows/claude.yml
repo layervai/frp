@@ -153,8 +153,9 @@ jobs:
           # checkout. This repository is private, so retain the job token for
           # that authenticated read. contents:read keeps Git pushes impossible,
           # but the persisted job token also carries the issue/PR write scopes
-          # required for replies. The explicit Bash/file-read denylist
-          # below prevents Claude from reaching the credential in .git/config.
+          # required for replies. The explicit local-tool denylist below keeps
+          # Claude on the GitHub MCP review surface and prevents it, including
+          # through Task delegation, from reaching the credential in .git/config.
           persist-credentials: true
 
       - name: Run Claude Code
@@ -174,7 +175,7 @@ jobs:
           # but not the Anthropic key. At this exact pin, tag mode creates the
           # current issue/PR tracking comment and always injects its scoped
           # update_claude_comment tool; that terminal path does not need a
-          # user-allowlisted general comment tool. Explicitly denying Bash and
-          # local file reads overrides tag mode's generic git conveniences and
-          # keeps the persisted credential outside Claude's reachable tools.
-          claude_args: '--model claude-opus-4-8 --disallowed-tools "Bash,Read,Glob,Grep" --allowed-tools "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_file_contents,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github_inline_comment__create_inline_comment"'
+          # user-allowlisted general comment tool. Deny every current local
+          # execution, file, delegation, and network builtin; review commands
+          # must gather context only through the explicit GitHub MCP allowlist.
+          claude_args: '--model claude-opus-4-8 --disallowed-tools "Bash,Read,Glob,Grep,Task,Edit,Write,NotebookEdit,WebFetch,WebSearch" --allowed-tools "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_file_contents,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github_inline_comment__create_inline_comment"'
