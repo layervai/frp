@@ -45,7 +45,6 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
-      actions: read
 
     steps:
       - name: Validate Claude trigger actor permission
@@ -106,6 +105,9 @@ jobs:
           # The job carries ANTHROPIC_API_KEY and a token that can write only
           # review comments. Never checkout a fork head across that boundary.
           if [[ "$head_repo" != "$GITHUB_REPOSITORY" ]]; then
+            if ! gh pr comment "$PR_NUMBER" --body "Claude command did not run: review commands are limited to same-repository pull requests because this workflow holds a repository secret."; then
+              echo "::warning::Unable to post the fork-rejection explanation on pull request $PR_NUMBER."
+            fi
             echo "::error::Claude command checkout is limited to same-repository pull requests."
             exit 1
           fi
