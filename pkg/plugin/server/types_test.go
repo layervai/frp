@@ -21,6 +21,25 @@ import (
 	"github.com/fatedier/frp/pkg/msg"
 )
 
+func TestUserInfoCloneIsolatesMutableMetas(t *testing.T) {
+	t.Parallel()
+
+	original := UserInfo{
+		User:  "exact-user",
+		Metas: map[string]string{"key": "original"},
+		RunID: "0123456789abcdef",
+	}
+	clone := original.Clone()
+	clone.Metas["key"] = "changed"
+
+	if original.Metas["key"] != "original" {
+		t.Fatalf("Clone() aliased Metas: original = %q", original.Metas["key"])
+	}
+	if clone.User != original.User || clone.RunID != original.RunID {
+		t.Fatalf("Clone() changed scalar identity: got %+v, want user=%q run_id=%q", clone, original.User, original.RunID)
+	}
+}
+
 func TestNewProxyContentAttemptIDWireFormat(t *testing.T) {
 	t.Parallel()
 

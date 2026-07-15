@@ -18,7 +18,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -214,11 +213,7 @@ func (m *Manager) CloseProxy(content *CloseProxyContent) error {
 		task := closeProxyNotification{
 			plugin: p,
 			content: CloseProxyContent{
-				User: UserInfo{
-					User:  content.User.User,
-					Metas: maps.Clone(content.User.Metas),
-					RunID: content.User.RunID,
-				},
+				User:       content.User.Clone(),
 				AttemptID:  content.AttemptID,
 				CloseProxy: content.CloseProxy,
 			},

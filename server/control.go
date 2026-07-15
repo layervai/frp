@@ -19,7 +19,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"maps"
 	"net"
 	"runtime/debug"
 	"sync"
@@ -174,11 +173,7 @@ func newRegisteredProxy(pxy proxy.Proxy, user plugin.UserInfo, attemptID string)
 	return registeredProxy{
 		proxy:     pxy,
 		attemptID: attemptID,
-		user: plugin.UserInfo{
-			User:  user.User,
-			Metas: maps.Clone(user.Metas),
-			RunID: user.RunID,
-		},
+		user:      user.Clone(),
 	}
 }
 

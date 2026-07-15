@@ -15,6 +15,8 @@
 package server
 
 import (
+	"maps"
+
 	"github.com/fatedier/frp/pkg/msg"
 )
 
@@ -41,6 +43,14 @@ type UserInfo struct {
 	User  string            `json:"user"`
 	Metas map[string]string `json:"metas"`
 	RunID string            `json:"run_id"`
+}
+
+// Clone returns an independent copy of the plugin identity. Metas is mutable,
+// so lifecycle callbacks and stored proxy records must not retain a caller's
+// map even though the scalar identity fields can be copied directly.
+func (u UserInfo) Clone() UserInfo {
+	u.Metas = maps.Clone(u.Metas)
+	return u
 }
 
 type NewProxyContent struct {

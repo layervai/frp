@@ -41,8 +41,9 @@ const HTTPPluginRequestTimeout = 25 * time.Second
 type httpPlugin struct {
 	options v1.HTTPPluginOptions
 
-	url    string
-	client *http.Client
+	url              string
+	client           *http.Client
+	closeProxyClient *http.Client
 }
 
 // pluginNotificationTransportError marks a callback for which http.Client
@@ -82,10 +83,17 @@ func NewHTTPPluginOptions(options v1.HTTPPluginOptions) Plugin {
 	if !strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "http://") {
 		url = "http://" + url
 	}
+	// Copy only during construction, before either client is used. The two
+	// clients share the same transport and timeout, while CloseProxy alone keeps
+	// the first redirect response terminal. http.Client must not be copied after
+	// use, so retain this dedicated instance for every callback and retry.
+	closeProxyClient := *client
+	closeProxyClient.CheckRedirect = keepPluginRedirectResponse
 	return &httpPlugin{
-		options: options,
-		url:     url,
-		client:  client,
+		options:          options,
+		url:              url,
+		client:           client,
+		closeProxyClient: &closeProxyClient,
 	}
 }
 
@@ -136,9 +144,7 @@ func (p *httpPlugin) do(ctx context.Context, r *Request, res *Response) error {
 	req.Header.Set("Content-Type", "application/json")
 	client := p.client
 	if r.Op == OpCloseProxy {
-		closeClient := *client
-		closeClient.CheckRedirect = keepPluginRedirectResponse
-		client = &closeClient
+		client = p.closeProxyClient
 	}
 	resp, err := client.Do(req)
 	if err != nil {

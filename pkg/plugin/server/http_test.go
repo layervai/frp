@@ -38,6 +38,15 @@ func TestNewHTTPPluginOptionsSetsRequestTimeout(t *testing.T) {
 		if plugin.client.Timeout != HTTPPluginRequestTimeout {
 			t.Fatalf("client timeout for %q = %s, want %s", addr, plugin.client.Timeout, HTTPPluginRequestTimeout)
 		}
+		if plugin.closeProxyClient == plugin.client {
+			t.Fatalf("CloseProxy client for %q aliases general client", addr)
+		}
+		if plugin.closeProxyClient.Timeout != plugin.client.Timeout || plugin.closeProxyClient.Transport != plugin.client.Transport {
+			t.Fatalf("CloseProxy client for %q does not share timeout/transport policy", addr)
+		}
+		if plugin.closeProxyClient.CheckRedirect == nil {
+			t.Fatalf("CloseProxy client for %q has no terminal redirect policy", addr)
+		}
 	}
 }
 
@@ -174,7 +183,7 @@ func TestHTTPPluginDoesNotFollowCloseProxyRedirectResponses(t *testing.T) {
 	body := &closeTrackingBody{Reader: strings.NewReader("redirect")}
 	transport := &redirectRoundTripper{body: body}
 	plugin := NewHTTPPluginOptions(v1.HTTPPluginOptions{Addr: "http://plugin.invalid"}).(*httpPlugin)
-	plugin.client.Transport = transport
+	plugin.closeProxyClient.Transport = transport
 
 	_, _, err := plugin.Handle(context.Background(), OpCloseProxy, CloseProxyContent{})
 	if err == nil || !strings.Contains(err.Error(), "error code: 302") {
@@ -274,7 +283,7 @@ func newCloseProxyHTTPManager(
 		Addr: "http://plugin.invalid",
 		Ops:  []string{OpCloseProxy},
 	}).(*httpPlugin)
-	plugin.client.Transport = transport
+	plugin.closeProxyClient.Transport = transport
 	manager.Register(plugin)
 	return manager
 }
