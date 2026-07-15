@@ -13,6 +13,9 @@ on:
   pull_request_review:
     types: [submitted]
 
+# Future jobs inherit no token authority unless they declare it explicitly.
+permissions: {}
+
 concurrency:
   # Serialize commands for one issue or pull request so repeated comments do
   # not race duplicate terminal reviews. Never cancel an in-flight response.
