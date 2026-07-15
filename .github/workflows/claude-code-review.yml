@@ -25,6 +25,9 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      # This workflow is PR-only: add_issue_comment publishes a PR conversation
+      # comment under pull-requests:write. A future issue trigger would also
+      # require issues:write and must not reuse this permission set silently.
       issues: read
       pull-requests: write
 
