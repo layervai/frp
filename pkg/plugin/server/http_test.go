@@ -277,7 +277,7 @@ func newCloseProxyHTTPManager(
 	transport http.RoundTripper,
 ) *Manager {
 	t.Helper()
-	manager := newManagerWithCloseProxyDelivery(queueSize, func(int) time.Duration { return 0 })
+	manager := newManagerWithCloseProxyDelivery(queueSize, func(int) time.Duration { return 0 }, time.Second)
 	plugin := NewHTTPPluginOptions(v1.HTTPPluginOptions{
 		Name: "close-proxy-test",
 		Addr: "http://plugin.invalid",
@@ -391,7 +391,7 @@ func TestManagerCloseProxyDoesNotRetryAfterHTTPResponse(t *testing.T) {
 	}
 }
 
-func TestManagerCloseProxyQueueAppliesBackpressure(t *testing.T) {
+func TestManagerCloseProxyRejectsFullQueueWithoutBlocking(t *testing.T) {
 	t.Parallel()
 
 	releaseFirst := make(chan struct{})
@@ -426,28 +426,61 @@ func TestManagerCloseProxyQueueAppliesBackpressure(t *testing.T) {
 		t.Fatalf("second CloseProxy() error = %v", err)
 	}
 
-	thirdDone := make(chan error, 1)
-	go func() {
-		thirdDone <- manager.CloseProxy(&CloseProxyContent{AttemptID: "00000000000000000000000000000003"})
-	}()
-	select {
-	case err := <-thirdDone:
-		t.Fatalf("third CloseProxy() returned without queue capacity: %v", err)
-	case <-time.After(50 * time.Millisecond):
+	started := time.Now()
+	err := manager.CloseProxy(&CloseProxyContent{AttemptID: "00000000000000000000000000000003"})
+	if !errors.Is(err, errPluginNotificationQueueFull) {
+		t.Fatalf("third CloseProxy() error = %v, want queue full", err)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("third CloseProxy() took %s on full queue, want non-blocking failure", elapsed)
 	}
 	close(releaseFirst)
 
-	select {
-	case err := <-thirdDone:
-		if err != nil {
-			t.Fatalf("third CloseProxy() error after capacity became available = %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("third CloseProxy() remained blocked after capacity became available")
+	got := receiveCloseProxyRequest(t, transport.seen)
+	if got.attemptID != "00000000000000000000000000000002" {
+		t.Fatalf("queued CloseProxy AttemptID = %q, want second notification", got.attemptID)
 	}
 }
 
-func TestManagerCloseCancelsDeliveryAndBlockedEnqueue(t *testing.T) {
+func TestManagerCloseProxyDeliveryTimeoutAdvancesQueue(t *testing.T) {
+	t.Parallel()
+
+	firstCanceled := make(chan struct{})
+	transport := &closeProxyRoundTripper{
+		seen: make(chan closeProxyRequestObservation, 2),
+		respond: func(call int, req *http.Request) (*http.Response, error) {
+			if call == 1 {
+				<-req.Context().Done()
+				close(firstCanceled)
+				return nil, req.Context().Err()
+			}
+			return closeProxyHTTPResponse(http.StatusOK, `{"reject":false,"unchange":true,"content":{}}`), nil
+		},
+	}
+	manager := newCloseProxyHTTPManager(t, 1, transport)
+	manager.closeProxyTimeout = 50 * time.Millisecond
+	t.Cleanup(manager.Close)
+
+	if err := manager.CloseProxy(&CloseProxyContent{AttemptID: "00000000000000000000000000000001"}); err != nil {
+		t.Fatalf("first CloseProxy() error = %v", err)
+	}
+	receiveCloseProxyRequest(t, transport.seen)
+	if err := manager.CloseProxy(&CloseProxyContent{AttemptID: "00000000000000000000000000000002"}); err != nil {
+		t.Fatalf("second CloseProxy() error = %v", err)
+	}
+
+	select {
+	case <-firstCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("first CloseProxy delivery did not stop at its deadline")
+	}
+	got := receiveCloseProxyRequest(t, transport.seen)
+	if got.attemptID != "00000000000000000000000000000002" {
+		t.Fatalf("delivery after timed-out head = %q, want second notification", got.attemptID)
+	}
+}
+
+func TestManagerCloseCancelsDeliveryAndDropsQueuedNotifications(t *testing.T) {
 	t.Parallel()
 
 	transportCanceled := make(chan struct{})
@@ -468,16 +501,6 @@ func TestManagerCloseCancelsDeliveryAndBlockedEnqueue(t *testing.T) {
 		t.Fatalf("second CloseProxy() error = %v", err)
 	}
 
-	blockedDone := make(chan error, 1)
-	go func() {
-		blockedDone <- manager.CloseProxy(&CloseProxyContent{AttemptID: "00000000000000000000000000000003"})
-	}()
-	select {
-	case err := <-blockedDone:
-		t.Fatalf("third CloseProxy() returned without queue capacity: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-
 	closeDone := make(chan struct{})
 	go func() {
 		manager.Close()
@@ -489,16 +512,9 @@ func TestManagerCloseCancelsDeliveryAndBlockedEnqueue(t *testing.T) {
 		t.Fatal("Manager.Close() did not cancel the in-flight HTTP request")
 	}
 	select {
-	case err := <-blockedDone:
-		if err == nil || !strings.Contains(err.Error(), "plugin manager is closed") {
-			t.Fatalf("blocked CloseProxy() error = %v, want manager closed", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Manager.Close() did not release blocked CloseProxy enqueue")
-	}
-	select {
 	case <-closeDone:
 	case <-time.After(time.Second):
 		t.Fatal("Manager.Close() did not wait for worker cancellation")
 	}
+	assertNoCloseProxyRequest(t, transport.seen)
 }

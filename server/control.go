@@ -394,17 +394,20 @@ func (ctl *Control) handleNewProxy(m msg.Message) {
 		User:     ctl.loginUserInfo(),
 		NewProxy: *inMsg,
 	}
-	inMsg, remoteAddr, err, resultErr := processNewProxyAttempt(
+	inMsg, remoteAddr, resultContent, err := processNewProxyAdmissionWithIDGenerator(
 		ctl.sessionCtx.PluginManager,
 		content,
 		ctl.RegisterProxy,
+		generateNewProxyAttemptID,
 	)
-	if resultErr != nil {
-		// NewProxyResult is a post-decision notification. A delivery error
-		// must not turn a successfully admitted proxy into a client-visible
-		// failure (the consumer may have processed the notification before
-		// the response was lost), nor mask the original admission error.
-		xl.Warnf("notify NewProxyResult for proxy [%s] error: %v", inMsg.ProxyName, resultErr)
+	if resultContent != nil {
+		resultErr := ctl.sessionCtx.PluginManager.EnqueueNewProxyResult(resultContent)
+		if resultErr != nil {
+			// NewProxyResult is a post-decision notification. A delivery error
+			// or queue-saturation error must not rewrite the admission decision.
+			// The bounded async path keeps plugin I/O off the control dispatcher.
+			xl.Warnf("enqueue NewProxyResult for proxy [%s] error: %v", inMsg.ProxyName, resultErr)
+		}
 	}
 
 	// register proxy in this control
@@ -432,14 +435,10 @@ type (
 	newProxyAttemptIDFunc func() (string, error)
 )
 
-// processNewProxyAttempt runs the mutable NewProxy plugin chain, attempts FRPS
-// registration when the chain accepts, then synchronously emits exactly one
-// immutable NewProxyResult notification before returning. The result identity
-// is the effective content returned by the plugin chain; on a plugin-chain
-// rejection, it is the original content because no replacement was accepted.
-//
-// NewProxyResult delivery is intentionally independent from admissionErr. It
-// reports the decision and cannot rewrite it; callers log resultErr separately.
+// processNewProxyAttempt is the synchronous test/integration wrapper around the
+// production admission helper. The live control path enqueues the immutable
+// result on Manager's bounded worker pool so plugin I/O cannot stall the
+// dispatcher; direct callers retain synchronous delivery and its result error.
 func processNewProxyAttempt(
 	manager *plugin.Manager,
 	content *plugin.NewProxyContent,
@@ -454,9 +453,31 @@ func processNewProxyAttemptWithIDGenerator(
 	register registerProxyFunc,
 	generateAttemptID newProxyAttemptIDFunc,
 ) (effectiveMsg *msg.NewProxy, remoteAddr string, admissionErr, resultErr error) {
+	effectiveMsg, remoteAddr, resultContent, admissionErr := processNewProxyAdmissionWithIDGenerator(
+		manager,
+		content,
+		register,
+		generateAttemptID,
+	)
+	if resultContent != nil {
+		resultErr = manager.NewProxyResult(resultContent)
+	}
+	return effectiveMsg, remoteAddr, admissionErr, resultErr
+}
+
+// processNewProxyAdmissionWithIDGenerator runs the mutable plugin chain and
+// FRPS registration, then constructs exactly one immutable result payload. It
+// performs no result-plugin I/O; the production caller can therefore enqueue
+// the payload before replying without blocking on the plugin endpoint.
+func processNewProxyAdmissionWithIDGenerator(
+	manager *plugin.Manager,
+	content *plugin.NewProxyContent,
+	register registerProxyFunc,
+	generateAttemptID newProxyAttemptIDFunc,
+) (effectiveMsg *msg.NewProxy, remoteAddr string, resultContent *plugin.NewProxyResultContent, admissionErr error) {
 	attemptID, err := generateAttemptID()
 	if err != nil {
-		return &content.NewProxy, "", fmt.Errorf("generate NewProxy attempt ID: %w", err), nil
+		return &content.NewProxy, "", nil, fmt.Errorf("generate NewProxy attempt ID: %w", err)
 	}
 	content.AttemptID = attemptID
 
@@ -467,13 +488,13 @@ func processNewProxyAttemptWithIDGenerator(
 		remoteAddr, admissionErr = register(&effectiveContent.NewProxy, effectiveContent.User, attemptID)
 	}
 
-	resultErr = manager.NewProxyResult(&plugin.NewProxyResultContent{
+	resultContent = &plugin.NewProxyResultContent{
 		User:      effectiveContent.User,
 		AttemptID: attemptID,
 		ProxyName: effectiveContent.ProxyName,
 		Admitted:  admissionErr == nil,
-	})
-	return &effectiveContent.NewProxy, remoteAddr, admissionErr, resultErr
+	}
+	return &effectiveContent.NewProxy, remoteAddr, resultContent, admissionErr
 }
 
 func generateNewProxyAttemptID() (string, error) {

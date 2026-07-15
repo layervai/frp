@@ -143,6 +143,41 @@ func TestProcessNewProxyAttemptReportsSuccessfulAdmissionSynchronously(t *testin
 	}
 }
 
+func TestProcessNewProxyAdmissionDefersResultPluginIO(t *testing.T) {
+	t.Parallel()
+
+	const attemptID = "0123456789abcdef0123456789abcdef"
+	resultCalled := false
+	manager := plugin.NewManager()
+	manager.Register(&controlResultPlugin{handle: func(op string, _ any) (*plugin.Response, any, error) {
+		if op == plugin.OpNewProxyResult {
+			resultCalled = true
+		}
+		return &plugin.Response{Unchange: true}, nil, nil
+	}})
+
+	effective, remoteAddr, resultContent, admissionErr := processNewProxyAdmissionWithIDGenerator(
+		manager,
+		newResultTestContent("0123456789abcdef", "proxy-async-result"),
+		func(*msg.NewProxy, plugin.UserInfo, string) (string, error) {
+			return "127.0.0.1:8080", nil
+		},
+		func() (string, error) { return attemptID, nil },
+	)
+	if admissionErr != nil {
+		t.Fatalf("admission error = %v", admissionErr)
+	}
+	if resultCalled {
+		t.Fatal("admission helper performed synchronous NewProxyResult plugin I/O")
+	}
+	if effective.ProxyName != "proxy-async-result" || remoteAddr != "127.0.0.1:8080" {
+		t.Fatalf("effective = %+v, remoteAddr = %q", effective, remoteAddr)
+	}
+	if resultContent == nil || resultContent.AttemptID != attemptID || !resultContent.Admitted {
+		t.Fatalf("result content = %+v, want immutable admitted result", resultContent)
+	}
+}
+
 func TestCloseProxyKeepsOldAttemptIDWhenReplacementUsesSameIdentity(t *testing.T) {
 	t.Parallel()
 

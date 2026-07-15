@@ -158,9 +158,13 @@ that was actually registered and later closed.
 
 Every server-plugin HTTP request, including both `NewProxy` and
 `NewProxyResult`, has a 25-second end-to-end timeout. `RegisterProxy` runs
-synchronously between those two callbacks and performs local FRPS registration;
-the result callback therefore completes or times out before FRPS returns the
-`NewProxy` response to the client.
+synchronously after `NewProxy` and performs local FRPS registration. FRPS then
+accepts `NewProxyResult` into a fixed 256-entry queue serviced by four workers
+before returning the `NewProxy` response to the client. Result-plugin HTTP I/O
+does not run on the control dispatcher, so a slow result endpoint cannot delay
+the admission response or subsequent heartbeat and control messages. Queue
+saturation fails the notification immediately and is logged; it never creates
+unbounded goroutines or rewrites the already-decided admission outcome.
 
 ```
 {
@@ -187,20 +191,23 @@ must use it to distinguish a delayed close from a replacement that reuses the
 same `user.run_id` and `proxy_name`.
 
 FRPS enqueues one notification for every interested plugin and proxy into a
-fixed 256-entry FIFO serviced by one worker. Enqueue blocks when the queue is
-full, applying backpressure to the proxy-teardown path rather than dropping
-lifecycle events or creating an unbounded number of goroutines.
+fixed 256-entry FIFO serviced by one worker. A full queue fails the enqueue
+immediately and is logged, rather than blocking the control dispatcher,
+teardown, or same-run-ID re-login. This bounds memory and concurrency without
+creating an unbounded number of goroutines.
 
 If an HTTP attempt fails before FRPS receives any response, the worker retries
-the notification for as long as the FRPS process remains alive, using the exact
-same content, `attempt_id`, and request ID. Retry delay starts at 100 ms and
-doubles to a maximum of five seconds. A received HTTP response is terminal and
-is never retried, including a non-2xx status, an unreadable or malformed body,
-or a successful plugin response. `CloseProxy` redirects are not followed; the
-first redirect response is itself a terminal non-2xx response. Consumers must
-therefore make transport retries idempotent by `attempt_id` and return a
-response only after recording the close outcome in the state that governs
-their contract.
+the notification within a 30-second delivery budget, using the exact same
+content, `attempt_id`, and request ID. Retry delay starts at 100 ms and doubles
+to a maximum of five seconds. When that budget expires, the worker advances to
+the next queued notification; one unreachable endpoint cannot wedge the FIFO
+for the process lifetime. A received HTTP response is terminal and is never
+retried, including a non-2xx status, an unreadable or malformed body, or a
+successful plugin response. `CloseProxy` redirects are not followed; the first
+redirect response is itself a terminal non-2xx response. Consumers must make
+transport retries idempotent by `attempt_id`, return a response only after
+recording the close outcome in the state that governs their contract, and use
+TTL or reconciliation for a notification that exhausts its bounded delivery.
 
 FRPS cancels the in-flight request and pending queue when it shuts down instead
 of attempting an unbounded drain. A plugin that maintains a live registration

@@ -19,6 +19,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -97,6 +98,80 @@ func TestManagerNewProxyResultIgnoresResponsesAndNotifiesAllPlugins(t *testing.T
 	}
 	if !slices.Equal(called, []string{"first", "second"}) {
 		t.Fatalf("notification order = %v, want [first second]", called)
+	}
+}
+
+func TestManagerEnqueueNewProxyResultBoundsConcurrencyAndNeverBlocks(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager()
+	manager.newProxyResultQueue = make(chan newProxyResultNotification, 1)
+	manager.newProxyResultWorkers = 1
+	releaseFirst := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releaseFirst) })
+		manager.Close()
+	})
+	delivered := make(chan string, 3)
+	manager.Register(&resultTestPlugin{
+		name:      "slow-result",
+		supported: []string{OpNewProxyResult},
+		handle: func(ctx context.Context, _ string, content any) (*Response, any, error) {
+			attemptID := content.(NewProxyResultContent).AttemptID
+			delivered <- attemptID
+			if attemptID == "00000000000000000000000000000001" {
+				select {
+				case <-releaseFirst:
+				case <-ctx.Done():
+					return nil, nil, ctx.Err()
+				}
+			}
+			return &Response{Unchange: true}, nil, nil
+		},
+	})
+
+	for _, attemptID := range []string{
+		"00000000000000000000000000000001",
+		"00000000000000000000000000000002",
+	} {
+		if err := manager.EnqueueNewProxyResult(&NewProxyResultContent{AttemptID: attemptID}); err != nil {
+			t.Fatalf("EnqueueNewProxyResult(%q) error = %v", attemptID, err)
+		}
+		if attemptID == "00000000000000000000000000000001" {
+			select {
+			case got := <-delivered:
+				if got != attemptID {
+					t.Fatalf("first delivered AttemptID = %q, want %q", got, attemptID)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("first NewProxyResult did not enter worker")
+			}
+		}
+	}
+
+	started := time.Now()
+	err := manager.EnqueueNewProxyResult(&NewProxyResultContent{AttemptID: "00000000000000000000000000000003"})
+	if !errors.Is(err, errPluginNotificationQueueFull) {
+		t.Fatalf("third EnqueueNewProxyResult() error = %v, want queue full", err)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("third EnqueueNewProxyResult() took %s on full queue, want non-blocking failure", elapsed)
+	}
+
+	releaseOnce.Do(func() { close(releaseFirst) })
+	select {
+	case got := <-delivered:
+		if got != "00000000000000000000000000000002" {
+			t.Fatalf("second delivered AttemptID = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued NewProxyResult was not delivered after worker recovered")
+	}
+	select {
+	case got := <-delivered:
+		t.Fatalf("queue-full NewProxyResult was unexpectedly delivered: %q", got)
+	case <-time.After(50 * time.Millisecond):
 	}
 }
 
