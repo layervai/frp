@@ -86,6 +86,34 @@ jobs:
 
           echo "authorized=true" >> "$GITHUB_OUTPUT"
 
+      - name: Materialize trusted Claude input validators
+        id: claude_validators
+        env:
+          VALIDATOR_SOURCE: |
+            validate_sha() {
+              local name="$1" sha="$2"
+              if [[ ! "$sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+                echo "::error::Invalid $name SHA."
+                return 1
+              fi
+            }
+            validate_ref() {
+              local name="$1" ref="$2"
+              if [[ ! "$ref" =~ ^[A-Za-z0-9@][A-Za-z0-9/_.#+,@-]*$ ]] ||
+                [[ "$ref" == "@" ]] ||
+                ! git check-ref-format "refs/heads/$ref" 2>/dev/null; then
+                echo "::error::Invalid $name ref."
+                return 1
+              fi
+            }
+        run: |
+          set -euo pipefail
+
+          validator_path="$RUNNER_TEMP/claude-input-validators.sh"
+          umask 077
+          printf '%s\n' "$VALIDATOR_SOURCE" > "$validator_path"
+          echo "path=$validator_path" >> "$GITHUB_OUTPUT"
+
       - name: Resolve Claude pull request context
         id: claude_pr
         if: |
@@ -95,8 +123,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          VALIDATORS: ${{ steps.claude_validators.outputs.path }}
         run: |
           set -euo pipefail
+          # shellcheck source=/dev/null
+          source "$VALIDATORS"
 
           if [[ -z "$PR_NUMBER" ]]; then
             echo "::error::Unable to resolve pull request number for Claude command."
@@ -109,6 +140,9 @@ jobs:
           fi
           head_repo="$(jq -r '.head.repo.full_name // ""' <<<"$pr")"
           head_sha="$(jq -r '.head.sha // ""' <<<"$pr")"
+          head_ref="$(jq -r '.head.ref // ""' <<<"$pr")"
+          base_sha="$(jq -r '.base.sha // ""' <<<"$pr")"
+          base_ref="$(jq -r '.base.ref // ""' <<<"$pr")"
 
           # The job carries ANTHROPIC_API_KEY and a token that can write only
           # review comments. Never checkout a fork head across that boundary.
@@ -119,16 +153,29 @@ jobs:
             echo "::error::Claude command checkout is limited to same-repository pull requests."
             exit 1
           fi
-          # GitHub uses SHA-1 today; accept the documented SHA-256 object shape
-          # as well so a future repository-format migration still fails closed
-          # on every other value.
-          if [[ ! "$head_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
-            echo "::error::Invalid pull request head SHA: $head_sha"
+          # SHA-1/SHA-256 shapes and the pinned action's stricter branch grammar
+          # are defined once in the trusted validator library used again after
+          # checkout. The ref grammar rejects leading '+' even though Git itself
+          # accepts it, because the pinned action's unqualified fetch does not.
+          validate_sha "pull request head" "$head_sha"
+          validate_sha "pull request base" "$base_sha"
+          validate_ref "pull request head" "$head_ref"
+          validate_ref "pull request base" "$base_ref"
+          # The two immutable snapshots become distinct branches in the local
+          # bare origin. Reject equality and directory/file prefix collisions
+          # explicitly instead of leaving a malformed API response to fail with
+          # an opaque refs/heads/foo vs refs/heads/foo/bar Git error.
+          if [[ "$head_ref" == "$base_ref" ]] ||
+            [[ "$head_ref" == "$base_ref/"* ]] ||
+            [[ "$base_ref" == "$head_ref/"* ]]; then
+            echo "::error::Pull request head and base refs must be distinct and non-overlapping."
             exit 1
           fi
-
           {
             echo "sha=$head_sha"
+            echo "head_ref=$head_ref"
+            echo "base_sha=$base_sha"
+            echo "base_ref=$base_ref"
             echo "checkout_allowed=true"
           } >> "$GITHUB_OUTPUT"
 
@@ -148,8 +195,148 @@ jobs:
           # Review one immutable pull-request snapshot. Ordinary issue commands
           # use the default-branch event SHA.
           ref: ${{ steps.claude_pr.outputs.sha != '' && steps.claude_pr.outputs.sha || github.sha }}
-          fetch-depth: 1
+          # Depth 0 is intentional for PR commands: the local credential-free
+          # origin needs both immutable head/base objects after checkout removes
+          # authentication. At this checkout pin, depth 0 fetches every branch
+          # tip; the later base_sha cat-file/push depends on that behavior when
+          # base is not an ancestor of head. Re-audit on checkout pin changes.
+          # Ordinary issue commands remain shallow. Checkout uses the token
+          # transiently and removes it before any pull-request-authored content
+          # reaches Claude.
+          fetch-depth: ${{ steps.claude_pr.outputs.checkout_allowed == 'true' && '0' || '1' }}
           persist-credentials: false
+
+      - name: Prepare credential-free Claude origin
+        id: local_origin
+        # Keep the implicit success() guard: never prepare or hand off a local
+        # origin after actor validation, PR resolution, or checkout has failed.
+        # Do not add always(), failure(), or cancelled() here.
+        if: steps.checkout.outcome == 'success'
+        env:
+          PR_MODE: ${{ steps.claude_pr.outputs.checkout_allowed }}
+          PR_HEAD_SHA: ${{ steps.claude_pr.outputs.sha }}
+          PR_HEAD_REF: ${{ steps.claude_pr.outputs.head_ref }}
+          PR_BASE_SHA: ${{ steps.claude_pr.outputs.base_sha }}
+          PR_BASE_REF: ${{ steps.claude_pr.outputs.base_ref }}
+          ISSUE_SHA: ${{ github.sha }}
+          ISSUE_REF: ${{ github.event.repository.default_branch }}
+          VALIDATORS: ${{ steps.claude_validators.outputs.path }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "$VALIDATORS"
+
+          if [[ "$PR_MODE" == "true" ]]; then
+            head_sha="$PR_HEAD_SHA"
+            head_ref="$PR_HEAD_REF"
+            base_sha="$PR_BASE_SHA"
+            base_ref="$PR_BASE_REF"
+            # The pinned action uses max(PR commit count, 20). A depth-20 proof
+            # exercises the same option/ref shape; the local origin already has
+            # complete reachable history, so a larger depth cannot affect auth
+            # or ref resolution.
+            fetch_depth=20
+          else
+            # Issue commands start from the event's immutable default-branch
+            # snapshot. The pinned action's later same-ref fetch stays on this
+            # local snapshot even if the public default branch moves mid-run.
+            # Checkout is intentionally depth 1 here: pushing that shallow tip
+            # and fetching it again at depth 1 is part of the pinned proof. Re-
+            # audit if either the issue checkout depth or refspec shape changes.
+            head_sha="$ISSUE_SHA"
+            head_ref="$ISSUE_REF"
+            base_sha=""
+            base_ref=""
+            fetch_depth=1
+          fi
+
+          validate_sha "Claude head" "$head_sha"
+          validate_ref "Claude head" "$head_ref"
+          git cat-file -e "$head_sha^{commit}"
+          push_refspecs=("${head_sha}:refs/heads/${head_ref}")
+          default_ref="$head_ref"
+          if [[ "$PR_MODE" == "true" ]]; then
+            validate_sha "Claude base" "$base_sha"
+            validate_ref "Claude base" "$base_ref"
+            git cat-file -e "$base_sha^{commit}"
+            push_refspecs+=("${base_sha}:refs/heads/${base_ref}")
+            default_ref="$base_ref"
+          fi
+
+          # Tag mode performs its own branch fetches before Claude starts. Build
+          # a local bare origin containing only the already-authenticated exact
+          # snapshots so those fetches need no repository credential. Missing
+          # objects (for example after a force-push) deliberately fail here
+          # instead of reviewing a mixed snapshot.
+          local_origin="$RUNNER_TEMP/claude-origin.git"
+          object_format="$(git rev-parse --show-object-format)"
+          git init --bare --quiet --object-format="$object_format" "$local_origin"
+          git push --quiet "$local_origin" "${push_refspecs[@]}"
+          git --git-dir="$local_origin" symbolic-ref HEAD "refs/heads/${default_ref}"
+          git remote set-url origin "$local_origin"
+
+          # The pinned action checks out these local branches and restores
+          # trusted startup files from origin/<base>. Pin both namespaces to the
+          # API/event snapshots; an unqualified fetch updates FETCH_HEAD only.
+          git branch -f "$head_ref" "$head_sha"
+          git update-ref "refs/remotes/origin/$head_ref" "$head_sha"
+          if [[ "$PR_MODE" == "true" ]]; then
+            git branch -f "$base_ref" "$base_sha"
+            git update-ref "refs/remotes/origin/$base_ref" "$base_sha"
+          fi
+
+          if git config --local --get-regexp '^http\..*\.extraheader$' >/dev/null 2>&1; then
+            echo "::error::Checkout credential remained in local Git config."
+            exit 1
+          fi
+          remote_line="$(git ls-remote --exit-code origin "refs/heads/$head_ref")"
+          resolved_sha="${remote_line%%$'\t'*}"
+          resolved_ref="${remote_line#*$'\t'}"
+          if [[ "$resolved_sha" != "$head_sha" || "$resolved_ref" != "refs/heads/$head_ref" ]]; then
+            echo "::error::Local Claude origin resolved $resolved_ref at $resolved_sha, want refs/heads/$head_ref at $head_sha."
+            exit 1
+          fi
+          if [[ "$PR_MODE" == "true" ]]; then
+            base_line="$(git ls-remote --exit-code origin "refs/heads/$base_ref")"
+            resolved_base_sha="${base_line%%$'\t'*}"
+            resolved_base_ref="${base_line#*$'\t'}"
+            if [[ "$resolved_base_sha" != "$base_sha" || "$resolved_base_ref" != "refs/heads/$base_ref" ]]; then
+              echo "::error::Local Claude origin resolved $resolved_base_ref at $resolved_base_sha, want refs/heads/$base_ref at $base_sha."
+              exit 1
+            fi
+          fi
+
+          # Exercise the pinned action's fetch shapes before handing it control.
+          # The action's setup head fetch intentionally lacks
+          # --no-recurse-submodules; only its trusted-base restore adds that
+          # flag, so the asymmetry below is deliberate. This repository has no
+          # submodules; adding .gitmodules requires a pin/source re-audit, and
+          # any private submodule fetch would fail closed without credentials.
+          # Ref validation makes the unqualified branch arguments safe from
+          # option/refspec injection. These --depth fetches (and the action's
+          # repeats) make the working repository
+          # shallow. That cannot truncate review context because this workflow
+          # denies every local file/git tool and reads the complete PR diff via
+          # GitHub MCP/API. Never enable a local-diff fallback without replacing
+          # these fetches or proving merge-base traversal remains complete.
+          if [[ "$PR_MODE" == "true" ]]; then
+            git fetch origin "--depth=$fetch_depth" "$head_ref"
+            git fetch origin "$base_ref" --depth=1 --no-recurse-submodules
+          else
+            git fetch origin "$head_ref" --depth=1
+          fi
+
+          if [[ "$(git rev-parse "refs/remotes/origin/$head_ref")" != "$head_sha" ]]; then
+            echo "::error::Pinned Claude head tracking ref changed during fetch proof."
+            exit 1
+          fi
+          if [[ "$PR_MODE" == "true" ]] &&
+            [[ "$(git rev-parse "refs/remotes/origin/$base_ref")" != "$base_sha" ]]; then
+            echo "::error::Pinned Claude base tracking ref changed during fetch proof."
+            exit 1
+          fi
+
+          echo "ready=true" >> "$GITHUB_OUTPUT"
 
       - name: Run Claude Code
         id: claude
@@ -157,18 +344,88 @@ jobs:
         # The pinned action restores PR-controlled startup configuration
         # (.claude/, .mcp.json, CLAUDE*.md, and related paths) from the trusted
         # base before Claude starts. Preserve that property on action upgrades.
-        if: steps.checkout.outcome == 'success'
+        if: |
+          steps.checkout.outcome == 'success' &&
+          steps.local_origin.outputs.ready == 'true'
         uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
           exclude_comments_by_actor: 'claude,github-actions,*[bot]'
+          # At the exact action pin, API commit signing skips configureGitAuth,
+          # which would otherwise replace the proven local origin with an HTTPS
+          # URL embedding the reply-capable token before Claude starts. Review
+          # commands never commit, and contents:read is the final write backstop.
+          use_commit_signing: true
           # Commands are review-only. GitHub reads and inline feedback use the
           # pinned action's MCP containers, which receive the repository token
           # but not the Anthropic key. At this exact pin, tag mode creates the
           # current issue/PR tracking comment and always injects its scoped
           # update_claude_comment tool; that terminal path does not need a
-          # user-allowlisted general comment tool. Explicitly denying Bash
-          # overrides tag mode's generic git conveniences and removes the final
-          # secret-bearing shell boundary.
-          claude_args: '--model claude-opus-4-8 --disallowed-tools "Bash" --allowed-tools "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_file_contents,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github_inline_comment__create_inline_comment"'
+          # user-allowlisted general comment tool. Deny every current local
+          # execution, file, delegation, and network builtin; review commands
+          # must gather context only through the explicit GitHub MCP allowlist.
+          # API signing makes the action provision file-write MCP tools; deny
+          # those explicitly too. On every pin change, re-derive the complete
+          # injected write-tool set from tag mode and re-audit the action's
+          # local-origin/configureGitAuth behavior; do not append by guesswork.
+          claude_args: >-
+            --model claude-opus-4-8
+            --disallowed-tools "Bash,Read,Glob,Grep,Task,Edit,Write,NotebookEdit,WebFetch,WebSearch,mcp__github_file_ops__commit_files,mcp__github_file_ops__delete_files,mcp__github__delete_file"
+            --allowed-tools "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_file_contents,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github_inline_comment__create_inline_comment"
+
+      - name: Verify credential-free Claude origin
+        # This postcondition is intentionally always() checked after the action:
+        # a future pin that rewrites origin or restores a checkout credential
+        # must make the command job non-terminal instead of passing unnoticed.
+        # Never print config values, environment values, or an unexpected URL;
+        # any of them could contain a credential.
+        if: always() && steps.local_origin.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+
+          if [[ "$(git remote get-url origin)" != "$RUNNER_TEMP/claude-origin.git" ]]; then
+            echo "::error::Claude action changed the credential-free local origin."
+            exit 1
+          fi
+
+          remote_keys="$(git config --local --name-only --get-regexp '^remote\..*\.(url|pushurl)$' || true)"
+          if [[ "$remote_keys" != "remote.origin.url" ]]; then
+            echo "::error::Claude action added an unexpected Git remote URL or push URL."
+            exit 1
+          fi
+
+          credential_config_pattern='^(credential($|\.)|core\.askpass$|http\..*\.extraheader$|url\..*\.(insteadof|pushinsteadof)$)'
+          for scope in --local --global --system; do
+            if git config "$scope" --get-regexp "$credential_config_pattern" >/dev/null 2>&1; then
+              echo "::error::Claude action persisted a credential-bearing Git configuration in $scope scope."
+              exit 1
+            fi
+          done
+
+          credential_env_names=(
+            GH_TOKEN
+            GITHUB_TOKEN
+            OVERRIDE_GITHUB_TOKEN
+            DEFAULT_WORKFLOW_TOKEN
+            GIT_ASKPASS
+            SSH_ASKPASS
+            GIT_CONFIG
+            GIT_CONFIG_GLOBAL
+            GIT_CONFIG_SYSTEM
+            GIT_CONFIG_COUNT
+            GIT_CONFIG_PARAMETERS
+          )
+          for name in "${credential_env_names[@]}"; do
+            if [[ -n "${!name:-}" ]]; then
+              echo "::error::Claude action persisted a credential-capable environment variable: $name."
+              exit 1
+            fi
+          done
+
+          for credential_file in "$HOME/.git-credentials" "$GITHUB_WORKSPACE/.git-credentials"; do
+            if [[ -e "$credential_file" ]]; then
+              echo "::error::Claude action persisted a Git credential file."
+              exit 1
+            fi
+          done
