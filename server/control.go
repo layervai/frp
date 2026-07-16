@@ -16,6 +16,8 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"runtime/debug"
@@ -134,7 +136,7 @@ type Control struct {
 	workConnCh chan net.Conn
 
 	// proxies in one client
-	proxies map[string]proxy.Proxy
+	proxies map[string]registeredProxy
 
 	// pool count
 	poolCount int
@@ -157,12 +159,30 @@ type Control struct {
 	doneCh chan struct{}
 }
 
+// registeredProxy couples the live proxy with the immutable attempt ID that
+// admitted it. The identity lives in FRPS state rather than mutable plugin
+// content so a delayed CloseProxy notification cannot be mistaken for the
+// teardown of a replacement proxy with the same run ID and proxy name.
+type registeredProxy struct {
+	proxy     proxy.Proxy
+	attemptID string
+	user      plugin.UserInfo
+}
+
+func newRegisteredProxy(pxy proxy.Proxy, user plugin.UserInfo, attemptID string) registeredProxy {
+	return registeredProxy{
+		proxy:     pxy,
+		attemptID: attemptID,
+		user:      user.Clone(),
+	}
+}
+
 func NewControl(ctx context.Context, sessionCtx *SessionContext) (*Control, error) {
 	poolCount := min(sessionCtx.LoginMsg.PoolCount, int(sessionCtx.ServerCfg.Transport.MaxPoolCount))
 	ctl := &Control{
 		sessionCtx:   sessionCtx,
 		workConnCh:   make(chan net.Conn, poolCount+10),
-		proxies:      make(map[string]proxy.Proxy),
+		proxies:      make(map[string]registeredProxy),
 		poolCount:    poolCount,
 		portsUsedNum: 0,
 		runID:        sessionCtx.LoginMsg.RunID,
@@ -311,20 +331,22 @@ func (ctl *Control) loginUserInfo() plugin.UserInfo {
 	}
 }
 
-func (ctl *Control) closeProxy(pxy proxy.Proxy) {
+func (ctl *Control) closeProxy(registered registeredProxy) {
+	pxy := registered.proxy
 	pxy.Close()
 	ctl.sessionCtx.PxyManager.Del(pxy.GetName())
 	metrics.Server.CloseProxy(pxy.GetName(), pxy.GetConfigurer().GetBaseConfig().Type)
 
 	notifyContent := &plugin.CloseProxyContent{
-		User: ctl.loginUserInfo(),
+		User:      registered.user,
+		AttemptID: registered.attemptID,
 		CloseProxy: msg.CloseProxy{
 			ProxyName: pxy.GetName(),
 		},
 	}
-	go func() {
-		_ = ctl.sessionCtx.PluginManager.CloseProxy(notifyContent)
-	}()
+	if err := ctl.sessionCtx.PluginManager.CloseProxy(notifyContent); err != nil {
+		ctl.xl.Warnf("enqueue CloseProxy plugin notification for proxy [%s] error: %v", pxy.GetName(), err)
+	}
 }
 
 func (ctl *Control) worker() {
@@ -342,7 +364,7 @@ func (ctl *Control) worker() {
 		workConn.Close()
 	}
 	proxies := ctl.proxies
-	ctl.proxies = make(map[string]proxy.Proxy)
+	ctl.proxies = make(map[string]registeredProxy)
 	ctl.mu.Unlock()
 
 	for _, pxy := range proxies {
@@ -372,11 +394,20 @@ func (ctl *Control) handleNewProxy(m msg.Message) {
 		User:     ctl.loginUserInfo(),
 		NewProxy: *inMsg,
 	}
-	var remoteAddr string
-	retContent, err := ctl.sessionCtx.PluginManager.NewProxy(content)
-	if err == nil {
-		inMsg = &retContent.NewProxy
-		remoteAddr, err = ctl.RegisterProxy(inMsg)
+	inMsg, remoteAddr, resultContent, err := processNewProxyAdmissionWithIDGenerator(
+		ctl.sessionCtx.PluginManager,
+		content,
+		ctl.RegisterProxy,
+		generateNewProxyAttemptID,
+	)
+	if resultContent != nil {
+		resultErr := ctl.sessionCtx.PluginManager.EnqueueNewProxyResult(resultContent)
+		if resultErr != nil {
+			// NewProxyResult is a post-decision notification. A delivery error
+			// or queue-saturation error must not rewrite the admission decision.
+			// The bounded async path keeps plugin I/O off the control dispatcher.
+			xl.Warnf("enqueue NewProxyResult for proxy [%s] error: %v", inMsg.ProxyName, resultErr)
+		}
 	}
 
 	// register proxy in this control
@@ -397,6 +428,81 @@ func (ctl *Control) handleNewProxy(m msg.Message) {
 		metrics.Server.NewProxy(inMsg.ProxyName, inMsg.ProxyType, ctl.sessionCtx.LoginMsg.User, clientID)
 	}
 	_ = ctl.msgDispatcher.Send(resp)
+}
+
+type (
+	registerProxyFunc     func(*msg.NewProxy, plugin.UserInfo, string) (string, error)
+	newProxyAttemptIDFunc func() (string, error)
+)
+
+// processNewProxyAttempt is the synchronous test/integration wrapper around the
+// production admission helper. The live control path enqueues the immutable
+// result on Manager's bounded worker pool so plugin I/O cannot stall the
+// dispatcher; direct callers retain synchronous delivery and its result error.
+func processNewProxyAttempt(
+	manager *plugin.Manager,
+	content *plugin.NewProxyContent,
+	register registerProxyFunc,
+) (effectiveMsg *msg.NewProxy, remoteAddr string, admissionErr, resultErr error) {
+	return processNewProxyAttemptWithIDGenerator(manager, content, register, generateNewProxyAttemptID)
+}
+
+func processNewProxyAttemptWithIDGenerator(
+	manager *plugin.Manager,
+	content *plugin.NewProxyContent,
+	register registerProxyFunc,
+	generateAttemptID newProxyAttemptIDFunc,
+) (effectiveMsg *msg.NewProxy, remoteAddr string, admissionErr, resultErr error) {
+	effectiveMsg, remoteAddr, resultContent, admissionErr := processNewProxyAdmissionWithIDGenerator(
+		manager,
+		content,
+		register,
+		generateAttemptID,
+	)
+	if resultContent != nil {
+		resultErr = manager.NewProxyResult(resultContent)
+	}
+	return effectiveMsg, remoteAddr, admissionErr, resultErr
+}
+
+// processNewProxyAdmissionWithIDGenerator runs the mutable plugin chain and
+// FRPS registration, then constructs exactly one immutable result payload. It
+// performs no result-plugin I/O; the production caller can therefore enqueue
+// the payload before replying without blocking on the plugin endpoint.
+func processNewProxyAdmissionWithIDGenerator(
+	manager *plugin.Manager,
+	content *plugin.NewProxyContent,
+	register registerProxyFunc,
+	generateAttemptID newProxyAttemptIDFunc,
+) (effectiveMsg *msg.NewProxy, remoteAddr string, resultContent *plugin.NewProxyResultContent, admissionErr error) {
+	attemptID, err := generateAttemptID()
+	if err != nil {
+		return &content.NewProxy, "", nil, fmt.Errorf("generate NewProxy attempt ID: %w", err)
+	}
+	content.AttemptID = attemptID
+
+	effectiveContent := content
+	retContent, admissionErr := manager.NewProxy(content)
+	if admissionErr == nil {
+		effectiveContent = retContent
+		remoteAddr, admissionErr = register(&effectiveContent.NewProxy, effectiveContent.User, attemptID)
+	}
+
+	resultContent = &plugin.NewProxyResultContent{
+		User:      effectiveContent.User,
+		AttemptID: attemptID,
+		ProxyName: effectiveContent.ProxyName,
+		Admitted:  admissionErr == nil,
+	}
+	return &effectiveContent.NewProxy, remoteAddr, resultContent, admissionErr
+}
+
+func generateNewProxyAttemptID() (string, error) {
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(random[:]), nil
 }
 
 func (ctl *Control) handlePing(m msg.Message) {
@@ -446,7 +552,11 @@ func (ctl *Control) handleCloseProxy(m msg.Message) {
 	xl.Infof("close proxy [%s] success", inMsg.ProxyName)
 }
 
-func (ctl *Control) RegisterProxy(pxyMsg *msg.NewProxy) (remoteAddr string, err error) {
+func (ctl *Control) RegisterProxy(
+	pxyMsg *msg.NewProxy,
+	user plugin.UserInfo,
+	attemptID string,
+) (remoteAddr string, err error) {
 	var pxyConf v1.ProxyConfigurer
 	// Load configures from NewProxy message and validate.
 	pxyConf, err = config.NewProxyConfigurerFromMsg(pxyMsg, ctl.sessionCtx.ServerCfg)
@@ -518,25 +628,25 @@ func (ctl *Control) RegisterProxy(pxyMsg *msg.NewProxy) (remoteAddr string, err 
 	}
 
 	ctl.mu.Lock()
-	ctl.proxies[pxy.GetName()] = pxy
+	ctl.proxies[pxy.GetName()] = newRegisteredProxy(pxy, user, attemptID)
 	ctl.mu.Unlock()
 	return
 }
 
 func (ctl *Control) CloseProxy(closeMsg *msg.CloseProxy) (err error) {
 	ctl.mu.Lock()
-	pxy, ok := ctl.proxies[closeMsg.ProxyName]
+	registered, ok := ctl.proxies[closeMsg.ProxyName]
 	if !ok {
 		ctl.mu.Unlock()
 		return
 	}
 
 	if ctl.sessionCtx.ServerCfg.MaxPortsPerClient > 0 {
-		ctl.portsUsedNum -= pxy.GetUsedPortsNum()
+		ctl.portsUsedNum -= registered.proxy.GetUsedPortsNum()
 	}
 	delete(ctl.proxies, closeMsg.ProxyName)
 	ctl.mu.Unlock()
 
-	ctl.closeProxy(pxy)
+	ctl.closeProxy(registered)
 	return
 }

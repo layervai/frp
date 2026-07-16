@@ -423,6 +423,7 @@ func (svr *Service) Close() error {
 	svr.rc.Close()
 	svr.muxer.Close()
 	svr.ctlManager.Close()
+	svr.pluginManager.Close()
 	if svr.cancel != nil {
 		svr.cancel()
 	}

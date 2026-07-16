@@ -70,7 +70,7 @@ The response can look like any of the following:
 
 ### Operation
 
-Currently `Login`, `NewProxy`, `CloseProxy`, `Ping`, `NewWorkConn` and `NewUserConn` operations are supported.
+Currently `Login`, `NewProxy`, `NewProxyResult`, `CloseProxy`, `Ping`, `NewWorkConn` and `NewUserConn` operations are supported.
 
 #### Login
 
@@ -103,9 +103,10 @@ Create new proxy
     "content": {
         "user": {
             "user": <string>,
-            "metas": map<string>string
+            "metas": map<string>string,
             "run_id": <string>
         },
+        "attempt_id": <string>,
         "proxy_name": <string>,
         "proxy_type": <string>,
         "use_encryption": <bool>,
@@ -138,21 +139,89 @@ Create new proxy
 }
 ```
 
-#### CloseProxy
+#### NewProxyResult
 
-A previously created proxy is closed.
+Reports the final FRPS admission result for a `NewProxy` attempt. The request is
+sent synchronously after the `NewProxy` plugin chain and, when that chain
+accepts, after FRPS attempts to register the proxy. `admitted` is true only when
+registration completed successfully.
 
-Please note that one request will be sent for every proxy that is closed, do **NOT** use this
-if you have too many proxies bound to a single client, as this may exhaust the server's resources.
+This operation is a notification. Its response cannot reject or modify the
+already-decided result. A plugin that prepares external state during `NewProxy`
+can use `attempt_id` to correlate that preparation with this final result, then
+commit the exact, unnormalized `user.run_id` and `proxy_name` state when
+`admitted` is true or roll it back when false. FRPS generates a fresh
+cryptographically random 128-bit lowercase-hex `attempt_id` before invoking the
+`NewProxy` plugin chain and does not allow plugin responses to change it. A
+failed admission is not a `CloseProxy`: FRPS only sends `CloseProxy` for a proxy
+that was actually registered and later closed.
+
+Every server-plugin HTTP request, including both `NewProxy` and
+`NewProxyResult`, has a 25-second end-to-end timeout. `RegisterProxy` runs
+synchronously after `NewProxy` and performs local FRPS registration. FRPS then
+accepts `NewProxyResult` into a fixed 256-entry queue serviced by four workers
+before returning the `NewProxy` response to the client. Result-plugin HTTP I/O
+does not run on the control dispatcher, so a slow result endpoint cannot delay
+the admission response or subsequent heartbeat and control messages. Queue
+saturation fails the notification immediately and is logged; it never creates
+unbounded goroutines or rewrites the already-decided admission outcome.
 
 ```
 {
     "content": {
         "user": {
             "user": <string>,
-            "metas": map<string>string
+            "metas": map<string>string,
             "run_id": <string>
         },
+        "attempt_id": <string>,
+        "proxy_name": <string>,
+        "admitted": <bool>
+    }
+}
+```
+
+#### CloseProxy
+
+A previously created proxy is closed.
+
+`attempt_id` is the same immutable FRPS-generated value that accompanied the
+successful `NewProxy` and `NewProxyResult` callbacks for this proxy. Consumers
+must use it to distinguish a delayed close from a replacement that reuses the
+same `user.run_id` and `proxy_name`.
+
+FRPS enqueues one notification for every interested plugin and proxy into a
+fixed 256-entry FIFO serviced by one worker. A full queue fails the enqueue
+immediately and is logged, rather than blocking the control dispatcher,
+teardown, or same-run-ID re-login. This bounds memory and concurrency without
+creating an unbounded number of goroutines.
+
+If an HTTP attempt fails before FRPS receives any response, the worker retries
+the notification within a 30-second delivery budget, using the exact same
+content, `attempt_id`, and request ID. Retry delay starts at 100 ms and doubles
+to a maximum of five seconds. When that budget expires, the worker advances to
+the next queued notification; one unreachable endpoint cannot wedge the FIFO
+for the process lifetime. A received HTTP response is terminal and is never
+retried, including a non-2xx status, an unreadable or malformed body, or a
+successful plugin response. `CloseProxy` redirects are not followed; the first
+redirect response is itself a terminal non-2xx response. Consumers must make
+transport retries idempotent by `attempt_id`, return a response only after
+recording the close outcome in the state that governs their contract, and use
+TTL or reconciliation for a notification that exhausts its bounded delivery.
+
+FRPS cancels the in-flight request and pending queue when it shuts down instead
+of attempting an unbounded drain. A plugin that maintains a live registration
+snapshot must reconcile or unregister that snapshot in its own shutdown path.
+
+```
+{
+    "content": {
+        "user": {
+            "user": <string>,
+            "metas": map<string>string,
+            "run_id": <string>
+        },
+        "attempt_id": <string>,
         "proxy_name": <string>
     }
 }

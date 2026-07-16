@@ -1,7 +1,9 @@
 package plugin
 
 import (
+	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/onsi/ginkgo/v2"
@@ -163,6 +165,95 @@ var _ = ginkgo.Describe("[Feature: Server-Plugins]", func() {
 			f.RunProcesses(serverConf, []string{clientConf})
 
 			framework.NewRequestExpect(f).Port(remotePort).Ensure()
+		})
+	})
+
+	ginkgo.Describe("NewProxyResult", func() {
+		newFunc := func() *plugin.Request {
+			var r plugin.Request
+			r.Content = &plugin.NewProxyResultContent{}
+			return &r
+		}
+
+		ginkgo.It("reports accepted and late-failed attempts without honoring response mutation", func() {
+			localPort := f.AllocPort()
+			results := make(chan plugin.NewProxyResultContent, 8)
+			handler := func(req *plugin.Request) *plugin.Response {
+				content := req.Content.(*plugin.NewProxyResultContent)
+				results <- *content
+				// NewProxyResult is notification-only. Even a rejecting response
+				// must not rewrite the already-decided FRPS admission outcome.
+				return &plugin.Response{Reject: true, RejectReason: "ignored result mutation"}
+			}
+			pluginServer := pluginpkg.NewHTTPPluginServer(localPort, newFunc, handler, nil)
+			f.RunServer("", pluginServer)
+
+			serverConf := consts.DefaultServerConfig + fmt.Sprintf(`
+			[[httpPlugins]]
+			name = "result-observer"
+			addr = "127.0.0.1:%d"
+			path = "/handler"
+			ops = ["NewProxyResult"]
+			`, localPort)
+			remotePort := f.AllocPort()
+			clientConf := consts.DefaultClientConfig + fmt.Sprintf(`
+			[[proxies]]
+			name = "result-first"
+			type = "tcp"
+			localPort = {{ .%s }}
+			remotePort = %d
+
+			[[proxies]]
+			name = "result-second"
+			type = "tcp"
+			localPort = {{ .%s }}
+			remotePort = %d
+			`, framework.TCPEchoServerPort, remotePort, framework.TCPEchoServerPort, remotePort)
+
+			f.RunProcesses(serverConf, []string{clientConf})
+			// Exactly one of the two attempts owns the shared remote port. Its
+			// rejecting result-plugin response is ignored, so the proxy remains
+			// reachable; the other attempt fails later inside RegisterProxy.
+			framework.NewRequestExpect(f).Port(remotePort).Ensure()
+
+			got := make([]plugin.NewProxyResultContent, 0, 2)
+			for len(got) < 2 {
+				select {
+				case result := <-results:
+					got = append(got, result)
+				case <-time.After(10 * time.Second):
+					ginkgo.Fail(fmt.Sprintf("timed out waiting for NewProxyResult callbacks; got %+v", got))
+				}
+			}
+
+			names := map[string]bool{}
+			attemptIDs := map[string]bool{}
+			admitted := 0
+			failed := 0
+			var runID string
+			for _, result := range got {
+				names[result.ProxyName] = true
+				framework.ExpectEqual(32, len(result.AttemptID))
+				framework.ExpectEqual(strings.ToLower(result.AttemptID), result.AttemptID)
+				_, err := hex.DecodeString(result.AttemptID)
+				framework.ExpectNoError(err)
+				attemptIDs[result.AttemptID] = true
+				framework.ExpectNotEqual("", result.User.RunID)
+				if runID == "" {
+					runID = result.User.RunID
+				}
+				framework.ExpectEqual(runID, result.User.RunID)
+				if result.Admitted {
+					admitted++
+				} else {
+					failed++
+				}
+			}
+			framework.ExpectTrue(names["result-first"])
+			framework.ExpectTrue(names["result-second"])
+			framework.ExpectEqual(2, len(attemptIDs))
+			framework.ExpectEqual(1, admitted)
+			framework.ExpectEqual(1, failed)
 		})
 	})
 
