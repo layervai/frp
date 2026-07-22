@@ -141,12 +141,17 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 		t.Fatal("workflow-level token permissions must remain empty")
 	}
 	if got, want := interactive.On, map[string]trigger{
-		"issue_comment":               {Types: []string{"created"}},
-		"pull_request_review_comment": {Types: []string{"created"}},
-		"issues":                      {Types: []string{"opened"}},
-		"pull_request_review":         {Types: []string{"submitted"}},
+		"issue_comment": {Types: []string{"created"}},
+		"issues":        {Types: []string{"opened"}},
 	}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("interactive events = %#v, want %#v", got, want)
+	}
+	for _, forbidden := range []string{
+		"pull_request", "pull_request_target", "pull_request_review", "pull_request_review_comment",
+	} {
+		if _, ok := interactive.On[forbidden]; ok {
+			t.Errorf("secret-bearing interactive workflow must not use PR-ref event %q", forbidden)
+		}
 	}
 
 	command := interactive.Jobs["claude"]
@@ -158,8 +163,6 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 	for _, exact := range []string{
 		"github.event.comment.body == '@claude'",
 		"startsWith(github.event.comment.body, '@claude ')",
-		"github.event.review.body == '@claude'",
-		"startsWith(github.event.review.body, '@claude ')",
 		"github.event.issue.body == '@claude'",
 		"startsWith(github.event.issue.body, '@claude ')",
 		"github.event.issue.title == '@claude'",
@@ -169,7 +172,6 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 	}
 	for _, loose := range []string{
 		"startsWith(github.event.comment.body, '@claude')",
-		"startsWith(github.event.review.body, '@claude')",
 		"startsWith(github.event.issue.body, '@claude')",
 		"startsWith(github.event.issue.title, '@claude')",
 	} {
@@ -264,9 +266,12 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 		`"$current_head" != "$EXPECTED_HEAD_SHA"`, `"$current_base" != "$EXPECTED_BASE_SHA"`)
 
 	if got, want := automatic.On, map[string]trigger{
-		"pull_request": {Types: []string{"opened", "synchronize", "reopened", "ready_for_review"}},
+		"pull_request_target": {Types: []string{"opened", "synchronize", "reopened", "ready_for_review"}},
 	}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("automatic events = %#v, want %#v", got, want)
+	}
+	if _, ok := automatic.On["pull_request"]; ok {
+		t.Fatal("secret-bearing automatic review must not load pull-request-authored workflow YAML")
 	}
 	review := automatic.Jobs["review"]
 	if got, want := review.Permissions, map[string]string{
@@ -286,8 +291,8 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 	if reviewCheckout.With["fetch-depth"] != 0 || reviewCheckout.With["persist-credentials"] != false {
 		t.Fatalf("automatic checkout = %#v", reviewCheckout.With)
 	}
-	if got := reviewCheckout.With["ref"]; got != "${{ github.event.repository.default_branch }}" {
-		t.Fatalf("automatic checkout must stay on trusted default branch, got %#v", got)
+	if got := reviewCheckout.With["ref"]; got != "${{ github.sha }}" {
+		t.Fatalf("automatic checkout must stay on the trusted default-branch event SHA, got %#v", got)
 	}
 	reviewOrigin := namedStep(t, review, "Prepare credential-free review origin")
 	if strings.Count(reviewOrigin.Run, helperGuard) != 2 || strings.Count(reviewOrigin.Run, extraheaderGuard) != 2 {

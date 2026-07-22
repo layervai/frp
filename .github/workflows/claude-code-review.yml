@@ -1,7 +1,10 @@
 name: Claude Code Review
 
 on:
-  pull_request:
+  # This job holds ANTHROPIC_API_KEY, so its workflow definition must come from
+  # the trusted default branch rather than the pull request merge ref. The job
+  # never checks out or executes pull-request content.
+  pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
 
 # Future jobs inherit no token authority unless they declare it explicitly.
@@ -43,10 +46,10 @@ jobs:
           # Agent mode reads the immutable PR head only through GitHub MCP. Keep
           # PR-authored files out of the credential-bearing workspace entirely:
           # v1.0.180 snapshots sensitive paths with recursive symlink
-          # dereferencing before it restores base config. The literal repository
-          # default branch is trusted workflow input, unlike API data resolved
-          # from the pull request.
-          ref: ${{ github.event.repository.default_branch }}
+          # dereferencing before it restores base config. pull_request_target's
+          # immutable event SHA is trusted default-branch input, unlike API data
+          # resolved from the pull request.
+          ref: ${{ github.sha }}
           # The same-repository head and exact base objects must be present before
           # checkout removes authentication so the next step can seed the local
           # origin used by the pinned action and GitHub-only review prompt.
@@ -182,10 +185,9 @@ jobs:
         if: |
           steps.checkout.outcome == 'success' &&
           steps.review_origin.outputs.ready == 'true'
-        # pull_request withholds secrets from forks, and the job-level gate
-        # rejects fork heads before checkout as defense in depth. Never convert
-        # this workflow to pull_request_target while checking out pull-request
-        # code or carrying a write-capable token.
+        # pull_request_target loads this secret-bearing workflow from the trusted
+        # default branch. The job-level gate rejects fork heads before a runner is
+        # allocated, and no step checks out or executes pull-request content.
         # The pinned action also replaces PR-controlled Claude startup config
         # with the trusted base version before CLI startup; preserve that
         # protection on action upgrades so hooks cannot bypass tool policy.
