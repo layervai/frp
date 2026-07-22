@@ -22,6 +22,8 @@ jobs:
     - uses: actions/setup-node@v6
       with:
         node-version: '22'
+    - name: Claude workflow contracts
+      run: go test ./test/ci
     - name: Build web assets (frps)
       run: make build
       working-directory: web/frps
