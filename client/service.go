@@ -363,6 +363,10 @@ func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginE
 			}
 			return false, err
 		}
+		if svr.ctx.Err() != nil {
+			closeSessionContext(sessionCtx)
+			return false, context.Cause(svr.ctx)
+		}
 
 		svr.runID = sessionCtx.RunID
 		xl.AddPrefix(xlog.LogPrefix{Name: "runID", Value: svr.runID})
@@ -421,7 +425,7 @@ func (e *firstLoginSuccessHookError) Unwrap() error {
 }
 
 func (svr *Service) runFirstLoginSuccessHook() error {
-	if svr.onFirstLoginSuccess == nil || svr.ctx.Err() != nil {
+	if svr.onFirstLoginSuccess == nil {
 		return nil
 	}
 	svr.firstLoginSuccessOnce.Do(func() {

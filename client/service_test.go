@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,6 +22,30 @@ import (
 
 type failingConnector struct {
 	err error
+}
+
+type cancelOnReadConn struct {
+	net.Conn
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (c *cancelOnReadConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.once.Do(c.cancel)
+	}
+	return n, err
+}
+
+type observedProxyConfigurer struct {
+	*v1.TCPProxyConfig
+	baseConfigReads atomic.Int32
+}
+
+func (c *observedProxyConfigurer) GetBaseConfig() *v1.ProxyBaseConfig {
+	c.baseConfigReads.Add(1)
+	return c.TCPProxyConfig.GetBaseConfig()
 }
 
 func (c *failingConnector) Open() error {
@@ -390,6 +415,85 @@ func TestServiceOnFirstLoginSuccessErrorRejectsSessionBeforeControl(t *testing.T
 	svr.ctlMu.RUnlock()
 	if ctl != nil {
 		t.Fatal("control was installed after hook rejection")
+	}
+}
+
+func TestServiceCancellationAfterAcceptedLoginStopsBeforeHookAndControl(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	trackedConn := &trackingConn{Conn: &cancelOnReadConn{Conn: clientConn, cancel: cancel}}
+	connector := &testConnector{conn: trackedConn}
+	t.Cleanup(func() {
+		cancel()
+		_ = clientConn.Close()
+		_ = serverConn.Close()
+	})
+
+	serverErr := make(chan error, 1)
+	go func() {
+		rw := msg.NewV1ReadWriter(serverConn)
+		var login msg.Login
+		if err := rw.ReadMsgInto(&login); err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- rw.WriteMsg(&msg.LoginResp{RunID: "accepted-after-cancel"})
+	}()
+
+	proxyCfg := &observedProxyConfigurer{TCPProxyConfig: &v1.TCPProxyConfig{
+		ProxyBaseConfig: v1.ProxyBaseConfig{
+			Name: "must-not-start",
+			Type: "tcp",
+			ProxyBackend: v1.ProxyBackend{
+				LocalPort: 10080,
+			},
+		},
+	}}
+	configSource := source.NewConfigSource()
+	if err := configSource.ReplaceAll([]v1.ProxyConfigurer{proxyCfg}, nil); err != nil {
+		t.Fatalf("seed proxy config: %v", err)
+	}
+
+	var callbacks atomic.Int32
+	svr, err := NewService(ServiceOptions{
+		Common:                 &v1.ClientCommonConfig{},
+		ConfigSourceAggregator: source.NewAggregator(configSource),
+		ConnectorCreator: func(context.Context, *v1.ClientCommonConfig) Connector {
+			return connector
+		},
+		OnFirstLoginSuccess: func(string) error {
+			callbacks.Add(1)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	proxyCfg.baseConfigReads.Store(0)
+
+	if err := svr.Run(ctx); err == nil {
+		t.Fatal("Run() error = nil after cancellation during accepted Login")
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+	if got := callbacks.Load(); got != 0 {
+		t.Fatalf("OnFirstLoginSuccess calls = %d after cancellation, want 0", got)
+	}
+	if got := proxyCfg.baseConfigReads.Load(); got != 0 {
+		t.Fatalf("proxy config reads after cancellation = %d, want 0 (control was started)", got)
+	}
+	if !trackedConn.closed.Load() {
+		t.Fatal("accepted session connection was not closed after cancellation")
+	}
+	if !connector.closed.Load() {
+		t.Fatal("accepted session connector was not closed after cancellation")
+	}
+	svr.ctlMu.RLock()
+	ctl := svr.ctl
+	svr.ctlMu.RUnlock()
+	if ctl != nil {
+		t.Fatal("control was installed after cancellation")
 	}
 }
 
