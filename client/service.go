@@ -69,11 +69,14 @@ type ServiceOptions struct {
 	// by frps is used for subsequent reconnects.
 	InitialRunID string
 
-	// OnFirstLoginSuccess is called synchronously with the accepted RunID after frps has accepted and
-	// authenticated a Login, before the corresponding control starts proxy and
-	// visitor registration. It runs at most once in this Service lifetime; a
-	// later internal reconnect cannot act on state created after the first
-	// accepted Login. Callers must keep the callback bounded and non-blocking.
+	// OnFirstLoginSuccess is called synchronously with the RunID returned after
+	// frps has accepted and authenticated a Login, before the corresponding
+	// control starts proxy and visitor registration. It runs at most once in this
+	// Service lifetime; a later internal reconnect cannot act on state created
+	// after the first accepted Login. The RunID is passed through verbatim, so a
+	// caller that correlates it with external state must validate it before
+	// applying side effects. The caller owns callback execution: it must return
+	// promptly, and a panic propagates like other ServiceOptions callbacks.
 	OnFirstLoginSuccess func(runID string)
 
 	// ConfigSourceAggregator manages internal config and optional store sources.

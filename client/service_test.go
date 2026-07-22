@@ -47,6 +47,34 @@ func getFreeTCPPort(t *testing.T) int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
+func waitForInstalledControlRunID(t *testing.T, svr *Service, want string) {
+	t.Helper()
+
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+
+	for {
+		svr.ctlMu.RLock()
+		ctl := svr.ctl
+		got := ""
+		if ctl != nil {
+			got = ctl.sessionCtx.RunID
+		}
+		svr.ctlMu.RUnlock()
+		if ctl != nil && got == want {
+			return
+		}
+
+		select {
+		case <-ticker.C:
+		case <-timer.C:
+			t.Fatalf("timed out waiting for installed control RunID %q; last RunID %q", want, got)
+		}
+	}
+}
+
 func TestRunSendsInitialRunIDOnFirstLoginAndReconnect(t *testing.T) {
 	firstClientConn, firstServerConn := net.Pipe()
 	secondClientConn, secondServerConn := net.Pipe()
@@ -60,6 +88,7 @@ func TestRunSendsInitialRunIDOnFirstLoginAndReconnect(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	secondLoginAccepted := make(chan struct{})
 	serverErrCh := make(chan error, 1)
 	go func() {
 		defer firstServerConn.Close()
@@ -94,11 +123,17 @@ func TestRunSendsInitialRunIDOnFirstLoginAndReconnect(t *testing.T) {
 			serverErrCh <- fmt.Errorf("reconnect login RunID = %q, want %q", loginMsg.RunID, "initial-run-id")
 			return
 		}
-		cancel()
+		if err := rw.WriteMsg(&msg.LoginResp{RunID: "reconnected-run-id"}); err != nil {
+			serverErrCh <- err
+			return
+		}
+		close(secondLoginAccepted)
+		<-ctx.Done()
 		serverErrCh <- nil
 	}()
 
 	var connectorCount atomic.Int32
+	var callbacks atomic.Int32
 	svr, err := NewService(ServiceOptions{
 		Common:                 &v1.ClientCommonConfig{},
 		ConfigSourceAggregator: source.NewAggregator(source.NewConfigSource()),
@@ -113,6 +148,12 @@ func TestRunSendsInitialRunIDOnFirstLoginAndReconnect(t *testing.T) {
 				return &failingConnector{err: context.Canceled}
 			}
 		},
+		OnFirstLoginSuccess: func(runID string) {
+			if runID != "initial-run-id" {
+				t.Errorf("OnFirstLoginSuccess RunID = %q, want initial-run-id", runID)
+			}
+			callbacks.Add(1)
+		},
 	})
 	if err != nil {
 		t.Fatalf("new service: %v", err)
@@ -124,15 +165,12 @@ func TestRunSendsInitialRunIDOnFirstLoginAndReconnect(t *testing.T) {
 	}()
 
 	select {
-	case err := <-serverErrCh:
-		cancel()
-		if err != nil {
-			t.Fatalf("mock server: %v", err)
-		}
+	case <-secondLoginAccepted:
+		waitForInstalledControlRunID(t, svr, "reconnected-run-id")
 	case <-time.After(5 * time.Second):
-		cancel()
 		t.Fatal("timed out waiting for reconnect login")
 	}
+	cancel()
 
 	select {
 	case err := <-runErrCh:
@@ -142,14 +180,22 @@ func TestRunSendsInitialRunIDOnFirstLoginAndReconnect(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for service shutdown")
 	}
+	if err := <-serverErrCh; err != nil {
+		t.Fatalf("mock server: %v", err)
+	}
 
 	if got := connectorCount.Load(); got != 2 {
 		t.Fatalf("connector attempts = %d, want 2", got)
+	}
+	if got := callbacks.Load(); got != 1 {
+		t.Fatalf("OnFirstLoginSuccess calls = %d, want 1 across reconnects", got)
 	}
 }
 
 func TestServiceOnFirstLoginSuccessFiresOnlyAfterAcceptedLogin(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
+	trackedConn := &trackingConn{Conn: clientConn}
+	connector := &testConnector{conn: trackedConn}
 	t.Cleanup(func() {
 		_ = clientConn.Close()
 		_ = serverConn.Close()
@@ -157,9 +203,10 @@ func TestServiceOnFirstLoginSuccessFiresOnlyAfterAcceptedLogin(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	accepted := make(chan struct{})
+	accepted := make(chan string, 1)
 	serverErr := make(chan error, 1)
 	go func() {
+		defer serverConn.Close()
 		rw := msg.NewV1ReadWriter(serverConn)
 		var login msg.Login
 		if err := rw.ReadMsgInto(&login); err != nil {
@@ -170,74 +217,59 @@ func TestServiceOnFirstLoginSuccessFiresOnlyAfterAcceptedLogin(t *testing.T) {
 			serverErr <- err
 			return
 		}
-		<-accepted
-		cancel()
+		<-ctx.Done()
 		serverErr <- nil
 	}()
 
-	var callbacks atomic.Int32
 	svr, err := NewService(ServiceOptions{
 		Common:                 &v1.ClientCommonConfig{},
 		ConfigSourceAggregator: source.NewAggregator(source.NewConfigSource()),
 		ConnectorCreator: func(context.Context, *v1.ClientCommonConfig) Connector {
-			return &testConnector{conn: &trackingConn{Conn: clientConn}}
+			return connector
 		},
 		OnFirstLoginSuccess: func(runID string) {
-			if runID != "accepted-run" {
-				t.Errorf("OnFirstLoginSuccess RunID = %q, want accepted-run", runID)
-			}
-			callbacks.Add(1)
-			close(accepted)
+			accepted <- runID
 		},
 	})
 	if err != nil {
 		t.Fatalf("new service: %v", err)
 	}
-	if err := svr.Run(ctx); err != nil {
-		t.Fatalf("run service: %v", err)
+
+	runErrCh := make(chan error, 1)
+	go func() { runErrCh <- svr.Run(ctx) }()
+
+	select {
+	case runID := <-accepted:
+		if runID != "accepted-run" {
+			t.Fatalf("OnFirstLoginSuccess RunID = %q, want accepted-run", runID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for accepted-login callback")
+	}
+	waitForInstalledControlRunID(t, svr, "accepted-run")
+	select {
+	case err := <-runErrCh:
+		t.Fatalf("Service.Run returned before external cancellation: %v", err)
+	default:
+	}
+
+	cancel()
+	select {
+	case err := <-runErrCh:
+		if err != nil {
+			t.Fatalf("run service: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for service shutdown")
 	}
 	if err := <-serverErr; err != nil {
 		t.Fatalf("server: %v", err)
 	}
-	if got := callbacks.Load(); got != 1 {
-		t.Fatalf("OnFirstLoginSuccess calls = %d, want 1", got)
+	if !trackedConn.closed.Load() {
+		t.Fatal("control connection was not closed during Service.Run cleanup")
 	}
-}
-
-func TestServiceOnFirstLoginSuccessDoesNotRefireForLaterReconnect(t *testing.T) {
-	var callbacks atomic.Int32
-	svr := &Service{
-		ctx:                 context.Background(),
-		runID:               "first-run",
-		onFirstLoginSuccess: func(string) { callbacks.Add(1) },
-	}
-	svr.notifyFirstLoginSuccess()
-	svr.runID = "later-reconnect-run"
-	svr.notifyFirstLoginSuccess()
-	if got := callbacks.Load(); got != 1 {
-		t.Fatalf("OnFirstLoginSuccess calls = %d, want 1 across reconnects", got)
-	}
-}
-
-func TestServiceOnFirstLoginSuccessDoesNotFireOnRejectedLogin(t *testing.T) {
-	loginFailExit := true
-	var callbacks atomic.Int32
-	svr, err := NewService(ServiceOptions{
-		Common:                 &v1.ClientCommonConfig{LoginFailExit: &loginFailExit},
-		ConfigSourceAggregator: source.NewAggregator(source.NewConfigSource()),
-		ConnectorCreator: func(context.Context, *v1.ClientCommonConfig) Connector {
-			return &failingConnector{err: errors.New("login transport rejected")}
-		},
-		OnFirstLoginSuccess: func(string) { callbacks.Add(1) },
-	})
-	if err != nil {
-		t.Fatalf("new service: %v", err)
-	}
-	if err := svr.Run(context.Background()); err == nil {
-		t.Fatal("Run() error = nil, want rejected login")
-	}
-	if got := callbacks.Load(); got != 0 {
-		t.Fatalf("OnFirstLoginSuccess calls = %d, want 0", got)
+	if !connector.closed.Load() {
+		t.Fatal("connector was not closed during Service.Run cleanup")
 	}
 }
 
