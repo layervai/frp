@@ -71,6 +71,13 @@ type ServiceOptions struct {
 	// by frps is used for subsequent reconnects.
 	InitialRunID string
 
+	// OnFirstLoginSuccess is called synchronously with the accepted RunID after frps has accepted and
+	// authenticated a Login, before the corresponding control starts proxy and
+	// visitor registration. It runs at most once in this Service lifetime; a
+	// later internal reconnect cannot act on state created after the first
+	// accepted Login. Callers must keep the callback bounded and non-blocking.
+	OnFirstLoginSuccess func(runID string)
+
 	// ConfigSourceAggregator manages internal config and optional store sources.
 	// It is required for creating a Service.
 	ConfigSourceAggregator *source.Aggregator
@@ -161,8 +168,10 @@ type Service struct {
 	// call cancel to stop service
 	cancel context.CancelCauseFunc
 
-	connectorCreator func(context.Context, *v1.ClientCommonConfig) Connector
-	handleWorkConnCb func(*v1.ProxyBaseConfig, net.Conn, *msg.StartWorkConn) bool
+	connectorCreator      func(context.Context, *v1.ClientCommonConfig) Connector
+	handleWorkConnCb      func(*v1.ProxyBaseConfig, net.Conn, *msg.StartWorkConn) bool
+	onFirstLoginSuccess   func(string)
+	firstLoginSuccessOnce sync.Once
 }
 
 func NewService(options ServiceOptions) (*Service, error) {
@@ -202,22 +211,23 @@ func NewService(options ServiceOptions) (*Service, error) {
 	}
 
 	s := &Service{
-		ctx:              context.Background(),
-		runID:            options.InitialRunID,
-		auth:             authRuntime,
-		webServer:        webServer,
-		common:           options.Common,
-		reloadCommon:     options.Common,
-		configFilePath:   options.ConfigFilePath,
-		unsafeFeatures:   options.UnsafeFeatures,
-		proxyCfgs:        proxyCfgs,
-		visitorCfgs:      visitorCfgs,
-		clientSpec:       options.ClientSpec,
-		aggregator:       options.ConfigSourceAggregator,
-		configSource:     configSource,
-		storeSource:      storeSource,
-		connectorCreator: options.ConnectorCreator,
-		handleWorkConnCb: options.HandleWorkConnCb,
+		ctx:                 context.Background(),
+		runID:               options.InitialRunID,
+		auth:                authRuntime,
+		webServer:           webServer,
+		common:              options.Common,
+		reloadCommon:        options.Common,
+		configFilePath:      options.ConfigFilePath,
+		unsafeFeatures:      options.UnsafeFeatures,
+		proxyCfgs:           proxyCfgs,
+		visitorCfgs:         visitorCfgs,
+		clientSpec:          options.ClientSpec,
+		aggregator:          options.ConfigSourceAggregator,
+		configSource:        configSource,
+		storeSource:         storeSource,
+		connectorCreator:    options.ConnectorCreator,
+		handleWorkConnCb:    options.HandleWorkConnCb,
+		onFirstLoginSuccess: options.OnFirstLoginSuccess,
 	}
 
 	if webServer != nil {
@@ -345,6 +355,7 @@ func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginE
 		svr.runID = sessionCtx.RunID
 		xl.AddPrefix(xlog.LogPrefix{Name: "runID", Value: svr.runID})
 		xl.Infof("login to server success, get run id [%s]", svr.runID)
+		svr.notifyFirstLoginSuccess()
 
 		svr.cfgMu.RLock()
 		proxyCfgs := svr.proxyCfgs
@@ -379,6 +390,12 @@ func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginE
 			Jitter:      0.1,
 			MaxDuration: maxInterval,
 		}), true, svr.ctx.Done())
+}
+
+func (svr *Service) notifyFirstLoginSuccess() {
+	if svr.onFirstLoginSuccess != nil && svr.ctx.Err() == nil {
+		svr.firstLoginSuccessOnce.Do(func() { svr.onFirstLoginSuccess(svr.runID) })
+	}
 }
 
 func (svr *Service) UpdateAllConfigurer(proxyCfgs []v1.ProxyConfigurer, visitorCfgs []v1.VisitorConfigurer) error {
