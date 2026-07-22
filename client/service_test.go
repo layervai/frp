@@ -148,6 +148,141 @@ func TestRunSendsInitialRunIDOnFirstLoginAndReconnect(t *testing.T) {
 	}
 }
 
+func TestServiceOnFirstLoginSuccessFiresOnlyAfterAcceptedLogin(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = clientConn.Close()
+		_ = serverConn.Close()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	accepted := make(chan struct{})
+	serverErr := make(chan error, 1)
+	go func() {
+		rw := msg.NewV1ReadWriter(serverConn)
+		var login msg.Login
+		if err := rw.ReadMsgInto(&login); err != nil {
+			serverErr <- err
+			return
+		}
+		if err := rw.WriteMsg(&msg.LoginResp{RunID: "accepted-run"}); err != nil {
+			serverErr <- err
+			return
+		}
+		<-accepted
+		cancel()
+		serverErr <- nil
+	}()
+
+	var callbacks atomic.Int32
+	svr, err := NewService(ServiceOptions{
+		Common:                 &v1.ClientCommonConfig{},
+		ConfigSourceAggregator: source.NewAggregator(source.NewConfigSource()),
+		ConnectorCreator: func(context.Context, *v1.ClientCommonConfig) Connector {
+			return &testConnector{conn: &trackingConn{Conn: clientConn}}
+		},
+		OnFirstLoginSuccess: func(runID string) {
+			if runID != "accepted-run" {
+				t.Errorf("OnFirstLoginSuccess RunID = %q, want accepted-run", runID)
+			}
+			callbacks.Add(1)
+			close(accepted)
+		},
+	})
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	if err := svr.Run(ctx); err != nil {
+		t.Fatalf("run service: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+	if got := callbacks.Load(); got != 1 {
+		t.Fatalf("OnFirstLoginSuccess calls = %d, want 1", got)
+	}
+}
+
+func TestServiceOnFirstLoginSuccessDoesNotRefireForLaterReconnect(t *testing.T) {
+	var callbacks atomic.Int32
+	svr := &Service{
+		ctx:                 context.Background(),
+		runID:               "first-run",
+		onFirstLoginSuccess: func(string) { callbacks.Add(1) },
+	}
+	svr.notifyFirstLoginSuccess()
+	svr.runID = "later-reconnect-run"
+	svr.notifyFirstLoginSuccess()
+	if got := callbacks.Load(); got != 1 {
+		t.Fatalf("OnFirstLoginSuccess calls = %d, want 1 across reconnects", got)
+	}
+}
+
+func TestServiceOnFirstLoginSuccessDoesNotFireOnRejectedLogin(t *testing.T) {
+	loginFailExit := true
+	var callbacks atomic.Int32
+	svr, err := NewService(ServiceOptions{
+		Common:                 &v1.ClientCommonConfig{LoginFailExit: &loginFailExit},
+		ConfigSourceAggregator: source.NewAggregator(source.NewConfigSource()),
+		ConnectorCreator: func(context.Context, *v1.ClientCommonConfig) Connector {
+			return &failingConnector{err: errors.New("login transport rejected")}
+		},
+		OnFirstLoginSuccess: func(string) { callbacks.Add(1) },
+	})
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	if err := svr.Run(context.Background()); err == nil {
+		t.Fatal("Run() error = nil, want rejected login")
+	}
+	if got := callbacks.Load(); got != 0 {
+		t.Fatalf("OnFirstLoginSuccess calls = %d, want 0", got)
+	}
+}
+
+func TestServiceOnFirstLoginSuccessDoesNotFireOnAuthenticatedLoginRejection(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = clientConn.Close()
+		_ = serverConn.Close()
+	})
+
+	serverErr := make(chan error, 1)
+	go func() {
+		rw := msg.NewV1ReadWriter(serverConn)
+		var login msg.Login
+		if err := rw.ReadMsgInto(&login); err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- rw.WriteMsg(&msg.LoginResp{RunID: "rejected-run", Error: "token rejected"})
+	}()
+
+	loginFailExit := true
+	var callbacks atomic.Int32
+	svr, err := NewService(ServiceOptions{
+		Common:                 &v1.ClientCommonConfig{LoginFailExit: &loginFailExit},
+		ConfigSourceAggregator: source.NewAggregator(source.NewConfigSource()),
+		ConnectorCreator: func(context.Context, *v1.ClientCommonConfig) Connector {
+			return &testConnector{conn: &trackingConn{Conn: clientConn}}
+		},
+		OnFirstLoginSuccess: func(string) { callbacks.Add(1) },
+	})
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	if err := svr.Run(context.Background()); err == nil {
+		t.Fatal("Run() error = nil, want authenticated LoginResp rejection")
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+	if got := callbacks.Load(); got != 0 {
+		t.Fatalf("OnFirstLoginSuccess calls = %d, want 0", got)
+	}
+}
+
 func TestRunStopsStartedComponentsOnInitialLoginFailure(t *testing.T) {
 	port := getFreeTCPPort(t)
 	agg := source.NewAggregator(source.NewConfigSource())
