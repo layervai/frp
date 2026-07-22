@@ -348,6 +348,7 @@ jobs:
           EXPECTED_HEAD_REF: ${{ github.event.pull_request.head.ref }}
           EXPECTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           EXPECTED_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          TRUSTED_DEFAULT_REF: ${{ github.event.repository.default_branch }}
           EXECUTION_FILE: ${{ steps.claude_review.outputs.execution_file }}
           LOCAL_ORIGIN: ${{ steps.review_origin.outputs.path }}
           TRUSTED_GUIDANCE_OID: ${{ steps.review_origin.outputs.trusted_guidance_oid }}
