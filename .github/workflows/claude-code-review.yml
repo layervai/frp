@@ -24,10 +24,12 @@ jobs:
     # distinct from the command workflow's trigger-actor authorization. Keep it
     # if this workflow's trigger or trust model changes.
     if: |
+      github.event.pull_request.state == 'open' &&
       github.event.pull_request.user.type != 'Bot' &&
       github.event.pull_request.draft == false &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.base.repo.full_name == github.repository
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref != github.event.repository.default_branch
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -60,6 +62,7 @@ jobs:
         id: review_origin
         if: steps.checkout.outcome == 'success'
         env:
+          EXPECTED_STATE: ${{ github.event.pull_request.state }}
           EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           EXPECTED_HEAD_REF: ${{ github.event.pull_request.head.ref }}
           EXPECTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -79,7 +82,8 @@ jobs:
               [[ "$1" != "@" ]] &&
               git check-ref-format "refs/heads/$1" >/dev/null 2>&1
           }
-          if ! validate_sha "$EXPECTED_HEAD_SHA" ||
+          if [[ "$EXPECTED_STATE" != "open" ]] ||
+            ! validate_sha "$EXPECTED_HEAD_SHA" ||
             ! validate_sha "$EXPECTED_BASE_SHA" ||
             ! validate_ref "$EXPECTED_HEAD_REF" ||
             ! validate_ref "$EXPECTED_BASE_REF" ||
@@ -87,6 +91,7 @@ jobs:
             [[ "$EXPECTED_HEAD_REF" == "$EXPECTED_BASE_REF/"* ]] ||
             [[ "$EXPECTED_BASE_REF" == "$EXPECTED_HEAD_REF/"* ]] ||
             ! validate_ref "$TRUSTED_DEFAULT_REF" ||
+            [[ "$EXPECTED_HEAD_REF" == "$TRUSTED_DEFAULT_REF" ]] ||
             [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] ||
             [[ ! "$RUN_ID" =~ ^[1-9][0-9]*$ ]] ||
             [[ ! "$RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
@@ -180,11 +185,53 @@ jobs:
             echo "ready=true"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Verify current review target
+        id: current_target
+        if: steps.review_origin.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          TRUSTED_DEFAULT_REF: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          validate_ref() {
+            [[ "$1" != "@" ]] &&
+              [[ "$1" =~ ^[A-Za-z0-9@_][A-Za-z0-9/_.#+,@-]*$ ]] &&
+              git check-ref-format "refs/heads/$1" >/dev/null 2>&1
+          }
+          if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] ||
+            ! validate_ref "$EXPECTED_HEAD_REF" ||
+            ! validate_ref "$TRUSTED_DEFAULT_REF"; then
+            echo "::error::Claude review target verification received invalid pull request metadata."
+            exit 1
+          fi
+          if ! current_pr="$(timeout 30s gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"; then
+            echo "::error::Unable to refresh the pull request immediately before Claude review."
+            exit 1
+          fi
+          current_state="$(jq -r '.state // ""' <<<"$current_pr")"
+          current_head_ref="$(jq -r '.head.ref // ""' <<<"$current_pr")"
+          current_default_branch="$(jq -r '.base.repo.default_branch // ""' <<<"$current_pr")"
+          if [[ "$current_state" != "open" ]] ||
+            ! validate_ref "$current_head_ref" ||
+            ! validate_ref "$current_default_branch" ||
+            [[ "$current_head_ref" != "$EXPECTED_HEAD_REF" ]] ||
+            [[ "$current_default_branch" != "$TRUSTED_DEFAULT_REF" ]] ||
+            [[ "$current_head_ref" == "$current_default_branch" ]]; then
+            echo "::error::Claude review requires an open pull request whose head is not the repository default branch."
+            exit 1
+          fi
+
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
       - name: Run Claude Code Review
         id: claude_review
         if: |
           steps.checkout.outcome == 'success' &&
-          steps.review_origin.outputs.ready == 'true'
+          steps.review_origin.outputs.ready == 'true' &&
+          steps.current_target.outputs.ready == 'true'
         # pull_request_target loads this secret-bearing workflow from the trusted
         # default branch. The job-level gate rejects fork heads before a runner is
         # allocated, and no step checks out or executes pull-request content.
@@ -368,10 +415,15 @@ jobs:
           current_head="$(jq -r '.head.sha // ""' <<<"$current_pr")"
           current_head_ref="$(jq -r '.head.ref // ""' <<<"$current_pr")"
           current_base_repo="$(jq -r '.base.repo.full_name // ""' <<<"$current_pr")"
+          current_default_branch="$(jq -r '.base.repo.default_branch // ""' <<<"$current_pr")"
           current_base="$(jq -r '.base.sha // ""' <<<"$current_pr")"
           current_base_ref="$(jq -r '.base.ref // ""' <<<"$current_pr")"
-          if [[ "$current_head_repo" != "$GITHUB_REPOSITORY" ||
+          current_state="$(jq -r '.state // ""' <<<"$current_pr")"
+          if [[ "$current_state" != "open" ||
+            "$current_head_repo" != "$GITHUB_REPOSITORY" ||
             "$current_base_repo" != "$GITHUB_REPOSITORY" ||
+            "$current_default_branch" != "$TRUSTED_DEFAULT_REF" ||
+            "$current_head_ref" == "$current_default_branch" ||
             "$current_head" != "$EXPECTED_HEAD_SHA" ||
             "$current_head_ref" != "$EXPECTED_HEAD_REF" ||
             "$current_base" != "$EXPECTED_BASE_SHA" ||

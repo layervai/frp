@@ -186,7 +186,9 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 	resolver := namedStep(t, command, "Resolve Claude pull request context").Run
 	requireFragments(t, resolver,
 		`timeout 30s gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER"`,
-		`.head.repo.full_name`, `.base.repo.full_name`, `.commits`,
+		`.head.repo.full_name`, `.base.repo.full_name`, `.base.repo.default_branch`, `.commits`, `.state`,
+		`"$pr_state" != "open"`, `validate_ref "repository default branch" "$default_branch"`,
+		`"$head_ref" == "$default_branch"`, `echo "default_branch=$default_branch"`,
 		`head_fetch_depth=$(( commit_count > 20 ? commit_count : 20 ))`,
 		`echo "head_fetch_depth=$head_fetch_depth"`,
 		`"$base_repo" != "$GITHUB_REPOSITORY"`)
@@ -206,13 +208,18 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 		t.Fatalf("interactive checkout ref = %#v", got)
 	}
 
-	origin := namedStep(t, command, "Prepare credential-free Claude origin").Run
+	originStep := namedStep(t, command, "Prepare credential-free Claude origin")
+	if got := originStep.Env["PR_DEFAULT_REF"]; got != "${{ steps.claude_pr.outputs.default_branch }}" {
+		t.Fatalf("interactive origin PR_DEFAULT_REF = %#v", got)
+	}
+	origin := originStep.Run
 	helperGuard := "git config --local --get-regexp '" + helperPattern + "'"
 	extraheaderGuard := "git config --local --get-regexp '^http\\..*\\.extraheader$'"
 	if strings.Count(origin, helperGuard) != 2 || strings.Count(origin, extraheaderGuard) != 2 {
 		t.Fatal("local origin must reject credential config before and after fetch proofs")
 	}
 	requireFragments(t, origin,
+		`PR_DEFAULT_REF`, `"$ISSUE_REF" != "$PR_DEFAULT_REF"`, `"$PR_HEAD_REF" == "$PR_DEFAULT_REF"`,
 		`validate_sensitive_tree "Claude head" "$head_sha"`,
 		`git init --bare --quiet --object-format="$object_format" "$local_origin"`,
 		`git config --local fetch.recurseSubmodules false`,
@@ -229,11 +236,17 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 		strings.LastIndex(origin, helperGuard) < strings.Index(origin, `git fetch origin "$base_ref" --depth=1`) {
 		t.Fatal("credential helper checks do not bracket the pinned fetch proofs")
 	}
+	commandTarget := namedStep(t, command, "Verify current Claude target")
+	requireFragments(t, commandTarget.Run,
+		`if [[ "$PR_MODE" != "true" ]]`, `echo "ready=true"`,
+		`repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER`, `.state`, `.head.ref`, `.base.repo.default_branch`,
+		`"$current_state" != "open"`, `"$current_head_ref" == "$current_default_branch"`)
 
 	commandAction := namedStep(t, command, "Run Claude Code")
 	if commandAction.ID != "claude" || commandAction.Uses != claudeAction {
 		t.Fatalf("interactive action = id %q uses %q", commandAction.ID, commandAction.Uses)
 	}
+	requireFragments(t, commandAction.If, `steps.current_target.outputs.ready == 'true'`)
 	if got, ok := commandAction.With["use_commit_signing"].(bool); !ok || !got {
 		t.Fatal("interactive action must skip Git credential installation")
 	}
@@ -263,6 +276,8 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 		`git --git-dir="$LOCAL_ORIGIN" rev-parse --verify "refs/heads/$EXPECTED_HEAD_REF"`,
 		`git rev-parse --verify "refs/heads/$EXPECTED_HEAD_REF"`,
 		`git rev-parse --verify "refs/remotes/origin/$EXPECTED_HEAD_REF"`,
+		`"$current_state" != "open"`, `"$current_default_branch" != "$TRUSTED_DEFAULT_REF"`,
+		`"$current_head_ref" == "$current_default_branch"`,
 		`"$current_head" != "$EXPECTED_HEAD_SHA"`, `"$current_base" != "$EXPECTED_BASE_SHA"`)
 
 	if got, want := automatic.On, map[string]trigger{
@@ -280,10 +295,12 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 		t.Fatalf("automatic permissions = %#v, want %#v", got, want)
 	}
 	requireFragments(t, review.If,
+		"github.event.pull_request.state == 'open'",
 		"github.event.pull_request.user.type != 'Bot'",
 		"github.event.pull_request.draft == false",
 		"github.event.pull_request.head.repo.full_name == github.repository",
-		"github.event.pull_request.base.repo.full_name == github.repository")
+		"github.event.pull_request.base.repo.full_name == github.repository",
+		"github.event.pull_request.head.ref != github.event.repository.default_branch")
 	if strings.Contains(review.If, "github.actor") {
 		t.Fatal("automatic bot guard must use the PR author, not the event actor")
 	}
@@ -299,6 +316,7 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 		t.Fatal("automatic local origin must reject credential config around base restore proof")
 	}
 	requireFragments(t, reviewOrigin.Run,
+		`"$EXPECTED_STATE" != "open"`, `"$EXPECTED_HEAD_REF" == "$TRUSTED_DEFAULT_REF"`,
 		`^[A-Za-z0-9@_][A-Za-z0-9/_.#+,@-]*$`,
 		`[[ "$1" != "@" ]]`,
 		`git checkout --quiet --detach "$trusted_start_sha"`,
@@ -310,11 +328,16 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 		`echo "review_marker=<!-- claude-review:$GITHUB_REPOSITORY:pr-$PR_NUMBER:run-$RUN_ID:`+
 			`attempt-$RUN_ATTEMPT:head-$EXPECTED_HEAD_SHA -->"`,
 		`git fetch origin "$EXPECTED_BASE_REF" --depth=1 --no-recurse-submodules`)
+	reviewTarget := namedStep(t, review, "Verify current review target")
+	requireFragments(t, reviewTarget.Run,
+		`repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER`, `.state`, `.head.ref`, `.base.repo.default_branch`,
+		`"$current_state" != "open"`, `"$current_head_ref" == "$current_default_branch"`)
 
 	reviewAction := namedStep(t, review, "Run Claude Code Review")
 	if reviewAction.ID != "claude_review" || reviewAction.Uses != claudeAction {
 		t.Fatalf("automatic action = id %q uses %q", reviewAction.ID, reviewAction.Uses)
 	}
+	requireFragments(t, reviewAction.If, `steps.current_target.outputs.ready == 'true'`)
 	if got, ok := reviewAction.With["use_commit_signing"].(bool); !ok || !got {
 		t.Fatal("automatic action must skip Git credential installation")
 	}
@@ -382,6 +405,8 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 		`git rev-parse --verify "refs/heads/$EXPECTED_HEAD_REF"`,
 		`git rev-parse --verify "refs/remotes/origin/$EXPECTED_HEAD_REF"`,
 		`git hash-object AGENTS.md`, `git hash-object CLAUDE.md`,
+		`"$current_state" != "open"`, `"$current_default_branch" != "$TRUSTED_DEFAULT_REF"`,
+		`"$current_head_ref" == "$current_default_branch"`,
 		`"$current_head" != "$EXPECTED_HEAD_SHA"`, `"$current_base" != "$EXPECTED_BASE_SHA"`,
 		`timeout 30s gh api --paginate`, `github-actions[bot]`, `endswith("\n" + $marker)`,
 		`sub("[\\r\\n]+$"; "")`, `indices($marker)`, `rtrimstr($marker)`,
@@ -588,9 +613,11 @@ if [[ "$*" == *"/comments?per_page=100"* ]]; then
   esac
   exit 0
 fi
-printf '{"head":{"repo":{"full_name":"%s"},"sha":"%s","ref":"%s"},"base":{"repo":{"full_name":"%s"},"sha":"%s","ref":"%s"}}\n' \
-  "$GITHUB_REPOSITORY" "$MOCK_HEAD_SHA" "$MOCK_HEAD_REF" \
-  "$GITHUB_REPOSITORY" "$MOCK_BASE_SHA" "$MOCK_BASE_REF"
+printf '{"state":"%s","head":{"repo":{"full_name":"%s"},"sha":"%s","ref":"%s"},"base":{' \
+  "${MOCK_PR_STATE:-open}" \
+  "$GITHUB_REPOSITORY" "$MOCK_HEAD_SHA" "$MOCK_HEAD_REF"
+printf '"repo":{"full_name":"%s","default_branch":"%s"},"sha":"%s","ref":"%s"},"commits":25}\n' \
+  "$GITHUB_REPOSITORY" "${MOCK_DEFAULT_BRANCH:-main}" "$MOCK_BASE_SHA" "$MOCK_BASE_REF"
 `
 	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
 		t.Fatal(err)
@@ -631,6 +658,104 @@ func requireScriptResult(t *testing.T, dir, script string, env []string, wantSuc
 	return output
 }
 
+func TestInteractiveClaudePRLifecycleFences(t *testing.T) {
+	wf := loadWorkflow(t, "claude.yml")
+	job := wf.Jobs["claude"]
+	fixture := createReviewFixture(t)
+	runnerTemp := t.TempDir()
+	home := t.TempDir()
+	validatorPath := filepath.Join(runnerTemp, "validators.sh")
+	writeValidator(t, wf, validatorPath)
+	bin := writeMockGH(t, filepath.Join(runnerTemp, "bin"))
+
+	base := map[string]string{
+		"PATH": bin + string(os.PathListSeparator) + os.Getenv("PATH"), "GH_TOKEN": "test-token",
+		"GITHUB_REPOSITORY": "layervai/frp", "PR_NUMBER": "11", "VALIDATORS": validatorPath,
+		"MOCK_HEAD_SHA": fixture.headSHA, "MOCK_HEAD_REF": fixture.headRef,
+		"MOCK_BASE_SHA": fixture.baseSHA, "MOCK_BASE_REF": "main",
+	}
+	resolver := namedStep(t, job, "Resolve Claude pull request context").Run
+	resolveValues := make(map[string]string, len(base)+1)
+	maps.Copy(resolveValues, base)
+	resolveOutput := filepath.Join(runnerTemp, "resolve-output")
+	resolveValues["GITHUB_OUTPUT"] = resolveOutput
+	requireScriptResult(t, fixture.workspace, resolver, cleanEnvironment(t, home, resolveValues), true)
+	if outputs := readOutputs(t, resolveOutput); outputs["default_branch"] != "main" || outputs["checkout_allowed"] != "true" {
+		t.Fatalf("resolver outputs = %#v", outputs)
+	}
+
+	for name, overrides := range map[string]map[string]string{
+		"closed":       {"MOCK_PR_STATE": "closed"},
+		"default-head": {"MOCK_HEAD_REF": "main"},
+	} {
+		t.Run("resolver-"+name, func(t *testing.T) {
+			values := make(map[string]string, len(base)+len(overrides)+1)
+			maps.Copy(values, base)
+			maps.Copy(values, overrides)
+			values["GITHUB_OUTPUT"] = filepath.Join(t.TempDir(), "output")
+			requireScriptResult(t, fixture.workspace, resolver, cleanEnvironment(t, home, values), false)
+		})
+	}
+
+	target := namedStep(t, job, "Verify current Claude target").Run
+	targetBase := map[string]string{
+		"PATH": bin + string(os.PathListSeparator) + os.Getenv("PATH"), "GH_TOKEN": "test-token",
+		"GITHUB_REPOSITORY": "layervai/frp", "PR_MODE": "true", "PR_NUMBER": "11",
+		"EXPECTED_HEAD_REF": fixture.headRef, "TRUSTED_DEFAULT_REF": "main", "VALIDATORS": validatorPath,
+		"MOCK_HEAD_SHA": fixture.headSHA, "MOCK_HEAD_REF": fixture.headRef,
+		"MOCK_BASE_SHA": fixture.baseSHA, "MOCK_BASE_REF": "main",
+	}
+	for name, overrides := range map[string]map[string]string{
+		"open-feature": {},
+		"closed":       {"MOCK_PR_STATE": "closed"},
+		"default-head": {"MOCK_HEAD_REF": "main"},
+	} {
+		t.Run("pre-action-"+name, func(t *testing.T) {
+			values := make(map[string]string, len(targetBase)+len(overrides)+1)
+			maps.Copy(values, targetBase)
+			maps.Copy(values, overrides)
+			values["GITHUB_OUTPUT"] = filepath.Join(t.TempDir(), "output")
+			requireScriptResult(t, fixture.workspace, target, cleanEnvironment(t, home, values), name == "open-feature")
+		})
+	}
+
+	issueOutput := filepath.Join(t.TempDir(), "output")
+	issueValues := map[string]string{"PR_MODE": "", "GITHUB_OUTPUT": issueOutput}
+	requireScriptResult(t, fixture.workspace, target, cleanEnvironment(t, home, issueValues), true)
+	if outputs := readOutputs(t, issueOutput); outputs["ready"] != "true" {
+		t.Fatalf("issue-only target outputs = %#v", outputs)
+	}
+}
+
+func TestAutomaticClaudePRLifecycleFences(t *testing.T) {
+	wf := loadWorkflow(t, "claude-code-review.yml")
+	target := namedStep(t, wf.Jobs["review"], "Verify current review target").Run
+	fixture := createReviewFixture(t)
+	runnerTemp := t.TempDir()
+	home := t.TempDir()
+	bin := writeMockGH(t, filepath.Join(runnerTemp, "bin"))
+	base := map[string]string{
+		"PATH": bin + string(os.PathListSeparator) + os.Getenv("PATH"), "GH_TOKEN": "test-token",
+		"GITHUB_REPOSITORY": "layervai/frp", "PR_NUMBER": "11",
+		"EXPECTED_HEAD_REF": fixture.headRef, "TRUSTED_DEFAULT_REF": "main",
+		"MOCK_HEAD_SHA": fixture.headSHA, "MOCK_HEAD_REF": fixture.headRef,
+		"MOCK_BASE_SHA": fixture.baseSHA, "MOCK_BASE_REF": "main",
+	}
+	for name, overrides := range map[string]map[string]string{
+		"open-feature": {},
+		"closed":       {"MOCK_PR_STATE": "closed"},
+		"default-head": {"MOCK_HEAD_REF": "main"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			values := make(map[string]string, len(base)+len(overrides)+1)
+			maps.Copy(values, base)
+			maps.Copy(values, overrides)
+			values["GITHUB_OUTPUT"] = filepath.Join(t.TempDir(), "output")
+			requireScriptResult(t, fixture.workspace, target, cleanEnvironment(t, home, values), name == "open-feature")
+		})
+	}
+}
+
 func simulatePinnedPRCheckout(t *testing.T, fixture reviewFixture, origin string, depth int) {
 	t.Helper()
 	gitOutput(t, fixture.workspace, "fetch", "origin", fmt.Sprintf("--depth=%d", depth), fixture.headRef)
@@ -640,6 +765,40 @@ func simulatePinnedPRCheckout(t *testing.T, fixture reviewFixture, origin string
 	gitOutput(t, fixture.workspace, "reset", "--", "CLAUDE.md")
 	if got := gitOutput(t, fixture.workspace, "remote", "get-url", "origin"); got != origin {
 		t.Fatalf("origin = %q, want %q", got, origin)
+	}
+}
+
+func TestInteractiveClaudeOriginRejectsDefaultBranchDriftBeforeGitWork(t *testing.T) {
+	wf := loadWorkflow(t, "claude.yml")
+	prepare := namedStep(t, wf.Jobs["claude"], "Prepare credential-free Claude origin").Run
+
+	for name, overrides := range map[string]map[string]string{
+		"event-default-mismatch": {"ISSUE_REF": "renamed-main"},
+		"default-head":           {"PR_HEAD_REF": "main"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fixture := createReviewFixture(t)
+			runnerTemp := t.TempDir()
+			validatorPath := filepath.Join(runnerTemp, "validators.sh")
+			writeValidator(t, wf, validatorPath)
+			values := map[string]string{
+				"PR_MODE": "true", "PR_HEAD_SHA": fixture.headSHA, "PR_HEAD_REF": fixture.headRef,
+				"PR_BASE_SHA": fixture.baseSHA, "PR_BASE_REF": "main", "PR_DEFAULT_REF": "main",
+				"PR_HEAD_FETCH_DEPTH": "25", "ISSUE_SHA": fixture.baseSHA, "ISSUE_REF": "main",
+				"VALIDATORS": validatorPath, "RUNNER_TEMP": runnerTemp,
+				"GITHUB_OUTPUT":    filepath.Join(runnerTemp, "prepare-output"),
+				"GITHUB_WORKSPACE": fixture.workspace,
+			}
+			maps.Copy(values, overrides)
+			originalOrigin := gitOutput(t, fixture.workspace, "remote", "get-url", "origin")
+			requireScriptResult(t, fixture.workspace, prepare, cleanEnvironment(t, t.TempDir(), values), false)
+			if got := gitOutput(t, fixture.workspace, "remote", "get-url", "origin"); got != originalOrigin {
+				t.Fatalf("origin changed before default-branch fence: got %q, want %q", got, originalOrigin)
+			}
+			if got := gitOutput(t, fixture.workspace, "rev-parse", "HEAD"); got != fixture.baseSHA {
+				t.Fatalf("HEAD changed before default-branch fence: got %s, want %s", got, fixture.baseSHA)
+			}
+		})
 	}
 }
 
@@ -708,8 +867,9 @@ func TestInteractiveClaudeRejectsSensitiveTreeIndirection(t *testing.T) {
 			writeValidator(t, wf, validatorPath)
 			env := cleanEnvironment(t, t.TempDir(), map[string]string{
 				"PR_MODE": "true", "PR_HEAD_SHA": fixture.headSHA, "PR_HEAD_REF": fixture.headRef,
-				"PR_BASE_SHA": fixture.baseSHA, "PR_BASE_REF": "main", "PR_HEAD_FETCH_DEPTH": "26",
-				"ISSUE_SHA": fixture.baseSHA, "ISSUE_REF": "main", "VALIDATORS": validatorPath,
+				"PR_BASE_SHA": fixture.baseSHA, "PR_BASE_REF": "main", "PR_DEFAULT_REF": "main",
+				"PR_HEAD_FETCH_DEPTH": "26",
+				"ISSUE_SHA":           fixture.baseSHA, "ISSUE_REF": "main", "VALIDATORS": validatorPath,
 				"RUNNER_TEMP": runnerTemp, "GITHUB_OUTPUT": filepath.Join(runnerTemp, "prepare-output"),
 				"GITHUB_WORKSPACE": fixture.workspace,
 			})
@@ -736,8 +896,9 @@ func TestInteractiveClaudeRuntimeContracts(t *testing.T) {
 
 	prepareEnv := cleanEnvironment(t, home, map[string]string{
 		"PR_MODE": "true", "PR_HEAD_SHA": fixture.headSHA, "PR_HEAD_REF": fixture.headRef,
-		"PR_BASE_SHA": fixture.baseSHA, "PR_BASE_REF": "main", "PR_HEAD_FETCH_DEPTH": "25",
-		"ISSUE_SHA": fixture.baseSHA, "ISSUE_REF": "main", "VALIDATORS": validatorPath,
+		"PR_BASE_SHA": fixture.baseSHA, "PR_BASE_REF": "main", "PR_DEFAULT_REF": "main",
+		"PR_HEAD_FETCH_DEPTH": "25",
+		"ISSUE_SHA":           fixture.baseSHA, "ISSUE_REF": "main", "VALIDATORS": validatorPath,
 		"RUNNER_TEMP": runnerTemp, "GITHUB_OUTPUT": outputPath, "GITHUB_WORKSPACE": fixture.workspace,
 	})
 	requireScriptResult(t, fixture.workspace, namedStep(t, job, "Prepare credential-free Claude origin").Run, prepareEnv, true)
@@ -768,7 +929,7 @@ func TestInteractiveClaudeRuntimeContracts(t *testing.T) {
 		"TRUSTED_GUIDANCE_OID": outputs["trusted_guidance_oid"],
 		"PR_MODE":              "true", "PR_NUMBER": "11", "EXPECTED_HEAD_SHA": fixture.headSHA,
 		"EXPECTED_HEAD_REF": fixture.headRef, "EXPECTED_BASE_SHA": fixture.baseSHA,
-		"EXPECTED_BASE_REF": "main", "EXECUTION_FILE": executionFile,
+		"EXPECTED_BASE_REF": "main", "TRUSTED_DEFAULT_REF": "main", "EXECUTION_FILE": executionFile,
 		"MOCK_HEAD_SHA": fixture.headSHA, "MOCK_HEAD_REF": fixture.headRef,
 		"MOCK_BASE_SHA": fixture.baseSHA, "MOCK_BASE_REF": "main",
 	}
@@ -780,6 +941,17 @@ func TestInteractiveClaudeRuntimeContracts(t *testing.T) {
 	terminalEnv := cleanEnvironment(t, home, terminalValues)
 	terminal := namedStep(t, job, "Verify terminal Claude result").Run
 	requireScriptResult(t, fixture.workspace, terminal, terminalEnv, true)
+	for name, overrides := range map[string]map[string]string{
+		"closed":       {"MOCK_PR_STATE": "closed"},
+		"default-head": {"MOCK_HEAD_REF": "main"},
+	} {
+		t.Run("terminal-"+name, func(t *testing.T) {
+			values := make(map[string]string, len(terminalValues)+len(overrides))
+			maps.Copy(values, terminalValues)
+			maps.Copy(values, overrides)
+			requireScriptResult(t, fixture.workspace, terminal, cleanEnvironment(t, home, values), false)
+		})
+	}
 
 	gitOutput(t, fixture.workspace, "remote", "set-url", "--add", "--push", "origin", "https://example.invalid/credential")
 	requireScriptResult(t, fixture.workspace, namedStep(t, job, "Verify credential-free Claude origin").Run, postEnv, false)
@@ -814,6 +986,7 @@ func TestAutomaticClaudeRuntimeContracts(t *testing.T) {
 	home := t.TempDir()
 	outputPath := filepath.Join(runnerTemp, "prepare-output")
 	prepareEnv := cleanEnvironment(t, home, map[string]string{
+		"EXPECTED_STATE":    "open",
 		"EXPECTED_HEAD_SHA": fixture.headSHA, "EXPECTED_HEAD_REF": fixture.headRef,
 		"EXPECTED_BASE_SHA": fixture.baseSHA, "EXPECTED_BASE_REF": "main",
 		"TRUSTED_DEFAULT_REF": "main", "PR_NUMBER": "11", "RUN_ID": "29893894149", "RUN_ATTEMPT": "2",
@@ -848,8 +1021,9 @@ func TestAutomaticClaudeRuntimeContracts(t *testing.T) {
 		"TRUSTED_GUIDANCE_OID": outputs["trusted_guidance_oid"],
 		"TRUSTED_START_SHA":    outputs["trusted_start_sha"],
 		"PR_NUMBER":            "11", "EXPECTED_HEAD_SHA": fixture.headSHA, "EXPECTED_HEAD_REF": fixture.headRef,
-		"EXPECTED_BASE_SHA": fixture.baseSHA, "EXPECTED_BASE_REF": "main", "EXECUTION_FILE": executionFile,
-		"REVIEW_MARKER": outputs["review_marker"], "MOCK_REVIEW_MARKER": outputs["review_marker"],
+		"EXPECTED_BASE_SHA": fixture.baseSHA, "EXPECTED_BASE_REF": "main", "TRUSTED_DEFAULT_REF": "main",
+		"EXECUTION_FILE": executionFile,
+		"REVIEW_MARKER":  outputs["review_marker"], "MOCK_REVIEW_MARKER": outputs["review_marker"],
 		"MOCK_COMMENT_MODE": "success",
 		"MOCK_HEAD_SHA":     fixture.headSHA, "MOCK_HEAD_REF": fixture.headRef,
 		"MOCK_BASE_SHA": fixture.baseSHA, "MOCK_BASE_REF": "main",
@@ -862,6 +1036,17 @@ func TestAutomaticClaudeRuntimeContracts(t *testing.T) {
 	terminalEnv := cleanEnvironment(t, home, terminalValues)
 	terminal := namedStep(t, job, "Verify terminal Claude review").Run
 	requireScriptResult(t, fixture.workspace, terminal, terminalEnv, true)
+	for name, overrides := range map[string]map[string]string{
+		"closed":       {"MOCK_PR_STATE": "closed"},
+		"default-head": {"MOCK_HEAD_REF": "main"},
+	} {
+		t.Run("target-"+name, func(t *testing.T) {
+			values := make(map[string]string, len(terminalValues)+len(overrides))
+			maps.Copy(values, terminalValues)
+			maps.Copy(values, overrides)
+			requireScriptResult(t, fixture.workspace, terminal, cleanEnvironment(t, home, values), false)
+		})
+	}
 	for _, mode := range []string{
 		"missing", "wrong-actor", "stale", "api-failure", "duplicate", "repeated-marker", "marker-only",
 	} {
@@ -896,7 +1081,7 @@ func TestIssueClaudeRuntimeAndShallowRegression(t *testing.T) {
 	outputPath := filepath.Join(runnerTemp, "prepare-output")
 	prepareValues := map[string]string{
 		"PR_MODE": "", "PR_HEAD_SHA": "", "PR_HEAD_REF": "", "PR_BASE_SHA": "", "PR_BASE_REF": "",
-		"PR_HEAD_FETCH_DEPTH": "", "ISSUE_SHA": fixture.baseSHA, "ISSUE_REF": "main",
+		"PR_DEFAULT_REF": "", "PR_HEAD_FETCH_DEPTH": "", "ISSUE_SHA": fixture.baseSHA, "ISSUE_REF": "main",
 		"VALIDATORS": validatorPath, "RUNNER_TEMP": runnerTemp, "GITHUB_OUTPUT": outputPath,
 		"GITHUB_WORKSPACE": fixture.workspace,
 	}

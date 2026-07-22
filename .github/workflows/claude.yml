@@ -178,9 +178,11 @@ jobs:
           head_sha="$(jq -r '.head.sha // ""' <<<"$pr")"
           head_ref="$(jq -r '.head.ref // ""' <<<"$pr")"
           base_repo="$(jq -r '.base.repo.full_name // ""' <<<"$pr")"
+          default_branch="$(jq -r '.base.repo.default_branch // ""' <<<"$pr")"
           base_sha="$(jq -r '.base.sha // ""' <<<"$pr")"
           base_ref="$(jq -r '.base.ref // ""' <<<"$pr")"
           commit_count="$(jq -r '.commits // "" | tostring' <<<"$pr")"
+          pr_state="$(jq -r '.state // ""' <<<"$pr")"
 
           # The job carries ANTHROPIC_API_KEY and a token that can write only
           # review comments. Never checkout a fork head across that boundary.
@@ -195,6 +197,10 @@ jobs:
             echo "::error::Claude command base repository does not match this repository."
             exit 1
           fi
+          if [[ "$pr_state" != "open" ]]; then
+            echo "::error::Claude commands require a currently open pull request."
+            exit 1
+          fi
           # SHA-1/SHA-256 shapes and the pinned action's stricter branch grammar
           # are defined once in the trusted validator library used again after
           # checkout. The ref grammar rejects leading '+' even though Git itself
@@ -203,6 +209,11 @@ jobs:
           validate_sha "pull request base" "$base_sha"
           validate_ref "pull request head" "$head_ref"
           validate_ref "pull request base" "$base_ref"
+          validate_ref "repository default branch" "$default_branch"
+          if [[ "$head_ref" == "$default_branch" ]]; then
+            echo "::error::Claude commands cannot target the repository default branch as a pull request head."
+            exit 1
+          fi
           # The two immutable snapshots become distinct branches in the local
           # bare origin. Reject equality and directory/file prefix collisions
           # explicitly instead of leaving a malformed API response to fail with
@@ -223,6 +234,7 @@ jobs:
             echo "head_ref=$head_ref"
             echo "base_sha=$base_sha"
             echo "base_ref=$base_ref"
+            echo "default_branch=$default_branch"
             echo "head_fetch_depth=$head_fetch_depth"
             echo "checkout_allowed=true"
           } >> "$GITHUB_OUTPUT"
@@ -264,6 +276,7 @@ jobs:
           PR_HEAD_REF: ${{ steps.claude_pr.outputs.head_ref }}
           PR_BASE_SHA: ${{ steps.claude_pr.outputs.base_sha }}
           PR_BASE_REF: ${{ steps.claude_pr.outputs.base_ref }}
+          PR_DEFAULT_REF: ${{ steps.claude_pr.outputs.default_branch }}
           PR_HEAD_FETCH_DEPTH: ${{ steps.claude_pr.outputs.head_fetch_depth }}
           ISSUE_SHA: ${{ github.sha }}
           ISSUE_REF: ${{ github.event.repository.default_branch }}
@@ -274,6 +287,14 @@ jobs:
           source "$VALIDATORS"
 
           if [[ "$PR_MODE" == "true" ]]; then
+            # Checkout selected the event repository default branch before this
+            # step. Bind that trusted workspace to the resolver's live PR view
+            # before reading any repository object or tree.
+            if [[ -z "$PR_DEFAULT_REF" || "$ISSUE_REF" != "$PR_DEFAULT_REF" ||
+              "$PR_HEAD_REF" == "$PR_DEFAULT_REF" ]]; then
+              echo "::error::Claude PR defaults changed or the head targets the repository default branch."
+              exit 1
+            fi
             head_sha="$PR_HEAD_SHA"
             head_ref="$PR_HEAD_REF"
             base_sha="$PR_BASE_SHA"
@@ -449,6 +470,53 @@ jobs:
             echo "ready=true"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Verify current Claude target
+        id: current_target
+        if: steps.local_origin.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_MODE: ${{ steps.claude_pr.outputs.checkout_allowed }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          EXPECTED_HEAD_REF: ${{ steps.claude_pr.outputs.head_ref }}
+          TRUSTED_DEFAULT_REF: ${{ steps.claude_pr.outputs.default_branch }}
+          VALIDATORS: ${{ steps.claude_validators.outputs.path }}
+        run: |
+          set -euo pipefail
+
+          # Issue-only commands have no pull request target. Keep that supported
+          # path explicit instead of applying PR lifecycle rules to an issue.
+          if [[ "$PR_MODE" != "true" ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # shellcheck source=/dev/null
+          source "$VALIDATORS"
+          if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] ||
+            ! validate_ref "expected pull request head" "$EXPECTED_HEAD_REF" ||
+            ! validate_ref "trusted repository default branch" "$TRUSTED_DEFAULT_REF"; then
+            echo "::error::Claude target verification received invalid pull request metadata."
+            exit 1
+          fi
+          if ! current_pr="$(timeout 30s gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"; then
+            echo "::error::Unable to refresh the pull request immediately before Claude."
+            exit 1
+          fi
+          current_state="$(jq -r '.state // ""' <<<"$current_pr")"
+          current_head_ref="$(jq -r '.head.ref // ""' <<<"$current_pr")"
+          current_default_branch="$(jq -r '.base.repo.default_branch // ""' <<<"$current_pr")"
+          if [[ "$current_state" != "open" ]] ||
+            ! validate_ref "current pull request head" "$current_head_ref" ||
+            ! validate_ref "current repository default branch" "$current_default_branch" ||
+            [[ "$current_head_ref" != "$EXPECTED_HEAD_REF" ]] ||
+            [[ "$current_default_branch" != "$TRUSTED_DEFAULT_REF" ]] ||
+            [[ "$current_head_ref" == "$current_default_branch" ]]; then
+            echo "::error::Claude commands require an open pull request whose head is not the repository default branch."
+            exit 1
+          fi
+
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
       - name: Run Claude Code
         id: claude
         # Keep the implicit success() guard here for the same fail-closed chain.
@@ -457,7 +525,8 @@ jobs:
         # base before Claude starts. Preserve that property on action upgrades.
         if: |
           steps.checkout.outcome == 'success' &&
-          steps.local_origin.outputs.ready == 'true'
+          steps.local_origin.outputs.ready == 'true' &&
+          steps.current_target.outputs.ready == 'true'
         # v1.0.180 includes upstream #1496, so provider/SDK failures cannot
         # make a review command or `/simplify` wrapper appear successful.
         uses: anthropics/claude-code-action@fa7e2f0a29a126f0b81cdcf360561b36e44cf608 # v1.0.180
@@ -569,6 +638,7 @@ jobs:
           EXPECTED_HEAD_REF: ${{ steps.claude_pr.outputs.head_ref != '' && steps.claude_pr.outputs.head_ref || github.event.repository.default_branch }}
           EXPECTED_BASE_SHA: ${{ steps.claude_pr.outputs.base_sha }}
           EXPECTED_BASE_REF: ${{ steps.claude_pr.outputs.base_ref }}
+          TRUSTED_DEFAULT_REF: ${{ steps.claude_pr.outputs.default_branch }}
           EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
           LOCAL_ORIGIN: ${{ steps.local_origin.outputs.path }}
           TRUSTED_GUIDANCE_OID: ${{ steps.local_origin.outputs.trusted_guidance_oid }}
@@ -612,6 +682,7 @@ jobs:
           if [[ "$PR_MODE" == "true" ]]; then
             if [[ ! "$EXPECTED_BASE_SHA" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] ||
               ! validate_ref "$EXPECTED_BASE_REF" ||
+              ! validate_ref "$TRUSTED_DEFAULT_REF" ||
               [[ "$(git --git-dir="$LOCAL_ORIGIN" rev-parse --verify "refs/heads/$EXPECTED_BASE_REF" 2>/dev/null)" != "$EXPECTED_BASE_SHA" ||
                 "$(git rev-parse --verify "refs/heads/$EXPECTED_BASE_REF" 2>/dev/null)" != "$EXPECTED_BASE_SHA" ||
                 "$(git rev-parse --verify "refs/remotes/origin/$EXPECTED_BASE_REF" 2>/dev/null)" != "$EXPECTED_BASE_SHA" ]]; then
@@ -626,10 +697,15 @@ jobs:
             current_head="$(jq -r '.head.sha // ""' <<<"$current_pr")"
             current_head_ref="$(jq -r '.head.ref // ""' <<<"$current_pr")"
             current_base_repo="$(jq -r '.base.repo.full_name // ""' <<<"$current_pr")"
+            current_default_branch="$(jq -r '.base.repo.default_branch // ""' <<<"$current_pr")"
             current_base="$(jq -r '.base.sha // ""' <<<"$current_pr")"
             current_base_ref="$(jq -r '.base.ref // ""' <<<"$current_pr")"
-            if [[ "$current_head_repo" != "$GITHUB_REPOSITORY" ||
+            current_state="$(jq -r '.state // ""' <<<"$current_pr")"
+            if [[ "$current_state" != "open" ||
+              "$current_head_repo" != "$GITHUB_REPOSITORY" ||
               "$current_base_repo" != "$GITHUB_REPOSITORY" ||
+              "$current_default_branch" != "$TRUSTED_DEFAULT_REF" ||
+              "$current_head_ref" == "$current_default_branch" ||
               "$current_head" != "$EXPECTED_HEAD_SHA" ||
               "$current_head_ref" != "$EXPECTED_HEAD_REF" ||
               "$current_base" != "$EXPECTED_BASE_SHA" ||
