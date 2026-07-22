@@ -8,11 +8,8 @@ on:
 permissions: {}
 
 concurrency:
-  # Every pushed head invalidates exact-head review evidence. Drafts are
-  # intentionally included: they need early security feedback, and cancellation
-  # prevents superseded heads from publishing competing terminal reviews. Each
-  # completed head keeps its own top-level review as an immutable audit trail;
-  # comment accumulation across distinct heads is deliberate.
+  # Primary review happens while the PR is draft. Spend the terminal Claude
+  # pass only on a ready candidate, and cancel a superseded exact-head review.
   group: claude-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
@@ -25,6 +22,7 @@ jobs:
     # if this workflow's trigger or trust model changes.
     if: |
       !endsWith(github.actor, '[bot]') &&
+      github.event.pull_request.draft == false &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -54,7 +52,10 @@ jobs:
         # The pinned action also replaces PR-controlled Claude startup config
         # with the trusted base version before CLI startup; preserve that
         # protection on action upgrades so hooks cannot bypass tool policy.
-        uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
+        # v1.0.180 includes upstream #1496: an SDK result with
+        # `subtype: success` plus `is_error: true` fails the job instead of
+        # recording a false-green review.
+        uses: anthropics/claude-code-action@fa7e2f0a29a126f0b81cdcf360561b36e44cf608 # v1.0.180
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}

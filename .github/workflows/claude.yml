@@ -347,7 +347,9 @@ jobs:
         if: |
           steps.checkout.outcome == 'success' &&
           steps.local_origin.outputs.ready == 'true'
-        uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
+        # v1.0.180 includes upstream #1496, so provider/SDK failures cannot
+        # make a review command or `/simplify` wrapper appear successful.
+        uses: anthropics/claude-code-action@fa7e2f0a29a126f0b81cdcf360561b36e44cf608 # v1.0.180
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
