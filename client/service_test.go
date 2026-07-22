@@ -148,11 +148,12 @@ func TestRunSendsInitialRunIDOnFirstLoginAndReconnect(t *testing.T) {
 				return &failingConnector{err: context.Canceled}
 			}
 		},
-		OnFirstLoginSuccess: func(runID string) {
+		OnFirstLoginSuccess: func(runID string) error {
 			if runID != "initial-run-id" {
 				t.Errorf("OnFirstLoginSuccess RunID = %q, want initial-run-id", runID)
 			}
 			callbacks.Add(1)
+			return nil
 		},
 	})
 	if err != nil {
@@ -227,8 +228,9 @@ func TestServiceOnFirstLoginSuccessFiresOnlyAfterAcceptedLogin(t *testing.T) {
 		ConnectorCreator: func(context.Context, *v1.ClientCommonConfig) Connector {
 			return connector
 		},
-		OnFirstLoginSuccess: func(runID string) {
+		OnFirstLoginSuccess: func(runID string) error {
 			accepted <- runID
+			return nil
 		},
 	})
 	if err != nil {
@@ -299,7 +301,10 @@ func TestServiceOnFirstLoginSuccessDoesNotFireOnAuthenticatedLoginRejection(t *t
 		ConnectorCreator: func(context.Context, *v1.ClientCommonConfig) Connector {
 			return &testConnector{conn: &trackingConn{Conn: clientConn}}
 		},
-		OnFirstLoginSuccess: func(string) { callbacks.Add(1) },
+		OnFirstLoginSuccess: func(string) error {
+			callbacks.Add(1)
+			return nil
+		},
 	})
 	if err != nil {
 		t.Fatalf("new service: %v", err)
@@ -312,6 +317,79 @@ func TestServiceOnFirstLoginSuccessDoesNotFireOnAuthenticatedLoginRejection(t *t
 	}
 	if got := callbacks.Load(); got != 0 {
 		t.Fatalf("OnFirstLoginSuccess calls = %d, want 0", got)
+	}
+}
+
+func TestServiceOnFirstLoginSuccessErrorRejectsSessionBeforeControl(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	trackedConn := &trackingConn{Conn: clientConn}
+	connector := &testConnector{conn: trackedConn}
+	t.Cleanup(func() {
+		_ = clientConn.Close()
+		_ = serverConn.Close()
+	})
+
+	serverErr := make(chan error, 1)
+	go func() {
+		rw := msg.NewV1ReadWriter(serverConn)
+		var login msg.Login
+		if err := rw.ReadMsgInto(&login); err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- rw.WriteMsg(&msg.LoginResp{RunID: "untrusted-run"})
+	}()
+
+	hookCause := errors.New("sensitive hook detail: " + strings.Repeat("x", 8_192))
+	var callbacks atomic.Int32
+	svr, err := NewService(ServiceOptions{
+		Common:                 &v1.ClientCommonConfig{},
+		ConfigSourceAggregator: source.NewAggregator(source.NewConfigSource()),
+		ConnectorCreator: func(context.Context, *v1.ClientCommonConfig) Connector {
+			return connector
+		},
+		OnFirstLoginSuccess: func(runID string) error {
+			callbacks.Add(1)
+			if runID != "untrusted-run" {
+				t.Errorf("OnFirstLoginSuccess RunID = %q, want untrusted-run", runID)
+			}
+			return hookCause
+		},
+	})
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+
+	err = svr.Run(context.Background())
+	if err == nil {
+		t.Fatal("Run() error = nil, want hook rejection")
+	}
+	if !errors.Is(err, hookCause) {
+		t.Fatal("Run() error does not wrap the original hook cause")
+	}
+	if !strings.Contains(err.Error(), "first login success hook rejected authenticated session") {
+		t.Fatalf("Run() error = %q, want bounded hook rejection", err)
+	}
+	if strings.Contains(err.Error(), "sensitive hook detail") || len(err.Error()) > 256 {
+		t.Fatalf("Run() exposed unbounded hook error: length=%d error=%q", len(err.Error()), err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+	if got := callbacks.Load(); got != 1 {
+		t.Fatalf("OnFirstLoginSuccess calls = %d, want 1", got)
+	}
+	if !trackedConn.closed.Load() {
+		t.Fatal("authenticated session connection was not closed after hook rejection")
+	}
+	if !connector.closed.Load() {
+		t.Fatal("authenticated session connector was not closed after hook rejection")
+	}
+	svr.ctlMu.RLock()
+	ctl := svr.ctl
+	svr.ctlMu.RUnlock()
+	if ctl != nil {
+		t.Fatal("control was installed after hook rejection")
 	}
 }
 
