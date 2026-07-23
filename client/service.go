@@ -290,13 +290,12 @@ func (svr *Service) Run(ctx context.Context) error {
 	// first login to frps
 	svr.loopLoginUntilSuccess(10*time.Second, lo.FromPtr(svr.common.LoginFailExit))
 	if svr.ctl == nil {
+		svr.stop()
 		if svr.firstLoginSuccessError != nil {
-			svr.stop()
 			return svr.firstLoginSuccessError
 		}
 		cancelCause := cancelErr{}
 		_ = errors.As(context.Cause(svr.ctx), &cancelCause)
-		svr.stop()
 		return fmt.Errorf("login to the server failed: %v. With loginFailExit enabled, no additional retries will be attempted", cancelCause.Err)
 	}
 
