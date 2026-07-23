@@ -79,10 +79,13 @@ type ServiceOptions struct {
 	// the authenticated session, closes it, and terminates the Service without
 	// installing a control. The RunID is passed through verbatim, so a caller
 	// that correlates it with external state must validate it before applying
-	// side effects. The caller owns callback execution: it must return promptly,
-	// and a panic propagates like other ServiceOptions callbacks. The returned
-	// Service error wraps the callback error for errors.Is/errors.As, but uses a
-	// fixed message so callback details cannot create unbounded log output.
+	// side effects. Cancellation observed immediately after Login acceptance
+	// skips the hook; cancellation concurrent with hook dispatch may still allow
+	// that one synchronous call. The caller owns callback execution: it must
+	// return promptly, and a panic propagates like other ServiceOptions callbacks.
+	// The returned Service error wraps the callback error for errors.Is/errors.As,
+	// but uses a fixed message so callback details cannot create unbounded log
+	// output.
 	OnFirstLoginSuccess func(runID string) error
 
 	// ConfigSourceAggregator manages internal config and optional store sources.
@@ -175,10 +178,12 @@ type Service struct {
 	// call cancel to stop service
 	cancel context.CancelCauseFunc
 
-	connectorCreator       func(context.Context, *v1.ClientCommonConfig) Connector
-	handleWorkConnCb       func(*v1.ProxyBaseConfig, net.Conn, *msg.StartWorkConn) bool
-	onFirstLoginSuccess    func(string) error
-	firstLoginSuccessOnce  sync.Once
+	connectorCreator      func(context.Context, *v1.ClientCommonConfig) Connector
+	handleWorkConnCb      func(*v1.ProxyBaseConfig, net.Conn, *msg.StartWorkConn) bool
+	onFirstLoginSuccess   func(string) error
+	firstLoginSuccessOnce sync.Once
+	// Written only by the synchronous first-login path before the reconnect
+	// goroutine starts; later reconnects read it after sync.Once.Do returns.
 	firstLoginSuccessError error
 }
 
