@@ -398,6 +398,9 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 		}
 	}
 	reviewTerminal := namedStep(t, review, "Verify terminal Claude review")
+	if got := reviewTerminal.Env["TRUSTED_DEFAULT_REF"]; got != "${{ github.event.repository.default_branch }}" {
+		t.Fatalf("automatic terminal TRUSTED_DEFAULT_REF = %#v", got)
+	}
 	requireFragments(t, reviewTerminal.Run,
 		`-z "$EXECUTION_FILE"`, `! -f "$EXECUTION_FILE"`, `! -s "$EXECUTION_FILE"`,
 		`git remote get-url --all origin`, `git remote get-url --push --all origin`, helperGuard,
