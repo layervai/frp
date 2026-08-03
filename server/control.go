@@ -130,6 +130,12 @@ type Control struct {
 	// work connections
 	workConnCh chan *proxy.WorkConn
 
+	// workConnChClosed reports that worker teardown has closed workConnCh.
+	// Both it and the close itself are guarded by mu: RegisterWorkConn may
+	// only send while holding mu and observing it false, so a send can never
+	// hit the closed channel.
+	workConnChClosed bool
+
 	// proxies in one client
 	proxies map[string]proxy.Proxy
 
@@ -198,14 +204,18 @@ func (ctl *Control) Replaced(newCtl *Control) {
 	ctl.sessionCtx.Conn.Close()
 }
 
+// RegisterWorkConn adds a work connection to the pool. It returns
+// ErrCtlClosed once worker teardown has closed the pool; ownership of conn
+// then stays with the caller.
 func (ctl *Control) RegisterWorkConn(conn *proxy.WorkConn) error {
 	xl := ctl.xl
-	defer func() {
-		if err := recover(); err != nil {
-			xl.Errorf("panic error: %v", err)
-			xl.Errorf(string(debug.Stack()))
-		}
-	}()
+
+	ctl.mu.RLock()
+	defer ctl.mu.RUnlock()
+	if ctl.workConnChClosed {
+		xl.Debugf("control is closed, discarding work connection")
+		return pkgerr.ErrCtlClosed
+	}
 
 	select {
 	case ctl.workConnCh <- conn:
@@ -319,6 +329,7 @@ func (ctl *Control) worker() {
 	ctl.sessionCtx.Conn.Close()
 
 	ctl.mu.Lock()
+	ctl.workConnChClosed = true
 	close(ctl.workConnCh)
 	for workConn := range ctl.workConnCh {
 		workConn.Close()
