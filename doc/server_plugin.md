@@ -146,25 +146,52 @@ sent synchronously after the `NewProxy` plugin chain and, when that chain
 accepts, after FRPS attempts to register the proxy. `admitted` is true only when
 registration completed successfully.
 
-This operation is a notification. Its response cannot reject or modify the
-already-decided result. A plugin that prepares external state during `NewProxy`
-can use `attempt_id` to correlate that preparation with this final result, then
-commit the exact, unnormalized `user.run_id` and `proxy_name` state when
-`admitted` is true or roll it back when false. FRPS generates a fresh
-cryptographically random 128-bit lowercase-hex `attempt_id` before invoking the
-`NewProxy` plugin chain and does not allow plugin responses to change it. A
-failed admission is not a `CloseProxy`: FRPS only sends `CloseProxy` for a proxy
-that was actually registered and later closed.
+This operation is the admission commit point. Its response cannot modify the
+result content, but a rejection or delivery failure prevents FRPS from reporting
+success to the client. When tentative local registration succeeded, FRPS closes
+that exact proxy before returning the failure. A plugin that prepares external
+state during `NewProxy` can use `attempt_id` to correlate that preparation with
+this final result, then commit the exact, unnormalized `user.run_id` and
+`proxy_name` state when `admitted` is true or roll it back when false. Every
+plugin that handles `NewProxyResult` must also handle `CloseProxy`; configuration
+validation rejects an unpaired result handler. If one result plugin rejects
+after an earlier plugin committed, the close callback is the compensating
+transaction for every plugin that already observed the admitted result. FRPS
+generates a fresh cryptographically random 128-bit lowercase-hex `attempt_id`
+before invoking the `NewProxy` plugin chain and does not allow plugin responses
+to change it. A proxy that never registered does not produce a synthetic
+`CloseProxy`; a tentatively registered proxy whose result confirmation fails is
+closed and does produce the compensating callback.
 
 Every server-plugin HTTP request, including both `NewProxy` and
 `NewProxyResult`, has a 25-second end-to-end timeout. `RegisterProxy` runs
-synchronously after `NewProxy` and performs local FRPS registration. FRPS then
-accepts `NewProxyResult` into a fixed 256-entry queue serviced by four workers
-before returning the `NewProxy` response to the client. Result-plugin HTTP I/O
-does not run on the control dispatcher, so a slow result endpoint cannot delay
-the admission response or subsequent heartbeat and control messages. Queue
-saturation fails the notification immediately and is logged; it never creates
-unbounded goroutines or rewrites the already-decided admission outcome.
+synchronously after `NewProxy` and performs tentative local FRPS registration.
+FRPS then calls `NewProxyResult` synchronously and returns success to the client
+only after every interested plugin confirms it. This deliberately puts external
+routing publication in the same bounded admission transaction as the local
+proxy, so a client cannot retire an older serving route before the replacement
+is actually routable. Result callbacks run in configured plugin order on the
+client's control dispatcher. When the application heartbeat is enabled, config
+validation requires its timeout to exceed the aggregate worst-case HTTP budget
+for every synchronous `NewProxy` and `NewProxyResult` callback; operators must
+raise the timeout or disable the application heartbeat if that bound is not
+satisfied. FRPS refreshes the control's liveness timestamp when it receives the
+`NewProxy` message, so this budget starts from a fresh authenticated control
+message rather than from the preceding ping. With TCP multiplexing enabled,
+FRPS and FRPC disable their application-layer heartbeat timeouts by default. If
+TCP multiplexing is disabled, FRPC's heartbeat timeout is independent of the
+server configuration and synchronous callbacks also delay `Pong`; both client
+and server heartbeat timeouts must exceed the aggregate callback budget, or the
+application heartbeat must be disabled. Every result plugin receives the
+admitted result even if an earlier plugin rejected it, and a rejecting plugin
+must also expect the compensating `CloseProxy` callback for that attempt. A
+valid successful response with `reject` unset or `false`, including HTTP 200
+with `{}`, confirms admission. A plugin must return `reject: true`, a non-2xx or
+invalid response, or a transport error to fence the attempt. When
+`detailedErrorsToClient` is enabled, a result plugin's rejection reason may be
+included in the client's `NewProxyResp.Error`, so rejection reasons must not
+contain secrets. FRPS logs transport and response-decoding details server-side
+but returns only a generic delivery failure to the client.
 
 ```
 {

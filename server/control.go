@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"runtime/debug"
@@ -164,9 +165,10 @@ type Control struct {
 // content so a delayed CloseProxy notification cannot be mistaken for the
 // teardown of a replacement proxy with the same run ID and proxy name.
 type registeredProxy struct {
-	proxy     proxy.Proxy
-	attemptID string
-	user      plugin.UserInfo
+	proxy             proxy.Proxy
+	attemptID         string
+	user              plugin.UserInfo
+	metricsRegistered bool
 }
 
 func newRegisteredProxy(pxy proxy.Proxy, user plugin.UserInfo, attemptID string) registeredProxy {
@@ -331,11 +333,13 @@ func (ctl *Control) loginUserInfo() plugin.UserInfo {
 	}
 }
 
-func (ctl *Control) closeProxy(registered registeredProxy) {
+func (ctl *Control) closeProxy(registered registeredProxy) error {
 	pxy := registered.proxy
 	pxy.Close()
 	ctl.sessionCtx.PxyManager.Del(pxy.GetName())
-	metrics.Server.CloseProxy(pxy.GetName(), pxy.GetConfigurer().GetBaseConfig().Type)
+	if registered.metricsRegistered {
+		metrics.Server.CloseProxy(pxy.GetName(), pxy.GetConfigurer().GetBaseConfig().Type)
+	}
 
 	notifyContent := &plugin.CloseProxyContent{
 		User:      registered.user,
@@ -346,7 +350,9 @@ func (ctl *Control) closeProxy(registered registeredProxy) {
 	}
 	if err := ctl.sessionCtx.PluginManager.CloseProxy(notifyContent); err != nil {
 		ctl.xl.Warnf("enqueue CloseProxy plugin notification for proxy [%s] error: %v", pxy.GetName(), err)
+		return err
 	}
+	return nil
 }
 
 func (ctl *Control) worker() {
@@ -368,7 +374,7 @@ func (ctl *Control) worker() {
 	ctl.mu.Unlock()
 
 	for _, pxy := range proxies {
-		ctl.closeProxy(pxy)
+		_ = ctl.closeProxy(pxy)
 	}
 
 	metrics.Server.CloseClient()
@@ -389,6 +395,10 @@ func (ctl *Control) registerMsgHandlers() {
 func (ctl *Control) handleNewProxy(m msg.Message) {
 	xl := ctl.xl
 	inMsg := m.(*msg.NewProxy)
+	// A just-received authenticated control message is direct evidence that the
+	// client is alive. Start the synchronous plugin budget from this boundary so
+	// a partially elapsed ping interval cannot consume its configured headroom.
+	ctl.lastPing.Store(time.Now())
 
 	content := &plugin.NewProxyContent{
 		User:     ctl.loginUserInfo(),
@@ -401,12 +411,15 @@ func (ctl *Control) handleNewProxy(m msg.Message) {
 		generateNewProxyAttemptID,
 	)
 	if resultContent != nil {
-		resultErr := ctl.sessionCtx.PluginManager.EnqueueNewProxyResult(resultContent)
+		var resultErr error
+		err, resultErr = confirmNewProxyResult(
+			ctl.sessionCtx.PluginManager,
+			resultContent,
+			err,
+			func() error { return ctl.CloseProxy(&msg.CloseProxy{ProxyName: inMsg.ProxyName}) },
+		)
 		if resultErr != nil {
-			// NewProxyResult is a post-decision notification. A delivery error
-			// or queue-saturation error must not rewrite the admission decision.
-			// The bounded async path keeps plugin I/O off the control dispatcher.
-			xl.Warnf("enqueue NewProxyResult for proxy [%s] error: %v", inMsg.ProxyName, resultErr)
+			xl.Warnf("confirm NewProxyResult for proxy [%s] error: %v", inMsg.ProxyName, resultErr)
 		}
 	}
 
@@ -421,11 +434,6 @@ func (ctl *Control) handleNewProxy(m msg.Message) {
 	} else {
 		resp.RemoteAddr = remoteAddr
 		xl.Infof("new proxy [%s] type [%s] success", inMsg.ProxyName, inMsg.ProxyType)
-		clientID := ctl.sessionCtx.LoginMsg.ClientID
-		if clientID == "" {
-			clientID = ctl.sessionCtx.LoginMsg.RunID
-		}
-		metrics.Server.NewProxy(inMsg.ProxyName, inMsg.ProxyType, ctl.sessionCtx.LoginMsg.User, clientID)
 	}
 	_ = ctl.msgDispatcher.Send(resp)
 }
@@ -435,10 +443,10 @@ type (
 	newProxyAttemptIDFunc func() (string, error)
 )
 
-// processNewProxyAttempt is the synchronous test/integration wrapper around the
-// production admission helper. The live control path enqueues the immutable
-// result on Manager's bounded worker pool so plugin I/O cannot stall the
-// dispatcher; direct callers retain synchronous delivery and its result error.
+// processNewProxyAttempt is a synchronous test/integration helper for the
+// mutable plugin chain, local registration callback, and result delivery. It
+// does not own the registered proxy and therefore cannot roll it back;
+// confirmNewProxyResult is the authoritative production commit/rollback path.
 func processNewProxyAttempt(
 	manager *plugin.Manager,
 	content *plugin.NewProxyContent,
@@ -465,10 +473,38 @@ func processNewProxyAttemptWithIDGenerator(
 	return effectiveMsg, remoteAddr, admissionErr, resultErr
 }
 
+// confirmNewProxyResult commits or rolls back one admission attempt. A proxy
+// that FRPS successfully registered is not visible to the client until every
+// result plugin confirms its external state. Failed registrations still report
+// their immutable result for cleanup, but a cleanup callback failure does not
+// replace the original admission error or synthesize a proxy teardown.
+func confirmNewProxyResult(
+	manager *plugin.Manager,
+	resultContent *plugin.NewProxyResultContent,
+	admissionErr error,
+	rollback func() error,
+) (finalErr, resultErr error) {
+	resultErr = manager.NewProxyResult(resultContent)
+	if resultErr == nil || admissionErr != nil {
+		return admissionErr, resultErr
+	}
+
+	// RegisterProxy has made the proxy locally live, but the result plugin has
+	// not committed the corresponding external routing state. Roll back the
+	// exact registered attempt before reporting failure so the client cannot
+	// retire an older serving proxy.
+	if rollbackErr := rollback(); rollbackErr != nil {
+		return errors.Join(
+			fmt.Errorf("confirm new proxy admission: %w", resultErr),
+			fmt.Errorf("rollback unconfirmed proxy: %w", rollbackErr),
+		), resultErr
+	}
+	return fmt.Errorf("confirm new proxy admission: %w", resultErr), resultErr
+}
+
 // processNewProxyAdmissionWithIDGenerator runs the mutable plugin chain and
-// FRPS registration, then constructs exactly one immutable result payload. It
-// performs no result-plugin I/O; the production caller can therefore enqueue
-// the payload before replying without blocking on the plugin endpoint.
+// FRPS registration, then constructs exactly one immutable result payload. The
+// caller must synchronously confirm that result before reporting success.
 func processNewProxyAdmissionWithIDGenerator(
 	manager *plugin.Manager,
 	content *plugin.NewProxyContent,
@@ -548,7 +584,10 @@ func (ctl *Control) handleNatHoleReport(m msg.Message) {
 func (ctl *Control) handleCloseProxy(m msg.Message) {
 	xl := ctl.xl
 	inMsg := m.(*msg.CloseProxy)
-	_ = ctl.CloseProxy(inMsg)
+	if err := ctl.CloseProxy(inMsg); err != nil {
+		xl.Warnf("close proxy [%s] with degraded plugin notification: %v", inMsg.ProxyName, err)
+		return
+	}
 	xl.Infof("close proxy [%s] success", inMsg.ProxyName)
 }
 
@@ -627,10 +666,31 @@ func (ctl *Control) RegisterProxy(
 		return
 	}
 
-	ctl.mu.Lock()
-	ctl.proxies[pxy.GetName()] = newRegisteredProxy(pxy, user, attemptID)
-	ctl.mu.Unlock()
+	ctl.addRegisteredProxy(pxy, user, attemptID)
 	return
+}
+
+// addRegisteredProxy publishes one locally live proxy and its metrics as one
+// control-local critical section. Result confirmation happens afterward, so a
+// failed confirmation can use the ordinary CloseProxy path without decrementing
+// a proxy-type metric that was never incremented.
+func (ctl *Control) addRegisteredProxy(pxy proxy.Proxy, user plugin.UserInfo, attemptID string) {
+	registered := newRegisteredProxy(pxy, user, attemptID)
+	clientID := ctl.sessionCtx.LoginMsg.ClientID
+	if clientID == "" {
+		clientID = ctl.sessionCtx.LoginMsg.RunID
+	}
+
+	ctl.mu.Lock()
+	metrics.Server.NewProxy(
+		pxy.GetName(),
+		pxy.GetConfigurer().GetBaseConfig().Type,
+		ctl.sessionCtx.LoginMsg.User,
+		clientID,
+	)
+	registered.metricsRegistered = true
+	ctl.proxies[pxy.GetName()] = registered
+	ctl.mu.Unlock()
 }
 
 func (ctl *Control) CloseProxy(closeMsg *msg.CloseProxy) (err error) {
@@ -647,6 +707,5 @@ func (ctl *Control) CloseProxy(closeMsg *msg.CloseProxy) (err error) {
 	delete(ctl.proxies, closeMsg.ProxyName)
 	ctl.mu.Unlock()
 
-	ctl.closeProxy(registered)
-	return
+	return ctl.closeProxy(registered)
 }
