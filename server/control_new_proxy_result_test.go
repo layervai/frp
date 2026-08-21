@@ -30,6 +30,7 @@ import (
 	v1 "github.com/fatedier/frp/pkg/config/v1"
 	"github.com/fatedier/frp/pkg/msg"
 	plugin "github.com/fatedier/frp/pkg/plugin/server"
+	"github.com/fatedier/frp/pkg/util/xlog"
 	"github.com/fatedier/frp/server/controller"
 	"github.com/fatedier/frp/server/proxy"
 )
@@ -206,6 +207,43 @@ func TestConfirmNewProxyResultFailedAdmissionKeepsOriginalError(t *testing.T) {
 	}
 }
 
+func TestControlCloseProxyPropagatesNotificationAdmissionFailure(t *testing.T) {
+	t.Parallel()
+
+	manager := plugin.NewManager()
+	manager.Register(&controlResultPlugin{handle: func(string, any) (*plugin.Response, any, error) {
+		t.Fatal("closed plugin manager delivered CloseProxy callback")
+		return nil, nil, nil
+	}})
+	manager.Close()
+
+	const proxyName = "proxy-rollback"
+	pxyManager := proxy.NewManager()
+	ctl := &Control{
+		proxies: map[string]registeredProxy{
+			proxyName: newRegisteredProxy(
+				newCloseResultTestProxy(proxyName),
+				plugin.UserInfo{RunID: "0123456789abcdef"},
+				"0123456789abcdef0123456789abcdef",
+			),
+		},
+		sessionCtx: &SessionContext{
+			PxyManager:    pxyManager,
+			PluginManager: manager,
+			ServerCfg:     &v1.ServerConfig{},
+		},
+		xl: xlog.FromContextSafe(context.Background()),
+	}
+
+	err := ctl.CloseProxy(&msg.CloseProxy{ProxyName: proxyName})
+	if err == nil || !strings.Contains(err.Error(), "plugin manager is closed") {
+		t.Fatalf("CloseProxy() error = %v, want plugin-manager closure", err)
+	}
+	if _, ok := ctl.proxies[proxyName]; ok {
+		t.Fatal("CloseProxy() kept locally closed proxy registered after notification failure")
+	}
+}
+
 func TestProcessNewProxyAdmissionDefersResultPluginIO(t *testing.T) {
 	t.Parallel()
 
@@ -280,22 +318,26 @@ func TestCloseProxyKeepsOldAttemptIDWhenReplacementUsesSameIdentity(t *testing.T
 	oldControl := newControl()
 	replacementControl := newControl()
 
-	oldControl.closeProxy(newRegisteredProxy(
+	if err := oldControl.closeProxy(newRegisteredProxy(
 		newCloseResultTestProxy(proxyName),
 		plugin.UserInfo{RunID: runID},
 		oldAttempt,
-	))
+	)); err != nil {
+		t.Fatalf("close old proxy: %v", err)
+	}
 	select {
 	case <-oldStarted:
 	case <-time.After(time.Second):
 		t.Fatal("old CloseProxy callback did not start")
 	}
 
-	replacementControl.closeProxy(newRegisteredProxy(
+	if err := replacementControl.closeProxy(newRegisteredProxy(
 		newCloseResultTestProxy(proxyName),
 		plugin.UserInfo{RunID: runID},
 		newAttempt,
-	))
+	)); err != nil {
+		t.Fatalf("close replacement proxy: %v", err)
+	}
 	select {
 	case got := <-delivered:
 		t.Fatalf("CloseProxy callback %q overtook blocked old callback", got.AttemptID)

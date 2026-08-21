@@ -332,7 +332,7 @@ func (ctl *Control) loginUserInfo() plugin.UserInfo {
 	}
 }
 
-func (ctl *Control) closeProxy(registered registeredProxy) {
+func (ctl *Control) closeProxy(registered registeredProxy) error {
 	pxy := registered.proxy
 	pxy.Close()
 	ctl.sessionCtx.PxyManager.Del(pxy.GetName())
@@ -347,7 +347,9 @@ func (ctl *Control) closeProxy(registered registeredProxy) {
 	}
 	if err := ctl.sessionCtx.PluginManager.CloseProxy(notifyContent); err != nil {
 		ctl.xl.Warnf("enqueue CloseProxy plugin notification for proxy [%s] error: %v", pxy.GetName(), err)
+		return err
 	}
+	return nil
 }
 
 func (ctl *Control) worker() {
@@ -369,7 +371,7 @@ func (ctl *Control) worker() {
 	ctl.mu.Unlock()
 
 	for _, pxy := range proxies {
-		ctl.closeProxy(pxy)
+		_ = ctl.closeProxy(pxy)
 	}
 
 	metrics.Server.CloseClient()
@@ -578,7 +580,10 @@ func (ctl *Control) handleNatHoleReport(m msg.Message) {
 func (ctl *Control) handleCloseProxy(m msg.Message) {
 	xl := ctl.xl
 	inMsg := m.(*msg.CloseProxy)
-	_ = ctl.CloseProxy(inMsg)
+	if err := ctl.CloseProxy(inMsg); err != nil {
+		xl.Warnf("close proxy [%s] with degraded plugin notification: %v", inMsg.ProxyName, err)
+		return
+	}
 	xl.Infof("close proxy [%s] success", inMsg.ProxyName)
 }
 
@@ -677,6 +682,5 @@ func (ctl *Control) CloseProxy(closeMsg *msg.CloseProxy) (err error) {
 	delete(ctl.proxies, closeMsg.ProxyName)
 	ctl.mu.Unlock()
 
-	ctl.closeProxy(registered)
-	return
+	return ctl.closeProxy(registered)
 }
