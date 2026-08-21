@@ -366,7 +366,7 @@ func (m *Manager) NewProxyResult(content *NewProxyResultContent) error {
 
 	reqid, _ := util.RandID()
 	xl := xlog.New().AppendPrefix("reqid: " + reqid)
-	ctx := xlog.NewContext(context.Background(), xl)
+	ctx := xlog.NewContext(m.notificationCtx, xl)
 	ctx = NewReqidContext(ctx, reqid)
 	return m.deliverNewProxyResult(ctx, xl, content)
 }

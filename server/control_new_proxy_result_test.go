@@ -40,6 +40,17 @@ type controlResultPlugin struct {
 	handle func(string, any) (*plugin.Response, any, error)
 }
 
+type controlContextPlugin struct {
+	supported []string
+	handle    func(context.Context, string, any) (*plugin.Response, any, error)
+}
+
+type closeTrackingControlConn struct {
+	net.Conn
+	closed chan struct{}
+	once   sync.Once
+}
+
 type closeResultTestProxy struct {
 	name       string
 	configurer v1.ProxyConfigurer
@@ -117,6 +128,21 @@ func (*controlResultPlugin) IsSupport(op string) bool {
 
 func (p *controlResultPlugin) Handle(_ context.Context, op string, content any) (*plugin.Response, any, error) {
 	return p.handle(op, content)
+}
+
+func (*controlContextPlugin) Name() string { return "control-context-test" }
+
+func (p *controlContextPlugin) IsSupport(op string) bool {
+	return slices.Contains(p.supported, op)
+}
+
+func (p *controlContextPlugin) Handle(ctx context.Context, op string, content any) (*plugin.Response, any, error) {
+	return p.handle(ctx, op, content)
+}
+
+func (c *closeTrackingControlConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.Conn.Close()
 }
 
 func TestProcessNewProxyAttemptReportsSuccessfulAdmissionSynchronously(t *testing.T) {
@@ -237,6 +263,128 @@ func TestConfirmNewProxyResultFailedAdmissionKeepsOriginalError(t *testing.T) {
 	}
 	if rollbackCalls != 0 {
 		t.Fatalf("rollback calls = %d, want 0", rollbackCalls)
+	}
+}
+
+func TestConfirmNewProxyResultManagerCloseCancelsAndRollsBack(t *testing.T) {
+	t.Parallel()
+
+	requestStarted := make(chan struct{})
+	manager := plugin.NewManager()
+	manager.Register(&controlContextPlugin{
+		supported: []string{plugin.OpNewProxyResult},
+		handle: func(ctx context.Context, _ string, _ any) (*plugin.Response, any, error) {
+			close(requestStarted)
+			<-ctx.Done()
+			return nil, nil, ctx.Err()
+		},
+	})
+
+	type confirmationResult struct {
+		finalErr  error
+		resultErr error
+	}
+	rolledBack := make(chan struct{}, 1)
+	resultCh := make(chan confirmationResult, 1)
+	go func() {
+		finalErr, resultErr := confirmNewProxyResult(
+			manager,
+			&plugin.NewProxyResultContent{Admitted: true},
+			nil,
+			func() error {
+				rolledBack <- struct{}{}
+				return nil
+			},
+		)
+		resultCh <- confirmationResult{finalErr: finalErr, resultErr: resultErr}
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("NewProxyResult plugin request did not start")
+	}
+	manager.Close()
+
+	select {
+	case result := <-resultCh:
+		if result.finalErr == nil || result.resultErr == nil ||
+			!strings.Contains(result.resultErr.Error(), context.Canceled.Error()) {
+			t.Fatalf("confirmation errors = final %v, result %v; want canceled result and rollback", result.finalErr, result.resultErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("NewProxyResult did not stop when the plugin manager closed")
+	}
+	select {
+	case <-rolledBack:
+	default:
+		t.Fatal("canceled NewProxyResult did not roll back tentative admission")
+	}
+}
+
+func TestHandleNewProxyRefreshesHeartbeatBeforeSynchronousPlugin(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	manager := plugin.NewManager()
+	manager.Register(&controlContextPlugin{
+		supported: []string{plugin.OpNewProxy},
+		handle: func(_ context.Context, _ string, _ any) (*plugin.Response, any, error) {
+			close(requestStarted)
+			<-releaseRequest
+			return &plugin.Response{Reject: true, RejectReason: "test complete"}, nil, nil
+		},
+	})
+	t.Cleanup(manager.Close)
+
+	serverConn, peerConn := net.Pipe()
+	trackedConn := &closeTrackingControlConn{Conn: serverConn, closed: make(chan struct{})}
+	t.Cleanup(func() {
+		_ = trackedConn.Close()
+		_ = peerConn.Close()
+	})
+	stopHeartbeat := make(chan struct{})
+	ctl := &Control{
+		sessionCtx: &SessionContext{
+			Conn:          trackedConn,
+			PluginManager: manager,
+			LoginMsg:      &msg.Login{RunID: "heartbeat-run"},
+			ServerCfg: &v1.ServerConfig{Transport: v1.ServerTransportConfig{
+				HeartbeatTimeout: 2,
+			}},
+		},
+		msgDispatcher: msg.NewDispatcher(trackedConn),
+		xl:            xlog.FromContextSafe(context.Background()),
+		doneCh:        stopHeartbeat,
+	}
+	stalePing := time.Now().Add(-time.Minute)
+	ctl.lastPing.Store(stalePing)
+
+	handlerDone := make(chan struct{})
+	go func() {
+		ctl.handleNewProxy(&msg.NewProxy{ProxyName: "heartbeat-refresh", ProxyType: "tcp"})
+		close(handlerDone)
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("NewProxy plugin request did not start")
+	}
+	if refreshed := ctl.lastPing.Load().(time.Time); !refreshed.After(stalePing) {
+		t.Fatalf("lastPing = %s, want refresh after %s", refreshed, stalePing)
+	}
+
+	ctl.heartbeatWorker()
+	select {
+	case <-trackedConn.closed:
+		t.Fatal("heartbeat worker closed a live control during synchronous NewProxy callback")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(stopHeartbeat)
+	close(releaseRequest)
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("NewProxy handler did not finish after plugin release")
 	}
 }
 

@@ -395,6 +395,10 @@ func (ctl *Control) registerMsgHandlers() {
 func (ctl *Control) handleNewProxy(m msg.Message) {
 	xl := ctl.xl
 	inMsg := m.(*msg.NewProxy)
+	// A just-received authenticated control message is direct evidence that the
+	// client is alive. Start the synchronous plugin budget from this boundary so
+	// a partially elapsed ping interval cannot consume its configured headroom.
+	ctl.lastPing.Store(time.Now())
 
 	content := &plugin.NewProxyContent{
 		User:     ctl.loginUserInfo(),
