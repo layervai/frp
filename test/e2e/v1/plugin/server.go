@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -171,7 +172,7 @@ var _ = ginkgo.Describe("[Feature: Server-Plugins]", func() {
 	ginkgo.Describe("NewProxyResult", func() {
 		newFunc := func() *plugin.Request {
 			var r plugin.Request
-			r.Content = &plugin.NewProxyResultContent{}
+			r.Content = new(json.RawMessage)
 			return &r
 		}
 
@@ -179,8 +180,13 @@ var _ = ginkgo.Describe("[Feature: Server-Plugins]", func() {
 			localPort := f.AllocPort()
 			results := make(chan plugin.NewProxyResultContent, 8)
 			handler := func(req *plugin.Request) *plugin.Response {
-				content := req.Content.(*plugin.NewProxyResultContent)
-				results <- *content
+				if req.Op == plugin.OpCloseProxy {
+					return &plugin.Response{Unchange: true}
+				}
+				framework.ExpectEqual(plugin.OpNewProxyResult, req.Op)
+				var content plugin.NewProxyResultContent
+				framework.ExpectNoError(json.Unmarshal(*req.Content.(*json.RawMessage), &content))
+				results <- content
 				return &plugin.Response{Unchange: true}
 			}
 			pluginServer := pluginpkg.NewHTTPPluginServer(localPort, newFunc, handler, nil)
@@ -191,7 +197,7 @@ var _ = ginkgo.Describe("[Feature: Server-Plugins]", func() {
 			name = "result-observer"
 			addr = "127.0.0.1:%d"
 			path = "/handler"
-			ops = ["NewProxyResult"]
+			ops = ["NewProxyResult", "CloseProxy"]
 			`, localPort)
 			remotePort := f.AllocPort()
 			clientConf := consts.DefaultClientConfig + fmt.Sprintf(`
@@ -252,6 +258,73 @@ var _ = ginkgo.Describe("[Feature: Server-Plugins]", func() {
 			framework.ExpectEqual(2, len(attemptIDs))
 			framework.ExpectEqual(1, admitted)
 			framework.ExpectEqual(1, failed)
+		})
+
+		ginkgo.It("rolls back a tentative proxy when result confirmation rejects it", func() {
+			localPort := f.AllocPort()
+			results := make(chan plugin.NewProxyResultContent, 16)
+			closes := make(chan plugin.CloseProxyContent, 16)
+			handler := func(req *plugin.Request) *plugin.Response {
+				raw := *req.Content.(*json.RawMessage)
+				switch req.Op {
+				case plugin.OpNewProxyResult:
+					var content plugin.NewProxyResultContent
+					framework.ExpectNoError(json.Unmarshal(raw, &content))
+					results <- content
+					return &plugin.Response{Reject: true, RejectReason: "external route rejected"}
+				case plugin.OpCloseProxy:
+					var content plugin.CloseProxyContent
+					framework.ExpectNoError(json.Unmarshal(raw, &content))
+					closes <- content
+					return &plugin.Response{Unchange: true}
+				default:
+					ginkgo.Fail(fmt.Sprintf("unexpected plugin op %q", req.Op))
+					return nil
+				}
+			}
+			pluginServer := pluginpkg.NewHTTPPluginServer(localPort, newFunc, handler, nil)
+			f.RunServer("", pluginServer)
+
+			serverConf := consts.DefaultServerConfig + fmt.Sprintf(`
+			[[httpPlugins]]
+			name = "result-rejector"
+			addr = "127.0.0.1:%d"
+			path = "/handler"
+			ops = ["NewProxyResult", "CloseProxy"]
+			`, localPort)
+			remotePort := f.AllocPort()
+			clientConf := consts.DefaultClientConfig + fmt.Sprintf(`
+			[[proxies]]
+			name = "result-rejected"
+			type = "tcp"
+			localPort = {{ .%s }}
+			remotePort = %d
+			`, framework.TCPEchoServerPort, remotePort)
+
+			_, clients := f.RunProcesses(serverConf, []string{clientConf})
+			framework.ExpectNoError(clients[0].WaitForOutput("external route rejected", 1, 10*time.Second))
+
+			var result plugin.NewProxyResultContent
+			select {
+			case result = <-results:
+			case <-time.After(10 * time.Second):
+				ginkgo.Fail("timed out waiting for rejected NewProxyResult callback")
+			}
+			framework.ExpectTrue(result.Admitted)
+			framework.ExpectEqual("result-rejected", result.ProxyName)
+			framework.ExpectNotEqual("", result.User.RunID)
+			framework.ExpectEqual(32, len(result.AttemptID))
+
+			var closeContent plugin.CloseProxyContent
+			select {
+			case closeContent = <-closes:
+			case <-time.After(10 * time.Second):
+				ginkgo.Fail("timed out waiting for compensating CloseProxy callback")
+			}
+			framework.ExpectEqual(result.AttemptID, closeContent.AttemptID)
+			framework.ExpectEqual(result.ProxyName, closeContent.ProxyName)
+			framework.ExpectEqual(result.User.RunID, closeContent.User.RunID)
+			framework.NewRequestExpect(f).Port(remotePort).ExpectError(true).Ensure()
 		})
 	})
 
