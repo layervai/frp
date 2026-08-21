@@ -15,6 +15,7 @@
 package validation
 
 import (
+	"strings"
 	"testing"
 
 	v1 "github.com/fatedier/frp/pkg/config/v1"
@@ -29,7 +30,7 @@ func TestValidateServerConfigAcceptsNewProxyResultPluginOp(t *testing.T) {
 		Auth: v1.AuthServerConfig{Method: "token"},
 		HTTPPlugins: []v1.HTTPPluginOptions{{
 			Name: "result-observer",
-			Ops:  []string{plugin.OpNewProxyResult},
+			Ops:  []string{plugin.OpNewProxyResult, plugin.OpCloseProxy},
 		}},
 	}
 	if err := cfg.Complete(); err != nil {
@@ -38,5 +39,25 @@ func TestValidateServerConfigAcceptsNewProxyResultPluginOp(t *testing.T) {
 	validator := NewConfigValidator(security.NewUnsafeFeatures(nil))
 	if _, err := validator.ValidateServerConfig(cfg); err != nil {
 		t.Fatalf("ValidateServerConfig() error = %v", err)
+	}
+}
+
+func TestValidateServerConfigRejectsNewProxyResultWithoutCloseProxy(t *testing.T) {
+	t.Parallel()
+
+	cfg := &v1.ServerConfig{
+		Auth: v1.AuthServerConfig{Method: "token"},
+		HTTPPlugins: []v1.HTTPPluginOptions{{
+			Name: "unsafe-result-observer",
+			Ops:  []string{plugin.OpNewProxyResult},
+		}},
+	}
+	if err := cfg.Complete(); err != nil {
+		t.Fatalf("ServerConfig.Complete() error = %v", err)
+	}
+	validator := NewConfigValidator(security.NewUnsafeFeatures(nil))
+	_, err := validator.ValidateServerConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "NewProxyResult requires CloseProxy for admission rollback") {
+		t.Fatalf("ValidateServerConfig() error = %v, want rollback pairing requirement", err)
 	}
 }

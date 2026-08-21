@@ -21,6 +21,7 @@ import (
 	"github.com/samber/lo"
 
 	v1 "github.com/fatedier/frp/pkg/config/v1"
+	splugin "github.com/fatedier/frp/pkg/plugin/server"
 	"github.com/fatedier/frp/pkg/policy/security"
 )
 
@@ -71,6 +72,9 @@ func (v *ConfigValidator) ValidateServerConfig(c *v1.ServerConfig) (Warning, err
 	for _, p := range c.HTTPPlugins {
 		if !lo.Every(SupportedHTTPPluginOps, p.Ops) {
 			errs = AppendError(errs, fmt.Errorf("invalid http plugin ops, optional values are %v", SupportedHTTPPluginOps))
+		}
+		if slices.Contains(p.Ops, splugin.OpNewProxyResult) && !slices.Contains(p.Ops, splugin.OpCloseProxy) {
+			errs = AppendError(errs, fmt.Errorf("http plugin %q: %s requires %s for admission rollback", p.Name, splugin.OpNewProxyResult, splugin.OpCloseProxy))
 		}
 	}
 	return warnings, errs

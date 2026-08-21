@@ -152,12 +152,16 @@ success to the client. When tentative local registration succeeded, FRPS closes
 that exact proxy before returning the failure. A plugin that prepares external
 state during `NewProxy` can use `attempt_id` to correlate that preparation with
 this final result, then commit the exact, unnormalized `user.run_id` and
-`proxy_name` state when `admitted` is true or roll it back when false. FRPS
+`proxy_name` state when `admitted` is true or roll it back when false. Every
+plugin that handles `NewProxyResult` must also handle `CloseProxy`; configuration
+validation rejects an unpaired result handler. If one result plugin rejects
+after an earlier plugin committed, the close callback is the compensating
+transaction for every plugin that already observed the admitted result. FRPS
 generates a fresh cryptographically random 128-bit lowercase-hex `attempt_id`
 before invoking the `NewProxy` plugin chain and does not allow plugin responses
-to change it. A
-failed admission is not a `CloseProxy`: FRPS only sends `CloseProxy` for a proxy
-that was actually registered and later closed.
+to change it. A proxy that never registered does not produce a synthetic
+`CloseProxy`; a tentatively registered proxy whose result confirmation fails is
+closed and does produce the compensating callback.
 
 Every server-plugin HTTP request, including both `NewProxy` and
 `NewProxyResult`, has a 25-second end-to-end timeout. `RegisterProxy` runs
@@ -166,7 +170,10 @@ FRPS then calls `NewProxyResult` synchronously and returns success to the client
 only after every interested plugin confirms it. This deliberately puts external
 routing publication in the same bounded admission transaction as the local
 proxy, so a client cannot retire an older serving route before the replacement
-is actually routable.
+is actually routable. Result callbacks run in configured plugin order on the
+client's control dispatcher, so operators must keep the total callback budget
+below the deployed control heartbeat timeout. With TCP multiplexing enabled,
+FRPS disables its application-layer heartbeat timeout by default.
 
 ```
 {
