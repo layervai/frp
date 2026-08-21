@@ -32,6 +32,7 @@ import (
 	plugin "github.com/fatedier/frp/pkg/plugin/server"
 	"github.com/fatedier/frp/pkg/util/xlog"
 	"github.com/fatedier/frp/server/controller"
+	servermetrics "github.com/fatedier/frp/server/metrics"
 	"github.com/fatedier/frp/server/proxy"
 )
 
@@ -43,6 +44,38 @@ type closeResultTestProxy struct {
 	name       string
 	configurer v1.ProxyConfigurer
 }
+
+type controlMetricsRecorder struct {
+	newProxyCalls   int
+	closeProxyCalls int
+	proxyCount      int
+	name            string
+	proxyType       string
+	user            string
+	clientID        string
+}
+
+func (*controlMetricsRecorder) NewClient()   {}
+func (*controlMetricsRecorder) CloseClient() {}
+func (m *controlMetricsRecorder) NewProxy(name, proxyType, user, clientID string) {
+	m.newProxyCalls++
+	m.proxyCount++
+	m.name = name
+	m.proxyType = proxyType
+	m.user = user
+	m.clientID = clientID
+}
+
+func (m *controlMetricsRecorder) CloseProxy(name, proxyType string) {
+	m.closeProxyCalls++
+	m.proxyCount--
+	m.name = name
+	m.proxyType = proxyType
+}
+func (*controlMetricsRecorder) OpenConnection(string, string)       {}
+func (*controlMetricsRecorder) CloseConnection(string, string)      {}
+func (*controlMetricsRecorder) AddTrafficIn(string, string, int64)  {}
+func (*controlMetricsRecorder) AddTrafficOut(string, string, int64) {}
 
 func newCloseResultTestProxy(name string) *closeResultTestProxy {
 	return &closeResultTestProxy{
@@ -241,6 +274,84 @@ func TestControlCloseProxyPropagatesNotificationAdmissionFailure(t *testing.T) {
 	}
 	if _, ok := ctl.proxies[proxyName]; ok {
 		t.Fatal("CloseProxy() kept locally closed proxy registered after notification failure")
+	}
+}
+
+func TestTentativeAdmissionRollbackBalancesProxyMetrics(t *testing.T) {
+	recorder := &controlMetricsRecorder{}
+	originalMetrics := servermetrics.Server
+	servermetrics.Server = recorder
+	t.Cleanup(func() { servermetrics.Server = originalMetrics })
+
+	const (
+		proxyName = "proxy-metric-rollback"
+		attemptID = "0123456789abcdef0123456789abcdef"
+	)
+	pxy := newCloseResultTestProxy(proxyName)
+	pxyManager := proxy.NewManager()
+	if err := pxyManager.Add(proxyName, pxy); err != nil {
+		t.Fatalf("add test proxy: %v", err)
+	}
+	manager := plugin.NewManager()
+	manager.Register(&controlResultPlugin{handle: func(op string, _ any) (*plugin.Response, any, error) {
+		switch op {
+		case plugin.OpNewProxyResult:
+			return &plugin.Response{Reject: true, RejectReason: "routing admission failed"}, nil, nil
+		case plugin.OpCloseProxy:
+			return &plugin.Response{Unchange: true}, nil, nil
+		default:
+			t.Fatalf("unexpected op %q", op)
+			return nil, nil, nil
+		}
+	}})
+	t.Cleanup(manager.Close)
+	ctl := &Control{
+		proxies: make(map[string]registeredProxy),
+		sessionCtx: &SessionContext{
+			PxyManager:    pxyManager,
+			PluginManager: manager,
+			LoginMsg: &msg.Login{
+				User:     "metric-user",
+				RunID:    "metric-run-id",
+				ClientID: "metric-client-id",
+			},
+			ServerCfg: &v1.ServerConfig{},
+		},
+		xl: xlog.FromContextSafe(context.Background()),
+	}
+
+	ctl.addRegisteredProxy(pxy, plugin.UserInfo{RunID: "effective-run-id"}, attemptID)
+	registered, ok := ctl.proxies[proxyName]
+	if !ok || !registered.metricsRegistered {
+		t.Fatalf("registered proxy = %+v, want metrics-recorded local admission", registered)
+	}
+	if recorder.newProxyCalls != 1 || recorder.closeProxyCalls != 0 || recorder.proxyCount != 1 {
+		t.Fatalf("metrics after local admission = new %d close %d count %d, want 1/0/1",
+			recorder.newProxyCalls, recorder.closeProxyCalls, recorder.proxyCount)
+	}
+	if recorder.name != proxyName || recorder.proxyType != "tcp" ||
+		recorder.user != "metric-user" || recorder.clientID != "metric-client-id" {
+		t.Fatalf("NewProxy metric identity = name %q type %q user %q client %q",
+			recorder.name, recorder.proxyType, recorder.user, recorder.clientID)
+	}
+
+	finalErr, resultErr := confirmNewProxyResult(
+		manager,
+		&plugin.NewProxyResultContent{
+			User:      plugin.UserInfo{RunID: "effective-run-id"},
+			AttemptID: attemptID,
+			ProxyName: proxyName,
+			Admitted:  true,
+		},
+		nil,
+		func() error { return ctl.CloseProxy(&msg.CloseProxy{ProxyName: proxyName}) },
+	)
+	if finalErr == nil || resultErr == nil {
+		t.Fatalf("confirmation errors = final %v, result %v; want rejection and rollback", finalErr, resultErr)
+	}
+	if recorder.newProxyCalls != 1 || recorder.closeProxyCalls != 1 || recorder.proxyCount != 0 {
+		t.Fatalf("metrics after rollback = new %d close %d count %d, want 1/1/0",
+			recorder.newProxyCalls, recorder.closeProxyCalls, recorder.proxyCount)
 	}
 }
 

@@ -171,9 +171,17 @@ only after every interested plugin confirms it. This deliberately puts external
 routing publication in the same bounded admission transaction as the local
 proxy, so a client cannot retire an older serving route before the replacement
 is actually routable. Result callbacks run in configured plugin order on the
-client's control dispatcher, so operators must keep the total callback budget
-below the deployed control heartbeat timeout. With TCP multiplexing enabled,
-FRPS disables its application-layer heartbeat timeout by default.
+client's control dispatcher. When the application heartbeat is enabled, config
+validation requires its timeout to exceed the aggregate worst-case HTTP budget
+for every synchronous `NewProxy` and `NewProxyResult` callback; operators must
+raise the timeout or disable the application heartbeat if that bound is not
+satisfied. With TCP multiplexing enabled, FRPS disables its application-layer
+heartbeat timeout by default. Every result plugin receives the admitted result
+even if an earlier plugin rejected it, and a rejecting plugin must also expect
+the compensating `CloseProxy` callback for that attempt. When
+`detailedErrorsToClient` is enabled, a result plugin's rejection reason may be
+included in the client's `NewProxyResp.Error`, so rejection reasons must not
+contain secrets.
 
 ```
 {
