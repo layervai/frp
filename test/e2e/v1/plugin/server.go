@@ -175,15 +175,13 @@ var _ = ginkgo.Describe("[Feature: Server-Plugins]", func() {
 			return &r
 		}
 
-		ginkgo.It("reports accepted and late-failed attempts without honoring response mutation", func() {
+		ginkgo.It("reports accepted and late-failed attempts before client success", func() {
 			localPort := f.AllocPort()
 			results := make(chan plugin.NewProxyResultContent, 8)
 			handler := func(req *plugin.Request) *plugin.Response {
 				content := req.Content.(*plugin.NewProxyResultContent)
 				results <- *content
-				// NewProxyResult is notification-only. Even a rejecting response
-				// must not rewrite the already-decided FRPS admission outcome.
-				return &plugin.Response{Reject: true, RejectReason: "ignored result mutation"}
+				return &plugin.Response{Unchange: true}
 			}
 			pluginServer := pluginpkg.NewHTTPPluginServer(localPort, newFunc, handler, nil)
 			f.RunServer("", pluginServer)
@@ -212,8 +210,8 @@ var _ = ginkgo.Describe("[Feature: Server-Plugins]", func() {
 
 			f.RunProcesses(serverConf, []string{clientConf})
 			// Exactly one of the two attempts owns the shared remote port. Its
-			// rejecting result-plugin response is ignored, so the proxy remains
-			// reachable; the other attempt fails later inside RegisterProxy.
+			// confirmed result-plugin response keeps the proxy reachable; the
+			// other attempt fails earlier inside RegisterProxy.
 			framework.NewRequestExpect(f).Port(remotePort).Ensure()
 
 			got := make([]plugin.NewProxyResultContent, 0, 2)

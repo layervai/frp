@@ -103,7 +103,7 @@ func TestProcessNewProxyAttemptReportsSuccessfulAdmissionSynchronously(t *testin
 		case plugin.OpNewProxyResult:
 			order = append(order, "result")
 			result = content.(plugin.NewProxyResultContent)
-			return &plugin.Response{Reject: true, RejectReason: "ignored"}, nil, nil
+			return &plugin.Response{Unchange: true}, nil, nil
 		default:
 			t.Fatalf("unexpected op %q", op)
 			return nil, nil, nil
@@ -140,6 +140,69 @@ func TestProcessNewProxyAttemptReportsSuccessfulAdmissionSynchronously(t *testin
 	}
 	if !slices.Equal(order, []string{"plugin", "register", "result"}) {
 		t.Fatalf("order = %v, want [plugin register result]", order)
+	}
+}
+
+func TestConfirmNewProxyResultRejectRollsBackBeforeClientSuccess(t *testing.T) {
+	t.Parallel()
+
+	manager := plugin.NewManager()
+	manager.Register(&controlResultPlugin{handle: func(op string, content any) (*plugin.Response, any, error) {
+		if op != plugin.OpNewProxyResult {
+			t.Fatalf("op = %q, want %q", op, plugin.OpNewProxyResult)
+		}
+		if got := content.(plugin.NewProxyResultContent); !got.Admitted {
+			t.Fatalf("result = %+v, want admitted result", got)
+		}
+		return &plugin.Response{Reject: true, RejectReason: "external registration not committed"}, nil, nil
+	}})
+
+	rollbackCalls := 0
+	finalErr, resultErr := confirmNewProxyResult(
+		manager,
+		&plugin.NewProxyResultContent{Admitted: true},
+		nil,
+		func() error {
+			rollbackCalls++
+			return nil
+		},
+	)
+	if finalErr == nil || resultErr == nil {
+		t.Fatalf("errors = final %v, result %v; want both non-nil", finalErr, resultErr)
+	}
+	if !strings.Contains(finalErr.Error(), "confirm new proxy admission") ||
+		!strings.Contains(resultErr.Error(), "external registration not committed") {
+		t.Fatalf("errors = final %q, result %q", finalErr, resultErr)
+	}
+	if rollbackCalls != 1 {
+		t.Fatalf("rollback calls = %d, want 1", rollbackCalls)
+	}
+}
+
+func TestConfirmNewProxyResultFailedAdmissionKeepsOriginalError(t *testing.T) {
+	t.Parallel()
+
+	manager := plugin.NewManager()
+	manager.Register(&controlResultPlugin{handle: func(string, any) (*plugin.Response, any, error) {
+		return nil, nil, errors.New("cleanup callback unavailable")
+	}})
+
+	admissionErr := errors.New("proxy name already exists")
+	rollbackCalls := 0
+	finalErr, resultErr := confirmNewProxyResult(
+		manager,
+		&plugin.NewProxyResultContent{Admitted: false},
+		admissionErr,
+		func() error {
+			rollbackCalls++
+			return nil
+		},
+	)
+	if !errors.Is(finalErr, admissionErr) || resultErr == nil {
+		t.Fatalf("errors = final %v, result %v; want original admission and callback error", finalErr, resultErr)
+	}
+	if rollbackCalls != 0 {
+		t.Fatalf("rollback calls = %d, want 0", rollbackCalls)
 	}
 }
 
@@ -497,23 +560,23 @@ func TestGenerateNewProxyAttemptIDFormatAndUniqueness(t *testing.T) {
 	}
 }
 
-func TestProcessNewProxyAttemptNotificationErrorDoesNotRewriteAdmission(t *testing.T) {
+func TestProcessNewProxyAttemptReturnsConfirmationErrorSeparately(t *testing.T) {
 	t.Parallel()
 
-	notifyErr := errors.New("notification unavailable")
+	confirmErr := errors.New("confirmation unavailable")
 	registerErr := errors.New("registration unavailable")
 	for _, tc := range []struct {
 		name        string
 		registerErr error
 	}{
-		{name: "successful admission remains successful"},
-		{name: "failed admission keeps original error", registerErr: registerErr},
+		{name: "successful registration still requires confirmation"},
+		{name: "failed registration keeps original error", registerErr: registerErr},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			manager := plugin.NewManager()
 			manager.Register(&controlResultPlugin{handle: func(op string, _ any) (*plugin.Response, any, error) {
 				if op == plugin.OpNewProxyResult {
-					return nil, nil, notifyErr
+					return nil, nil, confirmErr
 				}
 				if op == plugin.OpCloseProxy {
 					t.Fatal("failed NewProxy attempt emitted synthetic CloseProxy")
@@ -529,8 +592,8 @@ func TestProcessNewProxyAttemptNotificationErrorDoesNotRewriteAdmission(t *testi
 			if !errors.Is(admissionErr, tc.registerErr) {
 				t.Fatalf("admission error = %v, want %v", admissionErr, tc.registerErr)
 			}
-			if resultErr == nil || !strings.Contains(resultErr.Error(), notifyErr.Error()) {
-				t.Fatalf("result error = %v, want %q", resultErr, notifyErr)
+			if resultErr == nil || !strings.Contains(resultErr.Error(), confirmErr.Error()) {
+				t.Fatalf("result error = %v, want %q", resultErr, confirmErr)
 			}
 		})
 	}

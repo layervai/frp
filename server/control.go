@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"runtime/debug"
@@ -401,12 +402,15 @@ func (ctl *Control) handleNewProxy(m msg.Message) {
 		generateNewProxyAttemptID,
 	)
 	if resultContent != nil {
-		resultErr := ctl.sessionCtx.PluginManager.EnqueueNewProxyResult(resultContent)
+		var resultErr error
+		err, resultErr = confirmNewProxyResult(
+			ctl.sessionCtx.PluginManager,
+			resultContent,
+			err,
+			func() error { return ctl.CloseProxy(&msg.CloseProxy{ProxyName: inMsg.ProxyName}) },
+		)
 		if resultErr != nil {
-			// NewProxyResult is a post-decision notification. A delivery error
-			// or queue-saturation error must not rewrite the admission decision.
-			// The bounded async path keeps plugin I/O off the control dispatcher.
-			xl.Warnf("enqueue NewProxyResult for proxy [%s] error: %v", inMsg.ProxyName, resultErr)
+			xl.Warnf("confirm NewProxyResult for proxy [%s] error: %v", inMsg.ProxyName, resultErr)
 		}
 	}
 
@@ -435,10 +439,8 @@ type (
 	newProxyAttemptIDFunc func() (string, error)
 )
 
-// processNewProxyAttempt is the synchronous test/integration wrapper around the
-// production admission helper. The live control path enqueues the immutable
-// result on Manager's bounded worker pool so plugin I/O cannot stall the
-// dispatcher; direct callers retain synchronous delivery and its result error.
+// processNewProxyAttempt runs the complete admission transaction, including
+// the result-plugin confirmation required before FRPS can report success.
 func processNewProxyAttempt(
 	manager *plugin.Manager,
 	content *plugin.NewProxyContent,
@@ -465,10 +467,38 @@ func processNewProxyAttemptWithIDGenerator(
 	return effectiveMsg, remoteAddr, admissionErr, resultErr
 }
 
+// confirmNewProxyResult commits or rolls back one admission attempt. A proxy
+// that FRPS successfully registered is not visible to the client until every
+// result plugin confirms its external state. Failed registrations still report
+// their immutable result for cleanup, but a cleanup callback failure does not
+// replace the original admission error or synthesize a proxy teardown.
+func confirmNewProxyResult(
+	manager *plugin.Manager,
+	resultContent *plugin.NewProxyResultContent,
+	admissionErr error,
+	rollback func() error,
+) (finalErr, resultErr error) {
+	resultErr = manager.NewProxyResult(resultContent)
+	if resultErr == nil || admissionErr != nil {
+		return admissionErr, resultErr
+	}
+
+	// RegisterProxy has made the proxy locally live, but the result plugin has
+	// not committed the corresponding external routing state. Roll back the
+	// exact registered attempt before reporting failure so the client cannot
+	// retire an older serving proxy.
+	if rollbackErr := rollback(); rollbackErr != nil {
+		return errors.Join(
+			fmt.Errorf("confirm new proxy admission: %w", resultErr),
+			fmt.Errorf("rollback unconfirmed proxy: %w", rollbackErr),
+		), resultErr
+	}
+	return fmt.Errorf("confirm new proxy admission: %w", resultErr), resultErr
+}
+
 // processNewProxyAdmissionWithIDGenerator runs the mutable plugin chain and
-// FRPS registration, then constructs exactly one immutable result payload. It
-// performs no result-plugin I/O; the production caller can therefore enqueue
-// the payload before replying without blocking on the plugin endpoint.
+// FRPS registration, then constructs exactly one immutable result payload. The
+// caller must synchronously confirm that result before reporting success.
 func processNewProxyAdmissionWithIDGenerator(
 	manager *plugin.Manager,
 	content *plugin.NewProxyContent,

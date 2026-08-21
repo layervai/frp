@@ -69,10 +69,12 @@ type NewProxyContent struct {
 // plugin chain rejects it). Admitted is true only after RegisterProxy completes
 // successfully.
 //
-// This is a notification, not another admission hook: plugin responses cannot
-// change the outcome. Consumers that prepare external state during NewProxy can
-// use the exact identity and outcome to commit or roll that state back without
-// treating a failed admission as a CloseProxy event.
+// This is the commit point for admission. Plugins cannot mutate the content,
+// but a rejection or delivery failure prevents FRPS from reporting an admitted
+// proxy to the client and causes the newly registered proxy to be rolled back.
+// Consumers that prepare external state during NewProxy can use the exact
+// identity and outcome to commit or roll that state back without treating a
+// failed registration as a CloseProxy event.
 type NewProxyResultContent struct {
 	User      UserInfo `json:"user"`
 	AttemptID string   `json:"attempt_id"`

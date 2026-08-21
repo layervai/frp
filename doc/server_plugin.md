@@ -146,25 +146,27 @@ sent synchronously after the `NewProxy` plugin chain and, when that chain
 accepts, after FRPS attempts to register the proxy. `admitted` is true only when
 registration completed successfully.
 
-This operation is a notification. Its response cannot reject or modify the
-already-decided result. A plugin that prepares external state during `NewProxy`
-can use `attempt_id` to correlate that preparation with this final result, then
-commit the exact, unnormalized `user.run_id` and `proxy_name` state when
-`admitted` is true or roll it back when false. FRPS generates a fresh
-cryptographically random 128-bit lowercase-hex `attempt_id` before invoking the
-`NewProxy` plugin chain and does not allow plugin responses to change it. A
+This operation is the admission commit point. Its response cannot modify the
+result content, but a rejection or delivery failure prevents FRPS from reporting
+success to the client. When tentative local registration succeeded, FRPS closes
+that exact proxy before returning the failure. A plugin that prepares external
+state during `NewProxy` can use `attempt_id` to correlate that preparation with
+this final result, then commit the exact, unnormalized `user.run_id` and
+`proxy_name` state when `admitted` is true or roll it back when false. FRPS
+generates a fresh cryptographically random 128-bit lowercase-hex `attempt_id`
+before invoking the `NewProxy` plugin chain and does not allow plugin responses
+to change it. A
 failed admission is not a `CloseProxy`: FRPS only sends `CloseProxy` for a proxy
 that was actually registered and later closed.
 
 Every server-plugin HTTP request, including both `NewProxy` and
 `NewProxyResult`, has a 25-second end-to-end timeout. `RegisterProxy` runs
-synchronously after `NewProxy` and performs local FRPS registration. FRPS then
-accepts `NewProxyResult` into a fixed 256-entry queue serviced by four workers
-before returning the `NewProxy` response to the client. Result-plugin HTTP I/O
-does not run on the control dispatcher, so a slow result endpoint cannot delay
-the admission response or subsequent heartbeat and control messages. Queue
-saturation fails the notification immediately and is logged; it never creates
-unbounded goroutines or rewrites the already-decided admission outcome.
+synchronously after `NewProxy` and performs tentative local FRPS registration.
+FRPS then calls `NewProxyResult` synchronously and returns success to the client
+only after every interested plugin confirms it. This deliberately puts external
+routing publication in the same bounded admission transaction as the local
+proxy, so a client cannot retire an older serving route before the replacement
+is actually routable.
 
 ```
 {

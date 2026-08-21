@@ -31,8 +31,6 @@ const (
 	closeProxyNotificationTimeout   = 30 * time.Second
 	closeProxyRetryInitialDelay     = 100 * time.Millisecond
 	closeProxyRetryMaxDelay         = 5 * time.Second
-	newProxyResultQueueSize         = 256
-	newProxyResultWorkerCount       = 4
 )
 
 var (
@@ -52,12 +50,6 @@ type closeProxyNotification struct {
 	xl      *xlog.Logger
 }
 
-type newProxyResultNotification struct {
-	content NewProxyResultContent
-	ctx     context.Context
-	xl      *xlog.Logger
-}
-
 type Manager struct {
 	loginPlugins          []Plugin
 	newProxyPlugins       []Plugin
@@ -67,18 +59,15 @@ type Manager struct {
 	newWorkConnPlugins    []Plugin
 	newUserConnPlugins    []Plugin
 
-	closeProxyQueue         chan closeProxyNotification
-	closeProxyTimeout       time.Duration
-	closeProxyRetryDelay    func(int) time.Duration
-	newProxyResultQueue     chan newProxyResultNotification
-	newProxyResultWorkers   int
-	notificationCtx         context.Context
-	notificationCancel      context.CancelFunc
-	notificationMu          sync.Mutex
-	notificationWG          sync.WaitGroup
-	closeProxyWorkerOn      bool
-	newProxyResultWorkersOn bool
-	closed                  bool
+	closeProxyQueue      chan closeProxyNotification
+	closeProxyTimeout    time.Duration
+	closeProxyRetryDelay func(int) time.Duration
+	notificationCtx      context.Context
+	notificationCancel   context.CancelFunc
+	notificationMu       sync.Mutex
+	notificationWG       sync.WaitGroup
+	closeProxyWorkerOn   bool
+	closed               bool
 }
 
 func NewManager() *Manager {
@@ -112,8 +101,6 @@ func newManagerWithCloseProxyDelivery(
 		closeProxyQueue:       make(chan closeProxyNotification, queueSize),
 		closeProxyTimeout:     deliveryTimeout,
 		closeProxyRetryDelay:  retryDelay,
-		newProxyResultQueue:   make(chan newProxyResultNotification, newProxyResultQueueSize),
-		newProxyResultWorkers: newProxyResultWorkerCount,
 		notificationCtx:       ctx,
 		notificationCancel:    cancel,
 	}
@@ -367,78 +354,11 @@ func (m *Manager) deliverCloseProxy(task closeProxyNotification) {
 	}
 }
 
-// EnqueueNewProxyResult schedules a post-decision notification without putting
-// plugin I/O on the FRP control dispatcher. A fixed queue and worker set bound
-// memory and concurrency; saturation fails immediately so a slow plugin cannot
-// delay client responses, heartbeats, teardown, or re-login.
-func (m *Manager) EnqueueNewProxyResult(content *NewProxyResultContent) error {
-	if len(m.newProxyResultPlugins) == 0 {
-		return nil
-	}
-
-	reqid, _ := util.RandID()
-	xl := xlog.New().AppendPrefix("reqid: " + reqid)
-	ctx := xlog.NewContext(m.notificationCtx, xl)
-	ctx = NewReqidContext(ctx, reqid)
-	task := newProxyResultNotification{
-		content: NewProxyResultContent{
-			User:      content.User.Clone(),
-			AttemptID: content.AttemptID,
-			ProxyName: content.ProxyName,
-			Admitted:  content.Admitted,
-		},
-		ctx: ctx,
-		xl:  xl,
-	}
-
-	m.notificationMu.Lock()
-	defer m.notificationMu.Unlock()
-	if m.closed {
-		return errPluginManagerClosed
-	}
-	if !m.newProxyResultWorkersOn {
-		m.newProxyResultWorkersOn = true
-		m.notificationWG.Add(m.newProxyResultWorkers)
-		for range m.newProxyResultWorkers {
-			go m.runNewProxyResultWorker()
-		}
-	}
-	select {
-	case m.newProxyResultQueue <- task:
-		return nil
-	default:
-		return errPluginNotificationQueueFull
-	}
-}
-
-func (m *Manager) runNewProxyResultWorker() {
-	defer m.notificationWG.Done()
-	for {
-		select {
-		case <-m.notificationCtx.Done():
-			return
-		default:
-		}
-
-		select {
-		case <-m.notificationCtx.Done():
-			return
-		case task := <-m.newProxyResultQueue:
-			if m.notificationCtx.Err() != nil {
-				return
-			}
-			if err := m.deliverNewProxyResult(task.ctx, task.xl, &task.content); err != nil {
-				task.xl.Warnf("send %s request to plugins error: %v", OpNewProxyResult, err)
-			}
-		}
-	}
-}
-
-// NewProxyResult synchronously notifies every interested plugin of the final
-// FRPS admission outcome. Responses are deliberately ignored: unlike NewProxy,
-// this operation reports an outcome that has already been decided. Transport
-// errors are aggregated only for logging/observability and do not rewrite the
-// NewProxy response sent to the client.
+// NewProxyResult synchronously asks every interested plugin to confirm the
+// final FRPS admission outcome. An admitted proxy is not reported to the client
+// until every plugin acknowledges the result. A reject or delivery failure is
+// therefore authoritative for the admission transaction even though plugins
+// cannot mutate the result content.
 func (m *Manager) NewProxyResult(content *NewProxyResultContent) error {
 	if len(m.newProxyResultPlugins) == 0 {
 		return nil
@@ -458,10 +378,25 @@ func (m *Manager) deliverNewProxyResult(
 ) error {
 	errs := make([]string, 0)
 	for _, p := range m.newProxyResultPlugins {
-		_, _, err := p.Handle(ctx, OpNewProxyResult, *content)
+		res, _, err := p.Handle(ctx, OpNewProxyResult, *content)
 		if err != nil {
 			xl.Warnf("send %s request to plugin [%s] error: %v", OpNewProxyResult, p.Name(), err)
 			errs = append(errs, fmt.Sprintf("[%s]: %v", p.Name(), err))
+			continue
+		}
+		if res == nil {
+			err = errors.New("empty plugin response")
+			xl.Warnf("send %s request to plugin [%s] error: %v", OpNewProxyResult, p.Name(), err)
+			errs = append(errs, fmt.Sprintf("[%s]: %v", p.Name(), err))
+			continue
+		}
+		if res.Reject {
+			reason := strings.TrimSpace(res.RejectReason)
+			if reason == "" {
+				reason = "rejected without reason"
+			}
+			xl.Warnf("plugin [%s] rejected %s: %s", p.Name(), OpNewProxyResult, reason)
+			errs = append(errs, fmt.Sprintf("[%s]: %s", p.Name(), reason))
 		}
 	}
 
