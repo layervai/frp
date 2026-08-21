@@ -30,6 +30,7 @@ import (
 	v1 "github.com/fatedier/frp/pkg/config/v1"
 	"github.com/fatedier/frp/pkg/msg"
 	plugin "github.com/fatedier/frp/pkg/plugin/server"
+	"github.com/fatedier/frp/pkg/util/util"
 	"github.com/fatedier/frp/pkg/util/xlog"
 	"github.com/fatedier/frp/server/controller"
 	servermetrics "github.com/fatedier/frp/server/metrics"
@@ -270,12 +271,14 @@ func TestConfirmNewProxyResultManagerCloseCancelsAndRollsBack(t *testing.T) {
 	t.Parallel()
 
 	requestStarted := make(chan struct{})
+	requestCanceled := make(chan struct{})
 	manager := plugin.NewManager()
 	manager.Register(&controlContextPlugin{
 		supported: []string{plugin.OpNewProxyResult},
 		handle: func(ctx context.Context, _ string, _ any) (*plugin.Response, any, error) {
 			close(requestStarted)
 			<-ctx.Done()
+			close(requestCanceled)
 			return nil, nil, ctx.Err()
 		},
 	})
@@ -305,12 +308,19 @@ func TestConfirmNewProxyResultManagerCloseCancelsAndRollsBack(t *testing.T) {
 		t.Fatal("NewProxyResult plugin request did not start")
 	}
 	manager.Close()
+	select {
+	case <-requestCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("plugin request context was not canceled when the manager closed")
+	}
 
 	select {
 	case result := <-resultCh:
 		if result.finalErr == nil || result.resultErr == nil ||
-			!strings.Contains(result.resultErr.Error(), context.Canceled.Error()) {
-			t.Fatalf("confirmation errors = final %v, result %v; want canceled result and rollback", result.finalErr, result.resultErr)
+			!strings.Contains(result.resultErr.Error(), "result plugin delivery failed") ||
+			strings.Contains(result.resultErr.Error(), context.Canceled.Error()) {
+			t.Fatalf("confirmation errors = final %v, result %v; want sanitized cancellation and rollback",
+				result.finalErr, result.resultErr)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("NewProxyResult did not stop when the plugin manager closed")
@@ -319,6 +329,48 @@ func TestConfirmNewProxyResultManagerCloseCancelsAndRollsBack(t *testing.T) {
 	case <-rolledBack:
 	default:
 		t.Fatal("canceled NewProxyResult did not roll back tentative admission")
+	}
+}
+
+func TestNewProxyResultDeliveryErrorsStaySanitizedForClientDetailModes(t *testing.T) {
+	t.Parallel()
+
+	const sensitiveTransportError = "dial tcp 10.0.0.9:9443: tls certificate secret-plugin.internal"
+	manager := plugin.NewManager()
+	manager.Register(&controlContextPlugin{
+		supported: []string{plugin.OpNewProxyResult},
+		handle: func(context.Context, string, any) (*plugin.Response, any, error) {
+			return nil, nil, errors.New(sensitiveTransportError)
+		},
+	})
+	t.Cleanup(manager.Close)
+
+	rollbackCalls := 0
+	finalErr, resultErr := confirmNewProxyResult(
+		manager,
+		&plugin.NewProxyResultContent{Admitted: true},
+		nil,
+		func() error {
+			rollbackCalls++
+			return nil
+		},
+	)
+	if finalErr == nil || resultErr == nil || rollbackCalls != 1 {
+		t.Fatalf("confirmation = final %v result %v rollback %d, want sanitized failure and one rollback",
+			finalErr, resultErr, rollbackCalls)
+	}
+
+	for _, detailed := range []bool{true, false} {
+		got := util.GenerateResponseErrorString("new proxy error", finalErr, detailed)
+		if strings.Contains(got, sensitiveTransportError) || strings.Contains(got, "secret-plugin.internal") {
+			t.Fatalf("detailed=%t client error %q leaked raw transport details", detailed, got)
+		}
+		if detailed && !strings.Contains(got, "result plugin delivery failed") {
+			t.Fatalf("detailed client error = %q, want sanitized delivery reason", got)
+		}
+		if !detailed && got != "new proxy error" {
+			t.Fatalf("non-detailed client error = %q, want summary", got)
+		}
 	}
 }
 
@@ -864,7 +916,7 @@ func TestGenerateNewProxyAttemptIDFormatAndUniqueness(t *testing.T) {
 func TestProcessNewProxyAttemptReturnsConfirmationErrorSeparately(t *testing.T) {
 	t.Parallel()
 
-	confirmErr := errors.New("confirmation unavailable")
+	confirmErr := errors.New("confirmation unavailable at secret-plugin.internal")
 	registerErr := errors.New("registration unavailable")
 	for _, tc := range []struct {
 		name        string
@@ -893,8 +945,9 @@ func TestProcessNewProxyAttemptReturnsConfirmationErrorSeparately(t *testing.T) 
 			if !errors.Is(admissionErr, tc.registerErr) {
 				t.Fatalf("admission error = %v, want %v", admissionErr, tc.registerErr)
 			}
-			if resultErr == nil || !strings.Contains(resultErr.Error(), confirmErr.Error()) {
-				t.Fatalf("result error = %v, want %q", resultErr, confirmErr)
+			if resultErr == nil || !strings.Contains(resultErr.Error(), "result plugin delivery failed") ||
+				strings.Contains(resultErr.Error(), confirmErr.Error()) {
+				t.Fatalf("result error = %v, want sanitized confirmation failure", resultErr)
 			}
 		})
 	}

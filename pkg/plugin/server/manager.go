@@ -377,17 +377,18 @@ func (m *Manager) deliverNewProxyResult(
 	content *NewProxyResultContent,
 ) error {
 	errs := make([]string, 0)
+	deliveryFailed := false
 	for _, p := range m.newProxyResultPlugins {
 		res, _, err := p.Handle(ctx, OpNewProxyResult, *content)
 		if err != nil {
 			xl.Warnf("send %s request to plugin [%s] error: %v", OpNewProxyResult, p.Name(), err)
-			errs = append(errs, fmt.Sprintf("[%s]: %v", p.Name(), err))
+			deliveryFailed = true
 			continue
 		}
 		if res == nil {
 			err = errors.New("empty plugin response")
 			xl.Warnf("send %s request to plugin [%s] error: %v", OpNewProxyResult, p.Name(), err)
-			errs = append(errs, fmt.Sprintf("[%s]: %v", p.Name(), err))
+			deliveryFailed = true
 			continue
 		}
 		if res.Reject {
@@ -400,6 +401,9 @@ func (m *Manager) deliverNewProxyResult(
 		}
 	}
 
+	if deliveryFailed {
+		errs = append([]string{"result plugin delivery failed"}, errs...)
+	}
 	if len(errs) > 0 {
 		return fmt.Errorf("send %s request to plugin errors: %s", OpNewProxyResult, strings.Join(errs, "; "))
 	}

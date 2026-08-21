@@ -190,7 +190,8 @@ with `{}`, confirms admission. A plugin must return `reject: true`, a non-2xx or
 invalid response, or a transport error to fence the attempt. When
 `detailedErrorsToClient` is enabled, a result plugin's rejection reason may be
 included in the client's `NewProxyResp.Error`, so rejection reasons must not
-contain secrets.
+contain secrets. FRPS logs transport and response-decoding details server-side
+but returns only a generic delivery failure to the client.
 
 ```
 {

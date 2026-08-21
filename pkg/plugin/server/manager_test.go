@@ -201,13 +201,20 @@ func TestManagerNewProxyResultAggregatesErrorsWithoutShortCircuit(t *testing.T) 
 
 	manager := NewManager()
 	var called []string
-	for _, name := range []string{"first", "second"} {
+	const sensitiveTransportError = "dial tcp 10.0.0.8:8443: certificate contains secret-internal-name"
+	for _, name := range []string{"transport", "empty", "reject"} {
 		manager.Register(&resultTestPlugin{
 			name:      name,
 			supported: []string{OpNewProxyResult},
 			handle: func(_ context.Context, _ string, _ any) (*Response, any, error) {
 				called = append(called, name)
-				return nil, nil, errors.New("delivery failed")
+				if name == "transport" {
+					return nil, nil, errors.New(sensitiveTransportError)
+				}
+				if name == "empty" {
+					return nil, nil, nil
+				}
+				return &Response{Reject: true, RejectReason: "routing registration rejected"}, nil, nil
 			},
 		})
 	}
@@ -216,12 +223,19 @@ func TestManagerNewProxyResultAggregatesErrorsWithoutShortCircuit(t *testing.T) 
 	if err == nil {
 		t.Fatal("NewProxyResult() error = nil, want aggregate delivery error")
 	}
-	for _, want := range []string{"send NewProxyResult request to plugin errors", "[first]: delivery failed", "[second]: delivery failed"} {
+	for _, want := range []string{
+		"send NewProxyResult request to plugin errors",
+		"result plugin delivery failed",
+		"[reject]: routing registration rejected",
+	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("NewProxyResult() error = %q, want substring %q", err, want)
 		}
 	}
-	if !slices.Equal(called, []string{"first", "second"}) {
-		t.Fatalf("notification order = %v, want [first second]", called)
+	if strings.Contains(err.Error(), sensitiveTransportError) {
+		t.Fatalf("NewProxyResult() error = %q, leaked raw transport details", err)
+	}
+	if !slices.Equal(called, []string{"transport", "empty", "reject"}) {
+		t.Fatalf("notification order = %v, want [transport empty reject]", called)
 	}
 }
