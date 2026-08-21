@@ -178,10 +178,16 @@ raise the timeout or disable the application heartbeat if that bound is not
 satisfied. FRPS refreshes the control's liveness timestamp when it receives the
 `NewProxy` message, so this budget starts from a fresh authenticated control
 message rather than from the preceding ping. With TCP multiplexing enabled,
-FRPS disables its application-layer heartbeat timeout by default. Every result
-plugin receives the admitted result even if an earlier plugin rejected it, and
-a rejecting plugin must also expect
-the compensating `CloseProxy` callback for that attempt. When
+FRPS and FRPC disable their application-layer heartbeat timeouts by default. If
+TCP multiplexing is disabled, FRPC's heartbeat timeout is independent of the
+server configuration and synchronous callbacks also delay `Pong`; both client
+and server heartbeat timeouts must exceed the aggregate callback budget, or the
+application heartbeat must be disabled. Every result plugin receives the
+admitted result even if an earlier plugin rejected it, and a rejecting plugin
+must also expect the compensating `CloseProxy` callback for that attempt. A
+valid successful response with `reject` unset or `false`, including HTTP 200
+with `{}`, confirms admission. A plugin must return `reject: true`, a non-2xx or
+invalid response, or a transport error to fence the attempt. When
 `detailedErrorsToClient` is enabled, a result plugin's rejection reason may be
 included in the client's `NewProxyResp.Error`, so rejection reasons must not
 contain secrets.
