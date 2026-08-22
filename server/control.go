@@ -231,6 +231,25 @@ func (ctl *Control) Close() error {
 	return nil
 }
 
+// closeIfActive closes this exact control pointer unless its worker has
+// already finished. Callers that first resolve a Control from ControlManager
+// retain pointer identity across a concurrent same-runID replacement, so this
+// method can never close the replacement.
+func (ctl *Control) closeIfActive() bool {
+	select {
+	case <-ctl.doneCh:
+		return false
+	default:
+	}
+	// Control.Close deliberately treats connection-close errors as idempotent:
+	// the worker may have observed the transport failure before this terminal
+	// signal arrived, but it has not yet published doneCh. Preserve that
+	// contract here. The boolean reports whether this exact indexed control was
+	// still active when selected, not a transport-specific second-Close result.
+	_ = ctl.Close()
+	return true
+}
+
 func (ctl *Control) Replaced(newCtl *Control) {
 	xl := ctl.xl
 	xl.Infof("replaced by client [%s]", newCtl.runID)
