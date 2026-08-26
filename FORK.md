@@ -39,7 +39,7 @@ git merge v0.72.0          # resolve conflicts, keep upstream's version of
 
 Rebasing is tempting and wrong here. It re-authors every layerv commit, so the
 reviewed-commit identity that the release tags and the consumers'
-consumers' provenance-verification chain depend on restarts from scratch on every
+provenance-verification chain depend on restarts from scratch on every
 upstream bump. Merging keeps commit identity stable forever; the cost is a
 messier graph, which is the cheaper half of the trade.
 
@@ -76,12 +76,12 @@ git tag -s v1.1.0 -m "LayerV frp v1.1.0 (upstream v0.72.0)
 git push origin v1.1.0
 ```
 
-Consumers verify this chain with `scripts/verify-frp-provenance.sh`, which
-lives in each **consumer** repository (`qurl-connector`, `qurl-integrations`,
-`qurl-reverse-tunnel-server`) rather than here, and which
-checks the `go.mod` pin, the `go.sum` hashes, the public proxy's metadata from
-a cold module cache, and that the live tag still resolves to the recorded
-commit. Never move a published tag.
+Consumers verify this chain with `scripts/verify-frp-provenance.sh`. That
+script lives in each **consumer** repository (`qurl-connector`,
+`qurl-integrations`, `qurl-reverse-tunnel-server`), not here. It checks the
+`go.mod` pin, the `go.sum` hashes, the public proxy's metadata from a cold
+module cache, and that the live tag still resolves to the recorded commit.
+Never move a published tag.
 
 When cutting a release, every consumer's copy of that script needs its pinned
 constants refreshed. The script derives the version and hashes from `go.mod`
