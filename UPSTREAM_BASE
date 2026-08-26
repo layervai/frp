@@ -1,0 +1,6 @@
+# Machine-readable record of the upstream release this fork is merged up to.
+# Updated by the upstream-refresh procedure in FORK.md. Keep the format stable:
+# consumers and CI parse these keys.
+upstream_repo=https://github.com/fatedier/frp
+upstream_version=v0.71.0
+upstream_commit=4a23aa181c1d7e28eecaa8216024ed753b9d27c8
