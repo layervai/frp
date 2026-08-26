@@ -15,9 +15,9 @@ Between 2026-07 and 2026-08 the fork ran version-named base branches
 upstream release, with the layerv patches replayed onto each new one. That went
 wrong in a specific, predictable way:
 
-* Two lines were live at once and drifted three upstream releases apart —
-  `qurl-reverse-tunnel-server` consumed the v0.68.1 line while `qurl-connector`
-  consumed the v0.70.0 line — and nothing forced them to converge.
+* Two lines were live at once and drifted three upstream releases apart — the
+  frps-side consumer stayed on the v0.68.1 line while the frpc-side consumers
+  moved to v0.70.0 — and nothing forced them to converge.
 * Replaying gave the same fix a different SHA on every line, which defeats the
   point of a provenance chain built on signed tags that peel to a reviewed
   commit.
@@ -77,8 +77,7 @@ git push origin v1.1.0
 ```
 
 Consumers verify this chain with `scripts/verify-frp-provenance.sh`. That
-script lives in each **consumer** repository (`qurl-connector`,
-`qurl-integrations`, `qurl-reverse-tunnel-server`), not here. It checks the
+script lives in each **consumer** repository, not here. It checks the
 `go.mod` pin, the `go.sum` hashes, the public proxy's metadata from a cold
 module cache, and that the live tag still resolves to the recorded commit.
 Never move a published tag.
