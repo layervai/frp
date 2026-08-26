@@ -18,7 +18,7 @@ import (
 
 const (
 	claudeAction  = "anthropics/claude-code-action@fa7e2f0a29a126f0b81cdcf360561b36e44cf608"
-	claudeModel   = "claude-opus-4-8"
+	claudeModel   = "claude-opus-5"
 	helperPattern = `^credential(\..*)?\.helper$`
 )
 
