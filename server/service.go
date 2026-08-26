@@ -363,6 +363,24 @@ func NewService(cfg *v1.ServerConfig) (*Service, error) {
 	return svr, nil
 }
 
+// CloseControl closes the exact currently indexed control for runID.
+//
+// The manager lookup captures a Control pointer. A same-runID replacement
+// installed after that lookup owns a different pointer and is never closed by
+// this call. CloseControl returns false when no control was indexed or the
+// captured control had already finished; callers may treat both outcomes as
+// idempotent terminal cleanup. A request queued before this method is invoked
+// deliberately closes the control current at invocation time: one runID is one
+// immutable outer authorization cycle, so a same-runID reconnect remains part
+// of the stale cycle.
+func (svr *Service) CloseControl(runID string) bool {
+	ctl, ok := svr.ctlManager.GetByID(runID)
+	if !ok {
+		return false
+	}
+	return ctl.closeIfActive()
+}
+
 func (svr *Service) Run(ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
 	svr.ctx = ctx
@@ -434,6 +452,7 @@ func (svr *Service) Close() error {
 	svr.rc.Close()
 	svr.muxer.Close()
 	svr.ctlManager.Close()
+	svr.pluginManager.Close()
 	if svr.cancel != nil {
 		svr.cancel()
 	}

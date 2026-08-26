@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -295,42 +296,227 @@ func TestManagerMutableContentPluginErrorLogLevel(t *testing.T) {
 	}
 }
 
-func TestManagerCloseProxyAggregatesErrors(t *testing.T) {
-	logOutput := captureLogOutput(t)
-	m := NewManager()
+// TestManagerCloseProxyAggregatesErrors (upstream) is intentionally absent.
+// It pins the synchronous CloseProxy contract -- that m.CloseProxy returns an
+// aggregated error from every plugin. This fork replaces that contract with
+// bounded asynchronous delivery and retry (see enqueueCloseProxy /
+// runCloseProxyWorker), so CloseProxy no longer reports per-plugin failures to
+// its caller; delivery outcomes are logged and covered by the close-proxy
+// delivery tests below.
 
+type resultTestPlugin struct {
+	name      string
+	supported []string
+	handle    func(context.Context, string, any) (*Response, any, error)
+}
+
+func (p *resultTestPlugin) Name() string { return p.name }
+
+func (p *resultTestPlugin) IsSupport(op string) bool {
+	return slices.Contains(p.supported, op)
+}
+
+func (p *resultTestPlugin) Handle(ctx context.Context, op string, content any) (*Response, any, error) {
+	return p.handle(ctx, op, content)
+}
+
+func TestDefaultCloseProxyRetryDelayIsCapped(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		failureCount int
+		want         time.Duration
+	}{
+		{failureCount: 1, want: 100 * time.Millisecond},
+		{failureCount: 2, want: 200 * time.Millisecond},
+		{failureCount: 6, want: 3200 * time.Millisecond},
+		{failureCount: 7, want: 5 * time.Second},
+		{failureCount: 1000, want: 5 * time.Second},
+	}
+	for _, tt := range tests {
+		if got := defaultCloseProxyRetryDelay(tt.failureCount); got != tt.want {
+			t.Fatalf("defaultCloseProxyRetryDelay(%d) = %s, want %s", tt.failureCount, got, tt.want)
+		}
+	}
+}
+
+func TestManagerNewProxyResultRejectsAdmissionAndNotifiesAllPlugins(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager()
+	var called []string
 	for _, name := range []string{"first", "second"} {
-		m.Register(testPlugin{
-			name: name,
-			ops:  map[string]bool{OpCloseProxy: true},
-			handler: func(ctx context.Context, op string, content any) (*Response, any, error) {
-				if GetReqidFromContext(ctx) == "" {
-					t.Fatal("expected request id in context")
+		manager.Register(&resultTestPlugin{
+			name:      name,
+			supported: []string{OpNewProxyResult},
+			handle: func(_ context.Context, op string, content any) (*Response, any, error) {
+				called = append(called, name)
+				if op != OpNewProxyResult {
+					t.Fatalf("op = %q, want %q", op, OpNewProxyResult)
 				}
-				if op != OpCloseProxy {
-					t.Fatalf("unexpected op: %s", op)
+				got, ok := content.(NewProxyResultContent)
+				if !ok {
+					t.Fatalf("content type = %T, want NewProxyResultContent", content)
 				}
-				return nil, nil, errors.New(name + " error")
+				if got.User.RunID != "0123456789abcdef" || got.AttemptID != "0123456789abcdef0123456789abcdef" || got.ProxyName != "proxy-exact" || !got.Admitted {
+					t.Fatalf("content = %+v, want exact admitted identity", got)
+				}
+				if name == "first" {
+					return &Response{Reject: true, RejectReason: "external state not committed"}, nil, nil
+				}
+				return &Response{Unchange: true}, nil, nil
 			},
 		})
 	}
 
-	err := m.CloseProxy(&CloseProxyContent{})
-	if err == nil {
-		t.Fatal("expected close proxy error")
+	err := manager.NewProxyResult(&NewProxyResultContent{
+		User:      UserInfo{RunID: "0123456789abcdef"},
+		AttemptID: "0123456789abcdef0123456789abcdef",
+		ProxyName: "proxy-exact",
+		Admitted:  true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "[first]: external state not committed") {
+		t.Fatalf("NewProxyResult() error = %v, want first plugin rejection", err)
 	}
-	if !strings.HasPrefix(err.Error(), "send CloseProxy request to plugin errors: ") {
-		t.Fatalf("unexpected close proxy error prefix: %v", err)
+	if !slices.Equal(called, []string{"first", "second"}) {
+		t.Fatalf("notification order = %v, want [first second]", called)
 	}
-	if !strings.Contains(err.Error(), "[first]: first error") || !strings.Contains(err.Error(), "[second]: second error") {
-		t.Fatalf("missing aggregated errors: %v", err)
+}
+
+func TestManagerNewProxyResultAcceptsAllPluginConfirmations(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager()
+	for _, name := range []string{"first", "second"} {
+		manager.Register(&resultTestPlugin{
+			name:      name,
+			supported: []string{OpNewProxyResult},
+			handle: func(context.Context, string, any) (*Response, any, error) {
+				return &Response{Unchange: true}, nil, nil
+			},
+		})
 	}
-	if len(logOutput.levels) != 2 {
-		t.Fatalf("expected two warning logs, got %v", logOutput.levels)
+
+	if err := manager.NewProxyResult(&NewProxyResultContent{Admitted: true}); err != nil {
+		t.Fatalf("NewProxyResult() error = %v", err)
 	}
-	for _, level := range logOutput.levels {
-		if level != goliblog.WarnLevel {
-			t.Fatalf("expected warning log level, got %v", logOutput.levels)
+}
+
+func TestManagerNewProxyPreservesAttemptIDAcrossMutationChain(t *testing.T) {
+	t.Parallel()
+
+	const attemptID = "0123456789abcdef0123456789abcdef"
+	manager := NewManager()
+	manager.Register(&resultTestPlugin{
+		name:      "mutator",
+		supported: []string{OpNewProxy},
+		handle: func(_ context.Context, _ string, content any) (*Response, any, error) {
+			modified := content.(NewProxyContent)
+			modified.AttemptID = "aliased-attempt"
+			modified.ProxyName = "modified-proxy"
+			return &Response{Unchange: false}, &modified, nil
+		},
+	})
+	manager.Register(&resultTestPlugin{
+		name:      "observer",
+		supported: []string{OpNewProxy},
+		handle: func(_ context.Context, _ string, content any) (*Response, any, error) {
+			got := content.(NewProxyContent)
+			if got.AttemptID != attemptID {
+				t.Fatalf("second plugin AttemptID = %q, want immutable %q", got.AttemptID, attemptID)
+			}
+			return &Response{Unchange: true}, nil, nil
+		},
+	})
+
+	got, err := manager.NewProxy(&NewProxyContent{AttemptID: attemptID})
+	if err != nil {
+		t.Fatalf("NewProxy() error = %v", err)
+	}
+	if got.AttemptID != attemptID || got.ProxyName != "modified-proxy" {
+		t.Fatalf("NewProxy() content = %+v, want immutable attempt ID and mutable proxy name", got)
+	}
+}
+
+func TestManagerCloseProxyAttemptIDCannotBeRewrittenByPluginResponses(t *testing.T) {
+	t.Parallel()
+
+	const attemptID = "0123456789abcdef0123456789abcdef"
+	manager := NewManager()
+	t.Cleanup(manager.Close)
+	observedAttemptIDs := make(chan string, 2)
+	for _, name := range []string{"mutator", "observer"} {
+		manager.Register(&resultTestPlugin{
+			name:      name,
+			supported: []string{OpCloseProxy},
+			handle: func(_ context.Context, _ string, content any) (*Response, any, error) {
+				got := content.(CloseProxyContent)
+				observedAttemptIDs <- got.AttemptID
+				got.AttemptID = "aliased-attempt"
+				return &Response{Unchange: false}, &got, nil
+			},
+		})
+	}
+
+	content := &CloseProxyContent{AttemptID: attemptID}
+	if err := manager.CloseProxy(content); err != nil {
+		t.Fatalf("CloseProxy() error = %v", err)
+	}
+	if content.AttemptID != attemptID {
+		t.Fatalf("CloseProxy() rewrote AttemptID to %q", content.AttemptID)
+	}
+	for range 2 {
+		select {
+		case got := <-observedAttemptIDs:
+			if got != attemptID {
+				t.Fatalf("CloseProxy plugin AttemptID = %q, want immutable %q", got, attemptID)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("CloseProxy notification was not delivered")
 		}
+	}
+}
+
+func TestManagerNewProxyResultAggregatesErrorsWithoutShortCircuit(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager()
+	var called []string
+	const sensitiveTransportError = "dial tcp 10.0.0.8:8443: certificate contains secret-internal-name"
+	for _, name := range []string{"transport", "empty", "reject"} {
+		manager.Register(&resultTestPlugin{
+			name:      name,
+			supported: []string{OpNewProxyResult},
+			handle: func(_ context.Context, _ string, _ any) (*Response, any, error) {
+				called = append(called, name)
+				if name == "transport" {
+					return nil, nil, errors.New(sensitiveTransportError)
+				}
+				if name == "empty" {
+					return nil, nil, nil
+				}
+				return &Response{Reject: true, RejectReason: "routing registration rejected"}, nil, nil
+			},
+		})
+	}
+
+	err := manager.NewProxyResult(&NewProxyResultContent{})
+	if err == nil {
+		t.Fatal("NewProxyResult() error = nil, want aggregate delivery error")
+	}
+	for _, want := range []string{
+		"send NewProxyResult request to plugin errors",
+		"result plugin delivery failed",
+		"[reject]: routing registration rejected",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("NewProxyResult() error = %q, want substring %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), sensitiveTransportError) {
+		t.Fatalf("NewProxyResult() error = %q, leaked raw transport details", err)
+	}
+	if !slices.Equal(called, []string{"transport", "empty", "reject"}) {
+		t.Fatalf("notification order = %v, want [transport empty reject]", called)
 	}
 }
