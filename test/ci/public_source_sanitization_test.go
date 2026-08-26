@@ -102,7 +102,14 @@ func TestPublicSourceNamesNoPrivateLayerVMaterial(t *testing.T) {
 		if strings.HasSuffix(rel, "package-lock.json") {
 			return nil
 		}
-		body, err := os.ReadFile(path)
+		// G122 flags reading a WalkDir-supplied path as symlink-TOCTOU-prone.
+		// The tree walked here is this repository's own checkout, the walk is
+		// the point of the test, and a symlink race would at worst make the
+		// guard read the wrong file and report a false positive -- it cannot
+		// weaken the check or leak anything. os.Root would forbid crossing into
+		// a symlinked directory, which is exactly the traversal a whole-tree
+		// scan needs.
+		body, err := os.ReadFile(path) //nolint:gosec // G122: scanning this repo's own tree is the test
 		if err != nil {
 			// Unreadable entries (sockets, broken symlinks) are not source.
 			return nil //nolint:nilerr // skipping non-source entries is intended
