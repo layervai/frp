@@ -17,10 +17,12 @@ package validation
 import (
 	"fmt"
 	"slices"
+	"time"
 
 	"github.com/samber/lo"
 
 	v1 "github.com/fatedier/frp/pkg/config/v1"
+	splugin "github.com/fatedier/frp/pkg/plugin/server"
 )
 
 func (v *ConfigValidator) ValidateServerConfig(c *v1.ServerConfig) (Warning, error) {
@@ -55,9 +57,34 @@ func (v *ConfigValidator) ValidateServerConfig(c *v1.ServerConfig) (Warning, err
 		errs = AppendError(errs, fmt.Errorf("invalid transport.maxPoolCount, must be non-negative"))
 	}
 
+	newProxyPluginCount := 0
+	newProxyResultPluginCount := 0
 	for _, p := range c.HTTPPlugins {
 		if !lo.Every(SupportedHTTPPluginOps, p.Ops) {
 			errs = AppendError(errs, fmt.Errorf("invalid http plugin ops, optional values are %v", SupportedHTTPPluginOps))
+		}
+		if slices.Contains(p.Ops, splugin.OpNewProxy) {
+			newProxyPluginCount++
+		}
+		if slices.Contains(p.Ops, splugin.OpNewProxyResult) && !slices.Contains(p.Ops, splugin.OpCloseProxy) {
+			errs = AppendError(errs, fmt.Errorf("http plugin %q: %s requires %s for admission rollback", p.Name, splugin.OpNewProxyResult, splugin.OpCloseProxy))
+		}
+		if slices.Contains(p.Ops, splugin.OpNewProxyResult) {
+			newProxyResultPluginCount++
+		}
+	}
+	if newProxyResultPluginCount > 0 && c.Transport.HeartbeatTimeout > 0 {
+		callbackCount := newProxyPluginCount + newProxyResultPluginCount
+		callbackBudgetSeconds := int64(callbackCount) * int64(splugin.HTTPPluginRequestTimeout/time.Second)
+		if c.Transport.HeartbeatTimeout <= callbackBudgetSeconds {
+			errs = AppendError(errs, fmt.Errorf(
+				"transport.heartbeatTimeout %ds must exceed aggregate synchronous NewProxy callback budget %ds "+
+					"(%d NewProxy + %d NewProxyResult HTTP callbacks); raise it or disable the application heartbeat",
+				c.Transport.HeartbeatTimeout,
+				callbackBudgetSeconds,
+				newProxyPluginCount,
+				newProxyResultPluginCount,
+			))
 		}
 	}
 	return warnings, errs
