@@ -426,35 +426,6 @@ func (m *Manager) NewWorkConn(content *NewWorkConnContent) (*NewWorkConnContent,
 }
 
 func (m *Manager) NewUserConn(content *NewUserConnContent) (*NewUserConnContent, error) {
-	if len(m.newUserConnPlugins) == 0 {
-		return content, nil
-	}
-
-	var (
-		res = &Response{
-			Reject:   false,
-			Unchange: true,
-		}
-		retContent any
-		err        error
-	)
-	reqid, _ := util.RandID()
-	xl := xlog.New().AppendPrefix("reqid: " + reqid)
-	ctx := xlog.NewContext(context.Background(), xl)
-	ctx = NewReqidContext(ctx, reqid)
-
-	for _, p := range m.newUserConnPlugins {
-		res, retContent, err = p.Handle(ctx, OpNewUserConn, *content)
-		if err != nil {
-			xl.Infof("send NewUserConn request to plugin [%s] error: %v", p.Name(), err)
-			return nil, errors.New("send NewUserConn request to plugin error")
-		}
-		if res.Reject {
-			return nil, fmt.Errorf("%s", res.RejectReason)
-		}
-		if !res.Unchange {
-			content = retContent.(*NewUserConnContent)
-		}
-	}
-	return content, nil
+	// Preserve the pre-refactor log level for NewUserConn plugin errors.
+	return handleMutableContent(m.newUserConnPlugins, OpNewUserConn, content, pluginErrorLogInfo)
 }
