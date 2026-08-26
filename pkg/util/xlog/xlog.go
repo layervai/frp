@@ -17,6 +17,7 @@ package xlog
 import (
 	"cmp"
 	"slices"
+	"sync"
 
 	"github.com/fatedier/frp/pkg/util/log"
 )
@@ -30,8 +31,9 @@ type LogPrefix struct {
 	Priority int
 }
 
-// Logger is not thread safety for operations on prefix
 type Logger struct {
+	mu sync.RWMutex
+
 	prefixes []LogPrefix
 
 	prefixString string
@@ -44,6 +46,8 @@ func New() *Logger {
 }
 
 func (l *Logger) ResetPrefixes() (old []LogPrefix) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	old = l.prefixes
 	l.prefixes = make([]LogPrefix, 0)
 	l.prefixString = ""
@@ -59,6 +63,8 @@ func (l *Logger) AppendPrefix(prefix string) *Logger {
 }
 
 func (l *Logger) AddPrefix(prefix LogPrefix) *Logger {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	found := false
 	if prefix.Priority <= 0 {
 		prefix.Priority = 10
@@ -89,28 +95,36 @@ func (l *Logger) renderPrefixString() {
 }
 
 func (l *Logger) Spawn() *Logger {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	nl := New()
 	nl.prefixes = append(nl.prefixes, l.prefixes...)
 	nl.renderPrefixString()
 	return nl
 }
 
+func (l *Logger) prefix() string {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.prefixString
+}
+
 func (l *Logger) Errorf(format string, v ...any) {
-	log.Logger.WithPrefix(l.prefixString).Errorf(format, v...)
+	log.Logger.WithPrefix(l.prefix()).Errorf(format, v...)
 }
 
 func (l *Logger) Warnf(format string, v ...any) {
-	log.Logger.WithPrefix(l.prefixString).Warnf(format, v...)
+	log.Logger.WithPrefix(l.prefix()).Warnf(format, v...)
 }
 
 func (l *Logger) Infof(format string, v ...any) {
-	log.Logger.WithPrefix(l.prefixString).Infof(format, v...)
+	log.Logger.WithPrefix(l.prefix()).Infof(format, v...)
 }
 
 func (l *Logger) Debugf(format string, v ...any) {
-	log.Logger.WithPrefix(l.prefixString).Debugf(format, v...)
+	log.Logger.WithPrefix(l.prefix()).Debugf(format, v...)
 }
 
 func (l *Logger) Tracef(format string, v ...any) {
-	log.Logger.WithPrefix(l.prefixString).Tracef(format, v...)
+	log.Logger.WithPrefix(l.prefix()).Tracef(format, v...)
 }

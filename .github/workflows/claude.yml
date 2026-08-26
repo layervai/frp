@@ -1,0 +1,736 @@
+name: Claude Code
+
+# GitHub loads issue_comment workflows from the default branch, not from the
+# pull request that introduces them. Commands on existing PRs therefore remain
+# unavailable until this workflow is reviewed and merged to the default branch.
+on:
+  # These events load the workflow from the trusted default branch. Do not add
+  # pull_request, pull_request_review, or pull_request_review_comment here: their
+  # merge-ref workflow definitions are pull-request-authored before any job gate.
+  issue_comment:
+    types: [created]
+  # Edits intentionally cannot retrigger; invoke on an existing issue with a
+  # new trusted @claude comment instead.
+  issues:
+    types: [opened]
+
+# Future jobs inherit no token authority unless they declare it explicitly.
+permissions: {}
+
+concurrency:
+  # Serialize commands for one issue or pull request so repeated comments do
+  # not race duplicate terminal reviews. Never cancel an in-flight response.
+  group: claude-command-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  claude:
+    if: |
+      (
+        github.event_name == 'issue_comment' &&
+        (
+          github.event.comment.body == '@claude' ||
+          startsWith(github.event.comment.body, '@claude ')
+        ) &&
+        contains(fromJson('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+      ) ||
+      (
+        github.event_name == 'issues' &&
+        (
+          github.event.issue.body == '@claude' ||
+          startsWith(github.event.issue.body, '@claude ') ||
+          github.event.issue.title == '@claude' ||
+          startsWith(github.event.issue.title, '@claude ')
+        ) &&
+        contains(fromJson('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      # Review-only by design: this multi-event job needs both write scopes to
+      # reply on pull requests and issues. The token scopes themselves are
+      # broader; the enforced boundary is Claude's explicit tool allowlist,
+      # which exposes review comments but no GitHub close, label,
+      # metadata-edit, merge, or push tool.
+      contents: read
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Validate Claude trigger actor permission
+        id: claude_actor
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRIGGER_ACTOR: ${{ github.event.comment.user.login || github.event.issue.user.login || github.actor }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$TRIGGER_ACTOR" ]]; then
+            echo "::error::Unable to resolve Claude trigger actor; failing closed before checkout."
+            exit 1
+          fi
+
+          if ! actor_permission="$(timeout 30s gh api "repos/$GITHUB_REPOSITORY/collaborators/$TRIGGER_ACTOR/permission" --jq '.permission // ""')"; then
+            echo "::error::Unable to resolve Claude trigger actor permission; failing closed before checkout."
+            exit 1
+          fi
+
+          # GitHub's legacy permission field normally maps maintain to write;
+          # accept maintain explicitly as defense against API representation
+          # changes while continuing to reject triage/read contributors.
+          case "$actor_permission" in
+            admin|maintain|write) ;;
+            *)
+              echo "::error::Claude command trigger actor must have write access to this repository."
+              exit 1
+              ;;
+          esac
+
+          echo "authorized=true" >> "$GITHUB_OUTPUT"
+
+      - name: Materialize trusted Claude input validators
+        id: claude_validators
+        env:
+          VALIDATOR_SOURCE: |
+            validate_sha() {
+              local name="$1" sha="$2"
+              if [[ ! "$sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+                echo "::error::Invalid $name SHA."
+                return 1
+              fi
+            }
+            validate_ref() {
+              local name="$1" ref="$2"
+              if [[ ! "$ref" =~ ^[A-Za-z0-9@_][A-Za-z0-9/_.#+,@-]*$ ]] ||
+                [[ "$ref" == "@" ]] ||
+                ! git check-ref-format "refs/heads/$ref" 2>/dev/null; then
+                echo "::error::Invalid $name ref."
+                return 1
+              fi
+            }
+            validate_sensitive_tree() {
+              local name="$1" sha="$2" metadata path mode
+              local agents_entry agents_mode claude_oid expected_claude_oid
+              local sensitive_paths=(
+                .claude
+                .mcp.json
+                .claude.json
+                .gitmodules
+                .ripgreprc
+                CLAUDE.md
+                CLAUDE.local.md
+                .husky
+              )
+
+              agents_entry="$(git ls-tree "$sha" -- AGENTS.md)"
+              agents_mode="${agents_entry%% *}"
+              expected_claude_oid="$(printf %s AGENTS.md | git hash-object --stdin)"
+              while IFS=$'\t' read -r -d '' metadata path; do
+                mode="${metadata%% *}"
+                if [[ "$mode" == "100644" || "$mode" == "100755" ]]; then
+                  continue
+                fi
+                # FRP deliberately keeps only this one symlink: root
+                # CLAUDE.md -> AGENTS.md. Its target is separately pinned to a
+                # regular tree entry before skip-worktree preserves trusted
+                # base guidance across the PR-head checkout.
+                if [[ "$path" == "CLAUDE.md" && "$mode" == "120000" &&
+                  ( "$agents_mode" == "100644" || "$agents_mode" == "100755" ) ]]; then
+                  claude_oid="$(git rev-parse "$sha:CLAUDE.md")"
+                  if [[ "$claude_oid" == "$expected_claude_oid" ]]; then
+                    continue
+                  fi
+                fi
+                echo "::error::$name contains unsafe Claude startup path $path (mode $mode)."
+                return 1
+              done < <(git ls-tree -r -z "$sha" -- "${sensitive_paths[@]}")
+            }
+        run: |
+          set -euo pipefail
+
+          validator_path="$RUNNER_TEMP/claude-input-validators.sh"
+          umask 077
+          printf '%s\n' "$VALIDATOR_SOURCE" > "$validator_path"
+          echo "path=$validator_path" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve Claude pull request context
+        id: claude_pr
+        if: github.event_name == 'issue_comment' && github.event.issue.pull_request != null
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          VALIDATORS: ${{ steps.claude_validators.outputs.path }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "$VALIDATORS"
+
+          if [[ -z "$PR_NUMBER" ]]; then
+            echo "::error::Unable to resolve pull request number for Claude command."
+            exit 1
+          fi
+
+          if ! pr="$(timeout 30s gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"; then
+            echo "::error::Unable to resolve pull request head; failing closed before checkout."
+            exit 1
+          fi
+          head_repo="$(jq -r '.head.repo.full_name // ""' <<<"$pr")"
+          head_sha="$(jq -r '.head.sha // ""' <<<"$pr")"
+          head_ref="$(jq -r '.head.ref // ""' <<<"$pr")"
+          base_repo="$(jq -r '.base.repo.full_name // ""' <<<"$pr")"
+          default_branch="$(jq -r '.base.repo.default_branch // ""' <<<"$pr")"
+          base_sha="$(jq -r '.base.sha // ""' <<<"$pr")"
+          base_ref="$(jq -r '.base.ref // ""' <<<"$pr")"
+          commit_count="$(jq -r '.commits // "" | tostring' <<<"$pr")"
+          pr_state="$(jq -r '.state // ""' <<<"$pr")"
+
+          # The job carries ANTHROPIC_API_KEY and a token that can write only
+          # review comments. Never checkout a fork head across that boundary.
+          if [[ "$head_repo" != "$GITHUB_REPOSITORY" ]]; then
+            if ! timeout 30s gh pr comment "$PR_NUMBER" --body "Claude command did not run: review commands are limited to same-repository pull requests because this workflow holds a repository secret."; then
+              echo "::warning::Unable to post the fork-rejection explanation on pull request $PR_NUMBER."
+            fi
+            echo "::error::Claude command checkout is limited to same-repository pull requests."
+            exit 1
+          fi
+          if [[ "$base_repo" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::Claude command base repository does not match this repository."
+            exit 1
+          fi
+          if [[ "$pr_state" != "open" ]]; then
+            echo "::error::Claude commands require a currently open pull request."
+            exit 1
+          fi
+          # SHA-1/SHA-256 shapes and the pinned action's stricter branch grammar
+          # are defined once in the trusted validator library used again after
+          # checkout. The ref grammar rejects leading '+' even though Git itself
+          # accepts it, because the pinned action's unqualified fetch does not.
+          validate_sha "pull request head" "$head_sha"
+          validate_sha "pull request base" "$base_sha"
+          validate_ref "pull request head" "$head_ref"
+          validate_ref "pull request base" "$base_ref"
+          validate_ref "repository default branch" "$default_branch"
+          if [[ "$head_ref" == "$default_branch" ]]; then
+            echo "::error::Claude commands cannot target the repository default branch as a pull request head."
+            exit 1
+          fi
+          # The two immutable snapshots become distinct branches in the local
+          # bare origin. Reject equality and directory/file prefix collisions
+          # explicitly instead of leaving a malformed API response to fail with
+          # an opaque refs/heads/foo vs refs/heads/foo/bar Git error.
+          if [[ "$head_ref" == "$base_ref" ]] ||
+            [[ "$head_ref" == "$base_ref/"* ]] ||
+            [[ "$base_ref" == "$head_ref/"* ]]; then
+            echo "::error::Pull request head and base refs must be distinct and non-overlapping."
+            exit 1
+          fi
+          if [[ ! "$commit_count" =~ ^[0-9]+$ ]]; then
+            echo "::error::Pull request commit count is invalid."
+            exit 1
+          fi
+          head_fetch_depth=$(( commit_count > 20 ? commit_count : 20 ))
+          {
+            echo "sha=$head_sha"
+            echo "head_ref=$head_ref"
+            echo "base_sha=$base_sha"
+            echo "base_ref=$base_ref"
+            echo "default_branch=$default_branch"
+            echo "head_fetch_depth=$head_fetch_depth"
+            echo "checkout_allowed=true"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout repository
+        id: checkout
+        # Security invariant: this condition must remain implicitly
+        # success()-gated. Do not add always(), failure(), or cancelled(), or a
+        # failed authorization/head-resolution step could reach checkout.
+        if: |
+          steps.claude_actor.outputs.authorized == 'true' &&
+          (
+            steps.claude_pr.outcome == 'skipped' ||
+            steps.claude_pr.outputs.checkout_allowed == 'true'
+          )
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # A privileged PR command must not expose ANTHROPIC_API_KEY to a
+          # PR-authored checkout before the trusted authorization/local-origin
+          # steps run. Checkout the trusted default branch with full history;
+          # the next step seeds the separately authorized PR head/base objects,
+          # and v1.0.180 performs the first head checkout from that local origin.
+          # Ordinary issue commands retain their immutable default-branch event
+          # snapshot. Depth 0 is also required because a shallow boundary commit
+          # cannot seed a new bare origin with receive.shallowUpdate=false.
+          ref: ${{ steps.claude_pr.outputs.checkout_allowed == 'true' && github.event.repository.default_branch || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare credential-free Claude origin
+        id: local_origin
+        # Keep the implicit success() guard: never prepare or hand off a local
+        # origin after actor validation, PR resolution, or checkout has failed.
+        # Do not add always(), failure(), or cancelled() here.
+        if: steps.checkout.outcome == 'success'
+        env:
+          PR_MODE: ${{ steps.claude_pr.outputs.checkout_allowed }}
+          PR_HEAD_SHA: ${{ steps.claude_pr.outputs.sha }}
+          PR_HEAD_REF: ${{ steps.claude_pr.outputs.head_ref }}
+          PR_BASE_SHA: ${{ steps.claude_pr.outputs.base_sha }}
+          PR_BASE_REF: ${{ steps.claude_pr.outputs.base_ref }}
+          PR_DEFAULT_REF: ${{ steps.claude_pr.outputs.default_branch }}
+          PR_HEAD_FETCH_DEPTH: ${{ steps.claude_pr.outputs.head_fetch_depth }}
+          ISSUE_SHA: ${{ github.sha }}
+          ISSUE_REF: ${{ github.event.repository.default_branch }}
+          VALIDATORS: ${{ steps.claude_validators.outputs.path }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "$VALIDATORS"
+
+          if [[ "$PR_MODE" == "true" ]]; then
+            # Checkout selected the event repository default branch before this
+            # step. Bind that trusted workspace to the resolver's live PR view
+            # before reading any repository object or tree.
+            if [[ -z "$PR_DEFAULT_REF" || "$ISSUE_REF" != "$PR_DEFAULT_REF" ||
+              "$PR_HEAD_REF" == "$PR_DEFAULT_REF" ]]; then
+              echo "::error::Claude PR defaults changed or the head targets the repository default branch."
+              exit 1
+            fi
+            head_sha="$PR_HEAD_SHA"
+            head_ref="$PR_HEAD_REF"
+            base_sha="$PR_BASE_SHA"
+            base_ref="$PR_BASE_REF"
+            fetch_depth="$PR_HEAD_FETCH_DEPTH"
+          else
+            # Issue commands start from the event's immutable default-branch
+            # snapshot. The pinned action's later same-ref fetch stays on this
+            # local snapshot even if the public default branch moves mid-run.
+            # The authenticated checkout is complete so this snapshot can seed
+            # the new bare local origin. The pinned action still refetches the
+            # exact local source branch at depth 1 before reviewing the issue.
+            head_sha="$ISSUE_SHA"
+            head_ref="$ISSUE_REF"
+            base_sha=""
+            base_ref=""
+            fetch_depth=1
+          fi
+
+          validate_sha "Claude head" "$head_sha"
+          validate_ref "Claude head" "$head_ref"
+          git cat-file -e "$head_sha^{commit}"
+          # v1.0.180 snapshots these paths with recursive symlink
+          # dereferencing before restoring base configuration. Reject every
+          # PR-authored symlink/gitlink leaf before the action can materialize a
+          # runner file such as /proc/self/environ into the workspace.
+          validate_sensitive_tree "Claude head" "$head_sha"
+          push_refspecs=("${head_sha}:refs/heads/${head_ref}")
+          default_ref="$head_ref"
+          if [[ "$PR_MODE" == "true" ]]; then
+            validate_sha "Claude base" "$base_sha"
+            validate_ref "Claude base" "$base_ref"
+            git cat-file -e "$base_sha^{commit}"
+            push_refspecs+=("${base_sha}:refs/heads/${base_ref}")
+            default_ref="$base_ref"
+          fi
+
+          # PR mode intentionally starts on trusted default-branch content.
+          # Issue mode starts on the immutable event snapshot. Never require or
+          # perform a PR-head checkout in this trusted preparation step.
+          if [[ "$PR_MODE" != "true" &&
+            "$(git rev-parse --verify HEAD 2>/dev/null)" != "$head_sha" ]]; then
+            echo "::error::Claude issue source does not match the immutable event snapshot."
+            exit 1
+          fi
+          git checkout --quiet --detach
+
+          # Tag mode performs its own branch fetches before Claude starts. Build
+          # a local bare origin containing only the already-authenticated exact
+          # snapshots so those fetches need no repository credential. Missing
+          # objects (for example after a force-push) deliberately fail here
+          # instead of reviewing a mixed snapshot.
+          local_origin_parent="$(mktemp -d "$RUNNER_TEMP/claude-origin.XXXXXX")"
+          local_origin="$local_origin_parent/origin.git"
+          object_format="$(git rev-parse --show-object-format)"
+          git init --bare --quiet --object-format="$object_format" "$local_origin"
+          git push --quiet "$local_origin" "${push_refspecs[@]}"
+          git --git-dir="$local_origin" symbolic-ref HEAD "refs/heads/${default_ref}"
+          git remote set-url origin "$local_origin"
+          # The action's first head fetch does not pass
+          # --no-recurse-submodules. Pin the repository-local policy before any
+          # fetch so a PR-added gitlink cannot reach a submodule URL.
+          git config --local fetch.recurseSubmodules false
+
+          # The pinned action checks out these local branches and restores
+          # trusted startup files from origin/<base>. Pin both namespaces to the
+          # API/event snapshots; an unqualified fetch updates FETCH_HEAD only.
+          git branch -f "$head_ref" "$head_sha"
+          git update-ref "refs/remotes/origin/$head_ref" "$head_sha"
+          if [[ "$PR_MODE" == "true" ]]; then
+            git branch -f "$base_ref" "$base_sha"
+            git update-ref "refs/remotes/origin/$base_ref" "$base_sha"
+          fi
+
+          # CLAUDE.md is a base-branch symlink to AGENTS.md in this repository.
+          # v1.0.180 restores the symlink before CLI startup but not its target.
+          # Materialize the target from the authorized base (or the immutable
+          # default-branch issue snapshot) and preserve it across tag mode's
+          # branch checkout with skip-worktree. This makes startup guidance
+          # physically trusted instead of merely restoring a trusted symlink.
+          trusted_guidance_sha="$head_sha"
+          if [[ "$PR_MODE" == "true" ]]; then
+            trusted_guidance_sha="$base_sha"
+          fi
+          trusted_guidance_entry="$(git ls-tree "$trusted_guidance_sha" -- AGENTS.md)"
+          trusted_guidance_mode="${trusted_guidance_entry%% *}"
+          trusted_claude_entry="$(git ls-tree "$trusted_guidance_sha" -- CLAUDE.md)"
+          trusted_claude_mode="${trusted_claude_entry%% *}"
+          trusted_claude_oid="$(git rev-parse "$trusted_guidance_sha:CLAUDE.md" 2>/dev/null || true)"
+          expected_claude_oid="$(printf %s AGENTS.md | git hash-object --stdin)"
+          if [[ "$trusted_guidance_mode" != "100644" && "$trusted_guidance_mode" != "100755" ]] ||
+            [[ "$trusted_claude_mode" != "120000" || "$trusted_claude_oid" != "$expected_claude_oid" ]]; then
+            echo "::error::Trusted Claude guidance files do not match the physical-file plus symlink contract."
+            exit 1
+          fi
+          trusted_guidance_oid="$(git rev-parse "$trusted_guidance_sha:AGENTS.md")"
+          git checkout "$trusted_guidance_sha" -- AGENTS.md
+          # Match the index to the authorized head without changing the trusted
+          # worktree bytes. skip-worktree then preserves those bytes when tag
+          # mode performs its first checkout of the PR head.
+          git reset --quiet "$head_sha" -- AGENTS.md
+          git update-index --skip-worktree AGENTS.md
+          if [[ "$(git hash-object AGENTS.md)" != "$trusted_guidance_oid" ||
+            "$(git ls-files -v -- AGENTS.md)" != "S AGENTS.md" ]]; then
+            echo "::error::Unable to materialize trusted Claude guidance."
+            exit 1
+          fi
+
+          remote_keys="$(git config --local --name-only --get-regexp '^remote\..*\.(url|pushurl)$' || true)"
+          if [[ "$(git remote)" != "origin" ||
+            "$remote_keys" != "remote.origin.url" ||
+            "$(git remote get-url --all origin 2>/dev/null)" != "$local_origin" ||
+            "$(git remote get-url --push --all origin 2>/dev/null)" != "$local_origin" ||
+            "$(git config --local --get-all fetch.recurseSubmodules 2>/dev/null)" != "false" ]] ||
+            git config --local --get-regexp '^http\..*\.extraheader$' >/dev/null 2>&1 ||
+            git config --local --get-regexp '^credential(\..*)?\.helper$' >/dev/null 2>&1; then
+            echo "::error::Checkout credential remained in local Git config."
+            exit 1
+          fi
+          remote_line="$(git ls-remote --exit-code origin "refs/heads/$head_ref")"
+          resolved_sha="${remote_line%%$'\t'*}"
+          resolved_ref="${remote_line#*$'\t'}"
+          if [[ "$resolved_sha" != "$head_sha" || "$resolved_ref" != "refs/heads/$head_ref" ]]; then
+            echo "::error::Local Claude origin resolved $resolved_ref at $resolved_sha, want refs/heads/$head_ref at $head_sha."
+            exit 1
+          fi
+          if [[ "$PR_MODE" == "true" ]]; then
+            base_line="$(git ls-remote --exit-code origin "refs/heads/$base_ref")"
+            resolved_base_sha="${base_line%%$'\t'*}"
+            resolved_base_ref="${base_line#*$'\t'}"
+            if [[ "$resolved_base_sha" != "$base_sha" || "$resolved_base_ref" != "refs/heads/$base_ref" ]]; then
+              echo "::error::Local Claude origin resolved $resolved_base_ref at $resolved_base_sha, want refs/heads/$base_ref at $base_sha."
+              exit 1
+            fi
+          fi
+
+          # Exercise the pinned action's fetch shapes before handing it control.
+          # The action's setup head fetch lacks --no-recurse-submodules, so the
+          # repository-local false policy above is part of this proof. Its
+          # trusted-base restore also passes the explicit no-recurse flag.
+          # Ref validation makes the unqualified branch arguments safe from
+          # option/refspec injection. These --depth fetches (and the action's
+          # repeats) make the working repository
+          # shallow. That cannot truncate review context because this workflow
+          # denies every local file/git tool and reads the complete PR diff via
+          # GitHub MCP/API. Never enable a local-diff fallback without replacing
+          # these fetches or proving merge-base traversal remains complete.
+          if [[ "$PR_MODE" == "true" ]]; then
+            git fetch origin "--depth=$fetch_depth" "$head_ref"
+            git fetch origin "$base_ref" --depth=1 --no-recurse-submodules
+          else
+            git fetch origin "$head_ref" --depth=1
+          fi
+
+          if [[ "$(git rev-parse "refs/remotes/origin/$head_ref")" != "$head_sha" ]]; then
+            echo "::error::Pinned Claude head tracking ref changed during fetch proof."
+            exit 1
+          fi
+          if [[ "$PR_MODE" == "true" ]] &&
+            [[ "$(git rev-parse "refs/remotes/origin/$base_ref")" != "$base_sha" ]]; then
+            echo "::error::Pinned Claude base tracking ref changed during fetch proof."
+            exit 1
+          fi
+          if git config --local --get-regexp '^http\..*\.extraheader$' >/dev/null 2>&1 ||
+            git config --local --get-regexp '^credential(\..*)?\.helper$' >/dev/null 2>&1; then
+            echo "::error::Credential-free fetch proof installed a Git credential."
+            exit 1
+          fi
+
+          {
+            echo "path=$local_origin"
+            echo "trusted_guidance_oid=$trusted_guidance_oid"
+            echo "ready=true"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify current Claude target
+        id: current_target
+        if: steps.local_origin.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_MODE: ${{ steps.claude_pr.outputs.checkout_allowed }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          EXPECTED_HEAD_REF: ${{ steps.claude_pr.outputs.head_ref }}
+          TRUSTED_DEFAULT_REF: ${{ steps.claude_pr.outputs.default_branch }}
+          VALIDATORS: ${{ steps.claude_validators.outputs.path }}
+        run: |
+          set -euo pipefail
+
+          # Issue-only commands have no pull request target. Keep that supported
+          # path explicit instead of applying PR lifecycle rules to an issue.
+          if [[ "$PR_MODE" != "true" ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # shellcheck source=/dev/null
+          source "$VALIDATORS"
+          if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] ||
+            ! validate_ref "expected pull request head" "$EXPECTED_HEAD_REF" ||
+            ! validate_ref "trusted repository default branch" "$TRUSTED_DEFAULT_REF"; then
+            echo "::error::Claude target verification received invalid pull request metadata."
+            exit 1
+          fi
+          if ! current_pr="$(timeout 30s gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"; then
+            echo "::error::Unable to refresh the pull request immediately before Claude."
+            exit 1
+          fi
+          current_state="$(jq -r '.state // ""' <<<"$current_pr")"
+          current_head_ref="$(jq -r '.head.ref // ""' <<<"$current_pr")"
+          current_default_branch="$(jq -r '.base.repo.default_branch // ""' <<<"$current_pr")"
+          if [[ "$current_state" != "open" ]] ||
+            ! validate_ref "current pull request head" "$current_head_ref" ||
+            ! validate_ref "current repository default branch" "$current_default_branch" ||
+            [[ "$current_head_ref" != "$EXPECTED_HEAD_REF" ]] ||
+            [[ "$current_default_branch" != "$TRUSTED_DEFAULT_REF" ]] ||
+            [[ "$current_head_ref" == "$current_default_branch" ]]; then
+            echo "::error::Claude commands require an open pull request whose head is not the repository default branch."
+            exit 1
+          fi
+
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Run Claude Code
+        id: claude
+        # Keep the implicit success() guard here for the same fail-closed chain.
+        # The pinned action restores PR-controlled startup configuration
+        # (.claude/, .mcp.json, CLAUDE*.md, and related paths) from the trusted
+        # base before Claude starts. Preserve that property on action upgrades.
+        if: |
+          steps.checkout.outcome == 'success' &&
+          steps.local_origin.outputs.ready == 'true' &&
+          steps.current_target.outputs.ready == 'true'
+        # v1.0.180 includes upstream #1496, so provider/SDK failures cannot
+        # make a review command or `/simplify` wrapper appear successful.
+        uses: anthropics/claude-code-action@fa7e2f0a29a126f0b81cdcf360561b36e44cf608 # v1.0.180
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          exclude_comments_by_actor: 'github-actions[bot]'
+          # At the exact action pin, API commit signing skips configureGitAuth,
+          # which would otherwise replace the proven local origin with an HTTPS
+          # URL embedding the reply-capable token before Claude starts. Review
+          # commands never commit, and contents:read is the final write backstop.
+          use_commit_signing: true
+          # Commands are review-only. GitHub reads and inline feedback use the
+          # pinned action's MCP containers, which receive the repository token
+          # but not the Anthropic key. At this exact pin, tag mode creates the
+          # current issue/PR tracking comment and always injects its scoped
+          # update_claude_comment tool; that terminal path does not need a
+          # user-allowlisted general comment tool. Deny every current local
+          # execution, file, delegation, and network builtin; review commands
+          # must gather context only through the explicit GitHub MCP allowlist.
+          # API signing makes the action provision file-write MCP tools; deny
+          # those explicitly too. On every pin change, re-derive the complete
+          # injected write-tool set from tag mode and re-audit the action's
+          # local-origin/configureGitAuth behavior; do not append by guesswork.
+          claude_args: >-
+            --model claude-opus-4-8
+            --disallowed-tools "Bash,Read,Glob,Grep,LS,Task,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,mcp__github_file_ops__commit_files,mcp__github_file_ops__delete_files,mcp__github__create_or_update_file,mcp__github__push_files,mcp__github__delete_file"
+            --allowed-tools "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_file_contents,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github_inline_comment__create_inline_comment"
+
+      - name: Verify credential-free Claude origin
+        # This postcondition is intentionally always() checked after the action:
+        # a future pin that rewrites origin or restores a checkout credential
+        # must make the command job non-terminal instead of passing unnoticed.
+        # Never print config values, environment values, or an unexpected URL;
+        # any of them could contain a credential.
+        if: always() && steps.local_origin.outputs.ready == 'true'
+        env:
+          EXPECTED_ORIGIN: ${{ steps.local_origin.outputs.path }}
+          TRUSTED_GUIDANCE_OID: ${{ steps.local_origin.outputs.trusted_guidance_oid }}
+        run: |
+          set -euo pipefail
+
+          remote_keys="$(git config --local --name-only --get-regexp '^remote\..*\.(url|pushurl)$' || true)"
+          if [[ -z "$EXPECTED_ORIGIN" ||
+            "$(git remote)" != "origin" ||
+            "$remote_keys" != "remote.origin.url" ||
+            "$(git remote get-url --all origin 2>/dev/null)" != "$EXPECTED_ORIGIN" ||
+            "$(git remote get-url --push --all origin 2>/dev/null)" != "$EXPECTED_ORIGIN" ]]; then
+            echo "::error::Claude action changed the credential-free local origin."
+            exit 1
+          fi
+
+          if [[ "$(git config --local --get-all fetch.recurseSubmodules 2>/dev/null)" != "false" ]]; then
+            echo "::error::Claude action changed the submodule-recursion policy."
+            exit 1
+          fi
+
+          credential_config_pattern='^(credential($|\.)|core\.askpass$|http\..*\.extraheader$|url\..*\.(insteadof|pushinsteadof)$)'
+          for scope in --local --global --system; do
+            if git config "$scope" --get-regexp "$credential_config_pattern" >/dev/null 2>&1; then
+              echo "::error::Claude action persisted a credential-bearing Git configuration in $scope scope."
+              exit 1
+            fi
+          done
+
+          credential_env_names=(
+            GH_TOKEN
+            GITHUB_TOKEN
+            OVERRIDE_GITHUB_TOKEN
+            DEFAULT_WORKFLOW_TOKEN
+            GIT_ASKPASS
+            SSH_ASKPASS
+            GIT_CONFIG
+            GIT_CONFIG_GLOBAL
+            GIT_CONFIG_SYSTEM
+            GIT_CONFIG_COUNT
+            GIT_CONFIG_PARAMETERS
+          )
+          for name in "${credential_env_names[@]}"; do
+            if [[ -n "${!name:-}" ]]; then
+              echo "::error::Claude action persisted a credential-capable environment variable: $name."
+              exit 1
+            fi
+          done
+
+          for credential_file in "$HOME/.git-credentials" "$GITHUB_WORKSPACE/.git-credentials"; do
+            if [[ -e "$credential_file" ]]; then
+              echo "::error::Claude action persisted a Git credential file."
+              exit 1
+            fi
+          done
+
+          if [[ ! "$TRUSTED_GUIDANCE_OID" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ||
+            ! -L CLAUDE.md || "$(readlink CLAUDE.md 2>/dev/null; printf x)" != $'AGENTS.md\nx' ||
+            "$(git hash-object AGENTS.md 2>/dev/null)" != "$TRUSTED_GUIDANCE_OID" ||
+            "$(git hash-object CLAUDE.md 2>/dev/null)" != "$TRUSTED_GUIDANCE_OID" ||
+            "$(git ls-files -v -- AGENTS.md)" != "S AGENTS.md" ]]; then
+            echo "::error::Claude action changed the physically trusted repository guidance."
+            exit 1
+          fi
+
+      - name: Verify terminal Claude result
+        if: success() && steps.claude.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_MODE: ${{ steps.claude_pr.outputs.checkout_allowed }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          EXPECTED_HEAD_SHA: ${{ steps.claude_pr.outputs.sha != '' && steps.claude_pr.outputs.sha || github.sha }}
+          EXPECTED_HEAD_REF: ${{ steps.claude_pr.outputs.head_ref != '' && steps.claude_pr.outputs.head_ref || github.event.repository.default_branch }}
+          EXPECTED_BASE_SHA: ${{ steps.claude_pr.outputs.base_sha }}
+          EXPECTED_BASE_REF: ${{ steps.claude_pr.outputs.base_ref }}
+          TRUSTED_DEFAULT_REF: ${{ steps.claude_pr.outputs.default_branch }}
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+          LOCAL_ORIGIN: ${{ steps.local_origin.outputs.path }}
+          TRUSTED_GUIDANCE_OID: ${{ steps.local_origin.outputs.trusted_guidance_oid }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$EXECUTION_FILE" || ! -f "$EXECUTION_FILE" || ! -s "$EXECUTION_FILE" ]]; then
+            echo "::error::Claude did not produce a completed execution artifact."
+            exit 1
+          fi
+          validate_ref() {
+            [[ "$1" != "@" ]] &&
+              [[ "$1" =~ ^[A-Za-z0-9@_][A-Za-z0-9/_.#+,@-]*$ ]] &&
+              git check-ref-format "refs/heads/$1" >/dev/null 2>&1
+          }
+          if [[ ! "$EXPECTED_HEAD_SHA" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] ||
+            ! validate_ref "$EXPECTED_HEAD_REF"; then
+            echo "::error::Claude terminal verification received invalid head metadata."
+            exit 1
+          fi
+          if ! local_head="$(git rev-parse --verify HEAD 2>/dev/null)" ||
+            [[ "$local_head" != "$EXPECTED_HEAD_SHA" ]]; then
+            echo "::error::Claude did not finish on the authorized local head."
+            exit 1
+          fi
+          if [[ "$(git --git-dir="$LOCAL_ORIGIN" rev-parse --verify "refs/heads/$EXPECTED_HEAD_REF" 2>/dev/null)" != "$EXPECTED_HEAD_SHA" ||
+            "$(git rev-parse --verify "refs/heads/$EXPECTED_HEAD_REF" 2>/dev/null)" != "$EXPECTED_HEAD_SHA" ||
+            "$(git rev-parse --verify "refs/remotes/origin/$EXPECTED_HEAD_REF" 2>/dev/null)" != "$EXPECTED_HEAD_SHA" ]]; then
+            echo "::error::Claude local origin no longer contains the authorized head."
+            exit 1
+          fi
+          if [[ ! "$TRUSTED_GUIDANCE_OID" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ||
+            ! -L CLAUDE.md || "$(readlink CLAUDE.md 2>/dev/null; printf x)" != $'AGENTS.md\nx' ||
+            "$(git hash-object AGENTS.md 2>/dev/null)" != "$TRUSTED_GUIDANCE_OID" ||
+            "$(git hash-object CLAUDE.md 2>/dev/null)" != "$TRUSTED_GUIDANCE_OID" ||
+            "$(git ls-files -v -- AGENTS.md)" != "S AGENTS.md" ]]; then
+            echo "::error::Claude did not preserve the physically trusted repository guidance."
+            exit 1
+          fi
+
+          if [[ "$PR_MODE" == "true" ]]; then
+            if [[ ! "$EXPECTED_BASE_SHA" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] ||
+              ! validate_ref "$EXPECTED_BASE_REF" ||
+              ! validate_ref "$TRUSTED_DEFAULT_REF" ||
+              [[ "$(git --git-dir="$LOCAL_ORIGIN" rev-parse --verify "refs/heads/$EXPECTED_BASE_REF" 2>/dev/null)" != "$EXPECTED_BASE_SHA" ||
+                "$(git rev-parse --verify "refs/heads/$EXPECTED_BASE_REF" 2>/dev/null)" != "$EXPECTED_BASE_SHA" ||
+                "$(git rev-parse --verify "refs/remotes/origin/$EXPECTED_BASE_REF" 2>/dev/null)" != "$EXPECTED_BASE_SHA" ]]; then
+              echo "::error::Claude terminal verification received invalid base metadata."
+              exit 1
+            fi
+            if ! current_pr="$(timeout 30s gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"; then
+              echo "::error::Unable to refresh the pull request after Claude review."
+              exit 1
+            fi
+            current_head_repo="$(jq -r '.head.repo.full_name // ""' <<<"$current_pr")"
+            current_head="$(jq -r '.head.sha // ""' <<<"$current_pr")"
+            current_head_ref="$(jq -r '.head.ref // ""' <<<"$current_pr")"
+            current_base_repo="$(jq -r '.base.repo.full_name // ""' <<<"$current_pr")"
+            current_default_branch="$(jq -r '.base.repo.default_branch // ""' <<<"$current_pr")"
+            current_base="$(jq -r '.base.sha // ""' <<<"$current_pr")"
+            current_base_ref="$(jq -r '.base.ref // ""' <<<"$current_pr")"
+            current_state="$(jq -r '.state // ""' <<<"$current_pr")"
+            if [[ "$current_state" != "open" ||
+              "$current_head_repo" != "$GITHUB_REPOSITORY" ||
+              "$current_base_repo" != "$GITHUB_REPOSITORY" ||
+              "$current_default_branch" != "$TRUSTED_DEFAULT_REF" ||
+              "$current_head_ref" == "$current_default_branch" ||
+              "$current_head" != "$EXPECTED_HEAD_SHA" ||
+              "$current_head_ref" != "$EXPECTED_HEAD_REF" ||
+              "$current_base" != "$EXPECTED_BASE_SHA" ||
+              "$current_base_ref" != "$EXPECTED_BASE_REF" ]]; then
+              echo "::error::The pull request head or base changed during Claude review."
+              exit 1
+            fi
+          else
+            repo_owner="${GITHUB_REPOSITORY%%/*}"
+            repo_name="${GITHUB_REPOSITORY#*/}"
+            # GraphQL variables below are literal query syntax.
+            # shellcheck disable=SC2016
+            if ! current_context="$(timeout 30s gh api graphql \
+              -F owner="$repo_owner" \
+              -F name="$repo_name" \
+              -f query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){defaultBranchRef{name target{... on Commit{oid}}}}}' \
+              --jq '[.data.repository.defaultBranchRef.name // "", .data.repository.defaultBranchRef.target.oid // ""] | .[]')"; then
+              echo "::error::Unable to refresh the issue review source after Claude review."
+              exit 1
+            fi
+            mapfile -t current_fields <<< "$current_context"
+            if (( ${#current_fields[@]} != 2 )) ||
+              [[ "${current_fields[0]}" != "$EXPECTED_HEAD_REF" ||
+                "${current_fields[1]}" != "$EXPECTED_HEAD_SHA" ]]; then
+              echo "::error::The issue review source changed during Claude review."
+              exit 1
+            fi
+          fi
