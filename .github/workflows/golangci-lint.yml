@@ -22,7 +22,7 @@ jobs:
     - uses: actions/setup-node@v6
       with:
         node-version: '22'
-    - name: Claude workflow contracts
+    - name: CI contracts (Claude workflows, public-source sanitization)
       run: go test ./test/ci
     - name: Test and build web assets
       run: make web-ci
