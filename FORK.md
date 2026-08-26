@@ -39,7 +39,7 @@ git merge v0.72.0          # resolve conflicts, keep upstream's version of
 
 Rebasing is tempting and wrong here. It re-authors every layerv commit, so the
 reviewed-commit identity that the release tags and the consumers'
-`verify-frp-provenance.sh` chain depend on restarts from scratch on every
+provenance-verification chain depend on restarts from scratch on every
 upstream bump. Merging keeps commit identity stable forever; the cost is a
 messier graph, which is the cheaper half of the trade.
 
@@ -76,13 +76,33 @@ git tag -s v1.1.0 -m "LayerV frp v1.1.0 (upstream v0.72.0)
 git push origin v1.1.0
 ```
 
-Consumers verify this chain with `scripts/verify-frp-provenance.sh`, which
-checks the `go.mod` pin, the `go.sum` hashes, the public proxy's metadata from
-a cold module cache, and that the live tag still resolves to the recorded
-commit. Never move a published tag.
+Consumers verify this chain with `scripts/verify-frp-provenance.sh`. That
+script lives in each **consumer** repository (`qurl-connector`,
+`qurl-integrations`, `qurl-reverse-tunnel-server`), not here. It checks the
+`go.mod` pin, the `go.sum` hashes, the public proxy's metadata from a cold
+module cache, and that the live tag still resolves to the recorded commit.
+Never move a published tag.
+
+When cutting a release, every consumer's copy of that script needs its pinned
+constants refreshed. The script derives the version and hashes from `go.mod`
+and `go.sum`, so only `commit` is hand-maintained.
 
 ## Retired branches
 
 `retired/*` branches are frozen history, kept only so old release tags remain
 reachable and auditable. They are protected against pushes. Never merge into
 one; never cut a release from one.
+
+## History
+
+The version-named base branches were collapsed on 2026-08-26:
+
+| old branch | now | notes |
+|---|---|---|
+| `layerv/base-v0.71.0` | `layerv/main` | the live line |
+| `layerv/base-v0.70.0` | `retired/base-v0.70.0` | locked; content replayed onto v0.71.0 in #21 |
+| `layerv/base-v0.68.1` | `retired/base-v0.68.1` | locked; content ported onto v0.71.0 in #22 |
+
+Release tags on the retired lines (`v0.68.1-layerv.*`, `v0.70.0-layerv.*`)
+remain valid and reachable; branch renames do not move tags. They are frozen —
+new releases come from `layerv/main` on the `v1.x` line.
