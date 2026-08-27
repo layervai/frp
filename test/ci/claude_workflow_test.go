@@ -352,14 +352,14 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 	reviewArgs := stringInput(t, reviewAction, "claude_args")
 
 	wantDisallowed := []string{
-		"Bash", "Read", "Glob", "Grep", "LS", "Task", "Edit", "Write", "MultiEdit", "NotebookEdit", "WebFetch", "WebSearch",
+		"Bash", "Read", "Glob", "Grep", "LS", "Edit", "Write", "MultiEdit", "NotebookEdit", "WebFetch", "WebSearch",
 		"mcp__github_file_ops__commit_files", "mcp__github_file_ops__delete_files",
 		"mcp__github__create_or_update_file", "mcp__github__push_files", "mcp__github__delete_file",
 	}
 	wantCommandAllowed := []string{
 		"mcp__github__get_pull_request", "mcp__github__get_pull_request_diff", "mcp__github__get_pull_request_files",
 		"mcp__github__get_pull_request_review_comments", "mcp__github__get_pull_request_reviews", "mcp__github__get_pull_request_status",
-		"mcp__github__get_file_contents", "mcp__github__get_issue", "mcp__github__get_issue_comments", "mcp__github__search_issues",
+		"mcp__github__get_file_contents", "mcp__github__search_code", "mcp__github__get_issue", "mcp__github__get_issue_comments", "mcp__github__search_issues",
 		"mcp__github__search_pull_requests", "mcp__github__list_issues", "mcp__github__list_pull_requests",
 		"mcp__github_inline_comment__create_inline_comment",
 	}
