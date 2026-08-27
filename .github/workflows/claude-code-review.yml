@@ -35,7 +35,7 @@ jobs:
     # headroom, not a target. Delegation was tried fleet-wide and removed
     # after one review elsewhere ran past a 20-minute cap and published
     # nothing — a review this slow is a problem to look at, not to fund.
-    timeout-minutes: 12
+    timeout-minutes: 14
     permissions:
       contents: read
       # This workflow is PR-only: add_issue_comment publishes a PR conversation
