@@ -545,17 +545,16 @@ jobs:
           # current issue/PR tracking comment and always injects its scoped
           # update_claude_comment tool; that terminal path does not need a
           # user-allowlisted general comment tool. Deny every current local
-          # execution, file, and network builtin; review commands must gather
-          # context only through the explicit GitHub MCP allowlist. Task stays
-          # allowed so wide reads fan out; subagents inherit these denials.
+          # execution, file, delegation, and network builtin; review commands
+          # must gather context only through the explicit GitHub MCP allowlist.
           # API signing makes the action provision file-write MCP tools; deny
           # those explicitly too. On every pin change, re-derive the complete
           # injected write-tool set from tag mode and re-audit the action's
           # local-origin/configureGitAuth behavior; do not append by guesswork.
           claude_args: >-
             --model claude-opus-5
-            --disallowed-tools "Bash,Read,Glob,Grep,LS,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,mcp__github_file_ops__commit_files,mcp__github_file_ops__delete_files,mcp__github__create_or_update_file,mcp__github__push_files,mcp__github__delete_file"
-            --allowed-tools "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_file_contents,mcp__github__search_code,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github_inline_comment__create_inline_comment,Task"
+            --disallowed-tools "Bash,Read,Glob,Grep,LS,Task,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,mcp__github_file_ops__commit_files,mcp__github_file_ops__delete_files,mcp__github__create_or_update_file,mcp__github__push_files,mcp__github__delete_file"
+            --allowed-tools "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_file_contents,mcp__github__search_code,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github_inline_comment__create_inline_comment"
 
       - name: Verify credential-free Claude origin
         # This postcondition is intentionally always() checked after the action:
