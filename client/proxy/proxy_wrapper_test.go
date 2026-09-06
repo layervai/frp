@@ -87,6 +87,8 @@ func TestWrapperInWorkConnSynchronizesPhase(t *testing.T) {
 		close(done)
 		<-writerDone
 	}()
+	// This loop is a race-detector probe. Each peer read waits for the
+	// synchronous close or the dispatched proxy goroutine to close the stream.
 	for range 1000 {
 		conn, peer := net.Pipe()
 		wrapper.InWorkConn(conn, &msg.StartWorkConn{})

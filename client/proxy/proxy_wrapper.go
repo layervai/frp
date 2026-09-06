@@ -266,10 +266,11 @@ func (pw *Wrapper) statusFailedCallback() {
 func (pw *Wrapper) InWorkConn(workConn net.Conn, m *msg.StartWorkConn) {
 	xl := pw.xl
 	pw.mu.RLock()
-	defer pw.mu.RUnlock()
-	if pw.pxy != nil && pw.Phase == ProxyPhaseRunning {
+	pxy, running := pw.pxy, pw.Phase == ProxyPhaseRunning
+	pw.mu.RUnlock()
+	if pxy != nil && running {
 		xl.Debugf("start a new work connection, localAddr: %s remoteAddr: %s", workConn.LocalAddr().String(), workConn.RemoteAddr().String())
-		go pw.pxy.InWorkConn(workConn, m)
+		go pxy.InWorkConn(workConn, m)
 	} else {
 		workConn.Close()
 	}
