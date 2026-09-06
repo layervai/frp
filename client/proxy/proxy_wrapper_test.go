@@ -48,7 +48,9 @@ func TestWrapperInWorkConnSynchronizesPhase(t *testing.T) {
 	}
 	checkDispatch := func(phase string, want int64) {
 		t.Helper()
+		wrapper.mu.Lock()
 		wrapper.Phase = phase
+		wrapper.mu.Unlock()
 		conn, peer := net.Pipe()
 		wrapper.InWorkConn(conn, &msg.StartWorkConn{})
 		var buffer [1]byte
