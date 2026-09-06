@@ -267,8 +267,9 @@ func (pw *Wrapper) InWorkConn(workConn net.Conn, m *msg.StartWorkConn) {
 	xl := pw.xl
 	pw.mu.RLock()
 	pxy := pw.pxy
+	phase := pw.Phase
 	pw.mu.RUnlock()
-	if pxy != nil && pw.Phase == ProxyPhaseRunning {
+	if pxy != nil && phase == ProxyPhaseRunning {
 		xl.Debugf("start a new work connection, localAddr: %s remoteAddr: %s", workConn.LocalAddr().String(), workConn.RemoteAddr().String())
 		go pxy.InWorkConn(workConn, m)
 	} else {
