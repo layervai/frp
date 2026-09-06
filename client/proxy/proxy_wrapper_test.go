@@ -18,7 +18,7 @@ package proxy
 
 import (
 	"net"
-	"sync"
+	"runtime"
 	"sync/atomic"
 	"testing"
 
@@ -46,9 +46,25 @@ func TestWrapperInWorkConnSynchronizesPhase(t *testing.T) {
 		pxy:           proxy,
 		xl:            xlog.New(),
 	}
+	checkDispatch := func(phase string, want int64) {
+		t.Helper()
+		wrapper.Phase = phase
+		conn, peer := net.Pipe()
+		wrapper.InWorkConn(conn, &msg.StartWorkConn{})
+		var buffer [1]byte
+		_, _ = peer.Read(buffer[:])
+		_ = peer.Close()
+		if got := proxy.calls.Load(); got != want {
+			t.Fatalf("phase %q dispatched %d work connections, want %d", phase, got, want)
+		}
+	}
+	checkDispatch(ProxyPhaseRunning, 1)
+	checkDispatch(ProxyPhaseClosed, 1)
+
 	done := make(chan struct{})
-	var writer sync.WaitGroup
-	writer.Go(func() {
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
 		phase := ProxyPhaseClosed
 		for {
 			select {
@@ -64,20 +80,18 @@ func TestWrapperInWorkConnSynchronizesPhase(t *testing.T) {
 			} else {
 				phase = ProxyPhaseClosed
 			}
+			runtime.Gosched()
 		}
-	})
+	}()
+	defer func() {
+		close(done)
+		<-writerDone
+	}()
 	for range 1000 {
 		conn, peer := net.Pipe()
 		wrapper.InWorkConn(conn, &msg.StartWorkConn{})
 		var buffer [1]byte
-		if _, err := peer.Read(buffer[:]); err == nil {
-			t.Fatal("work connection remained open")
-		}
+		_, _ = peer.Read(buffer[:])
 		_ = peer.Close()
-	}
-	close(done)
-	writer.Wait()
-	if proxy.calls.Load() == 0 {
-		t.Fatal("running proxy branch was not exercised")
 	}
 }
