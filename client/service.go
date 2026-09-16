@@ -173,6 +173,10 @@ type Service struct {
 	// string if no configuration file was used.
 	configFilePath string
 
+	// lifecycleMu protects cancel publication against Close before or during Run.
+	lifecycleMu    sync.Mutex
+	closeRequested bool
+
 	// service context
 	ctx context.Context
 	// call cancel to stop service
@@ -254,8 +258,13 @@ func NewService(options ServiceOptions) (*Service, error) {
 
 func (svr *Service) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancelCause(ctx)
+	svr.lifecycleMu.Lock()
 	svr.ctx = xlog.NewContext(ctx, xlog.FromContextSafe(ctx))
 	svr.cancel = cancel
+	if svr.closeRequested {
+		cancel(nil)
+	}
+	svr.lifecycleMu.Unlock()
 
 	// set custom DNSServer
 	if svr.common.DNSServer != "" {
@@ -271,7 +280,7 @@ func (svr *Service) Run(ctx context.Context) error {
 		}
 		go func() {
 			log.Infof("virtual network controller start...")
-			if err := vnetController.Run(); err != nil && !errors.Is(err, net.ErrClosed) {
+			if err := vnetController.Run(); !errors.Is(err, net.ErrClosed) {
 				log.Warnf("virtual network controller exit with error: %v", err)
 			}
 		}()
@@ -496,7 +505,12 @@ func (svr *Service) Close() {
 
 func (svr *Service) GracefulClose(d time.Duration) {
 	svr.gracefulShutdownDuration.Store(int64(d))
-	svr.cancel(nil)
+	svr.lifecycleMu.Lock()
+	defer svr.lifecycleMu.Unlock()
+	svr.closeRequested = true
+	if svr.cancel != nil {
+		svr.cancel(nil)
+	}
 }
 
 func (svr *Service) stop() {

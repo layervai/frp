@@ -698,3 +698,37 @@ func TestReloadConfigFromSourcesDoesNotMutateStoreConfigs(t *testing.T) {
 		t.Fatalf("runtime visitor bindAddr should be defaulted, got %q", svr.visitorCfgs[0].GetBaseConfig().BindAddr)
 	}
 }
+
+func TestServiceCloseBeforeOrDuringRun(t *testing.T) {
+	for _, before := range []bool{true, false} {
+		t.Run(fmt.Sprintf("before=%t", before), func(t *testing.T) {
+			for range 100 {
+				svr, err := NewService(ServiceOptions{
+					Common:                 &v1.ClientCommonConfig{LoginFailExit: lo.ToPtr(false)},
+					ConfigSourceAggregator: source.NewAggregator(source.NewConfigSource()),
+					ConnectorCreator: func(ctx context.Context, _ *v1.ClientCommonConfig) Connector {
+						<-ctx.Done()
+						return &failingConnector{err: ctx.Err()}
+					},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if before {
+					svr.Close()
+				}
+				done := make(chan error, 1)
+				go func() { done <- svr.Run(context.Background()) }()
+				svr.GracefulClose(time.Millisecond)
+				select {
+				case <-done:
+					if !errors.Is(svr.ctx.Err(), context.Canceled) {
+						t.Fatal("close did not cancel Run")
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("Run did not stop after Close")
+				}
+			}
+		})
+	}
+}
