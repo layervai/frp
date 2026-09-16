@@ -174,6 +174,7 @@ type Service struct {
 	configFilePath string
 
 	// lifecycleMu protects cancel publication against Close before or during Run.
+	// Other cancel/ctx readers must run on Run or a goroutine it starts after publication.
 	lifecycleMu    sync.Mutex
 	closeRequested bool
 
@@ -261,10 +262,16 @@ func (svr *Service) Run(ctx context.Context) error {
 	svr.lifecycleMu.Lock()
 	svr.ctx = xlog.NewContext(ctx, xlog.FromContextSafe(ctx))
 	svr.cancel = cancel
-	if svr.closeRequested {
+	closeRequested := svr.closeRequested
+	if closeRequested {
 		cancel(nil)
 	}
 	svr.lifecycleMu.Unlock()
+	defer cancel(nil)
+	if closeRequested {
+		svr.stop()
+		return nil
+	}
 
 	// set custom DNSServer
 	if svr.common.DNSServer != "" {
@@ -302,6 +309,12 @@ func (svr *Service) Run(ctx context.Context) error {
 		svr.stop()
 		if svr.firstLoginSuccessError != nil {
 			return svr.firstLoginSuccessError
+		}
+		svr.lifecycleMu.Lock()
+		closeRequested = svr.closeRequested
+		svr.lifecycleMu.Unlock()
+		if closeRequested {
+			return nil
 		}
 		cancelCause := cancelErr{}
 		_ = errors.As(context.Cause(svr.ctx), &cancelCause)
