@@ -698,3 +698,49 @@ func TestReloadConfigFromSourcesDoesNotMutateStoreConfigs(t *testing.T) {
 		t.Fatalf("runtime visitor bindAddr should be defaulted, got %q", svr.visitorCfgs[0].GetBaseConfig().BindAddr)
 	}
 }
+
+func TestServiceCloseBeforeOrDuringRun(t *testing.T) {
+	for _, phase := range []string{"before", "concurrent", "login"} {
+		t.Run(phase, func(t *testing.T) {
+			for range 100 {
+				loginStarted := make(chan struct{})
+				svr, err := NewService(ServiceOptions{
+					Common:                 &v1.ClientCommonConfig{LoginFailExit: lo.ToPtr(false)},
+					ConfigSourceAggregator: source.NewAggregator(source.NewConfigSource()),
+					ConnectorCreator: func(ctx context.Context, _ *v1.ClientCommonConfig) Connector {
+						close(loginStarted)
+						<-ctx.Done()
+						return &failingConnector{err: ctx.Err()}
+					},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if phase == "before" {
+					svr.Close()
+				}
+				done := make(chan error, 1)
+				go func() { done <- svr.Run(context.Background()) }()
+				if phase == "login" {
+					select {
+					case <-loginStarted:
+					case <-time.After(5 * time.Second):
+						t.Fatal("Run never started login")
+					}
+				}
+				svr.GracefulClose(time.Millisecond)
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Fatalf("requested close returned an error: %v", err)
+					}
+					if !errors.Is(svr.ctx.Err(), context.Canceled) {
+						t.Fatal("close did not cancel Run")
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("Run did not stop after Close")
+				}
+			}
+		})
+	}
+}
