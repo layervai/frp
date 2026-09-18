@@ -146,6 +146,7 @@ func TestCertificateVerificationRequiresTLSTransport(t *testing.T) {
 			cfg := &v1.ClientTransportConfig{Protocol: protocol}
 			cfg.TLS.Enable = &disabled
 			cfg.TLS.VerifyServerCertificate = true
+			cfg.Complete()
 			_, err := validateTransportConfig(cfg)
 			if protocol == "wss" || protocol == "quic" {
 				require.NoError(t, err)
