@@ -263,9 +263,9 @@ const TotalAnnotationSizeLimitB int = 256 * (1 << 10) // 256 kB
 func ValidateAnnotationsSize(annotations map[string]string) error {
 	var totalSize int64
 	for k, v := range annotations {
-		totalSize += (int64)(len(k)) + (int64)(len(v))
+		totalSize += int64(len(k)) + int64(len(v))
 	}
-	if totalSize > (int64)(TotalAnnotationSizeLimitB) {
+	if totalSize > int64(TotalAnnotationSizeLimitB) {
 		return fmt.Errorf("annotations size %d is larger than limit %d", totalSize, TotalAnnotationSizeLimitB)
 	}
 	return nil
