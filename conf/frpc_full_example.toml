@@ -125,6 +125,8 @@ transport.connectServerLocalIP = "0.0.0.0"
 # If tls.enable is true, frpc will connect frps by tls.
 # Since v0.50.0, the default value has been changed to true, and tls is enabled by default.
 transport.tls.enable = true
+# Verify the server certificate and hostname with system roots or trustedCaFile.
+# transport.tls.verifyServerCertificate = true
 
 # transport.tls.certFile = "client.crt"
 # transport.tls.keyFile = "client.key"

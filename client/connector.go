@@ -122,6 +122,9 @@ func (c *defaultConnectorImpl) Open() error {
 			return err
 		}
 		tlsConfig.NextProtos = []string{"frp"}
+		if c.cfg.Transport.TLS.VerifyServerCertificate {
+			tlsConfig.InsecureSkipVerify = false
+		}
 
 		conn, err := quic.DialAddr(
 			c.ctx,
@@ -202,6 +205,9 @@ func (c *defaultConnectorImpl) realConnect() (net.Conn, error) {
 		if err != nil {
 			xl.Warnf("fail to build tls configuration, err: %v", err)
 			return nil, err
+		}
+		if c.cfg.Transport.TLS.VerifyServerCertificate {
+			tlsConfig.InsecureSkipVerify = false
 		}
 	}
 
