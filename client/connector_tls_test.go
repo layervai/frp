@@ -27,7 +27,7 @@ func TestConnectorCertificateVerification(t *testing.T) {
 		t.Fatal(err)
 	}
 	ca := filepath.Join(t.TempDir(), "ca.pem")
-	if err := os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600); err != nil {
+	if err := os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
@@ -68,8 +68,7 @@ func TestQUICCertificateVerification(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go func() {
 		for {
 			if _, err := listener.Accept(ctx); err != nil {
