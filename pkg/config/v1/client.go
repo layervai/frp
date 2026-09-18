@@ -168,6 +168,7 @@ func (c *ClientTransportConfig) Complete() {
 type TLSClientConfig struct {
 	// VerifyServerCertificate requires a trusted certificate and matching server
 	// name. Without trustedCaFile, verification uses the operating system roots.
+	// A trustedCaFile always enables verification, regardless of this option.
 	VerifyServerCertificate bool `json:"verifyServerCertificate,omitempty"`
 
 	// TLSEnable specifies whether or not TLS should be used when communicating

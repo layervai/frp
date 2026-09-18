@@ -153,6 +153,9 @@ func validateTransportConfig(c *v1.ClientTransportConfig) (Warning, error) {
 	}
 
 	if !lo.FromPtr(c.TLS.Enable) {
+		if c.TLS.VerifyServerCertificate && c.Protocol != "quic" && c.Protocol != "wss" {
+			errs = AppendError(errs, fmt.Errorf("transport.tls.verifyServerCertificate requires TLS"))
+		}
 		checkTLSConfig := func(name string, value string) Warning {
 			if value != "" {
 				return fmt.Errorf("%s is invalid when transport.tls.enable is false", name)

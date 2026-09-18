@@ -17,6 +17,7 @@ package client
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net"
 	"strconv"
 	"strings"
@@ -108,7 +109,7 @@ func (c *defaultConnectorImpl) Open() error {
 		if sn == "" {
 			sn = c.cfg.ServerAddr
 		}
-		if lo.FromPtr(c.cfg.Transport.TLS.Enable) {
+		if lo.FromPtr(c.cfg.Transport.TLS.Enable) || c.cfg.Transport.TLS.VerifyServerCertificate {
 			tlsConfig, err = transport.NewClientTLSConfig(
 				c.cfg.Transport.TLS.CertFile,
 				c.cfg.Transport.TLS.KeyFile,
@@ -190,6 +191,9 @@ func (c *defaultConnectorImpl) realConnect() (net.Conn, error) {
 	tlsEnable := lo.FromPtr(c.cfg.Transport.TLS.Enable)
 	if c.cfg.Transport.Protocol == "wss" {
 		tlsEnable = true
+	}
+	if c.cfg.Transport.TLS.VerifyServerCertificate && !tlsEnable {
+		return nil, errors.New("server certificate verification requires TLS")
 	}
 	if tlsEnable {
 		sn := c.cfg.Transport.TLS.ServerName

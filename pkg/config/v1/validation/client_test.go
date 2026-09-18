@@ -138,3 +138,20 @@ func TestValidateClientFeatureGatesAreConfigScoped(t *testing.T) {
 	require.ErrorContains(t, err, "VirtualNet feature is not enabled")
 	require.Equal(t, defaultGatesBefore, featuregate.DefaultFeatureGates.String())
 }
+
+func TestCertificateVerificationRequiresTLSTransport(t *testing.T) {
+	for _, protocol := range []string{"tcp", "kcp", "websocket", "wss", "quic"} {
+		t.Run(protocol, func(t *testing.T) {
+			disabled := false
+			cfg := &v1.ClientTransportConfig{Protocol: protocol}
+			cfg.TLS.Enable = &disabled
+			cfg.TLS.VerifyServerCertificate = true
+			_, err := validateTransportConfig(cfg)
+			if protocol == "wss" || protocol == "quic" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, "requires TLS")
+			}
+		})
+	}
+}
