@@ -53,7 +53,7 @@ func (uds *UnixDomainSocketPlugin) Handle(ctx context.Context, connInfo *Connect
 	xl := xlog.FromContextSafe(ctx)
 	localConn, err := net.DialUnix("unix", nil, uds.UnixAddr)
 	if err != nil {
-		xl.Warnf("dial to uds %s error: %v", uds.UnixAddr, err)
+		xl.Warnf("local Unix socket origin is unavailable")
 		connInfo.Conn.Close()
 		return
 	}
