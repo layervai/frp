@@ -15,10 +15,13 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"io"
 	"math"
 	"net"
+	"net/http"
 	"os"
 	"sync"
 	"testing"
@@ -592,4 +595,79 @@ func (m *countingServerMetrics) closedClients() int64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.closeCount
+}
+
+// Exercise the checked-out connection through HTTPProxy's real wrapper stack.
+// Closing just the control channel or the idle pool cannot stop this response.
+func TestCloseControlInterruptsActiveHTTPStreamOnlyForThatControl(t *testing.T) {
+	manager := NewControlManager(registry.NewClientRegistry())
+	first, _ := newLifecycleTestControl(t, "stream-first", "first", newCountingServerMetrics())
+	sibling, _ := newLifecycleTestControl(t, "stream-sibling", "sibling", newCountingServerMetrics())
+	for _, ctl := range []*Control{first, sibling} {
+		mustAddAndActivate(t, manager, ctl)
+		require.True(t, ctl.Start())
+	}
+	firstStream, firstPeer, firstBody := checkedOutHTTPStream(t, manager, first)
+	siblingStream, siblingPeer, siblingBody := checkedOutHTTPStream(t, manager, sibling)
+	defer firstStream.Close()
+	defer siblingStream.Close()
+	service := &Service{ctlManager: manager}
+	require.NoError(t, firstStream.SetReadDeadline(time.Now().Add(time.Second)))
+	require.NoError(t, firstPeer.SetReadDeadline(time.Now().Add(time.Second)))
+	require.True(t, service.CloseControl(first.runID))
+	waitForControlDone(t, first)
+	_, err := firstBody.Read(make([]byte, 1))
+	require.Error(t, err, "active response survived control closure")
+	var timeout net.Error
+	require.False(t, errors.As(err, &timeout) && timeout.Timeout(), "active response only stopped at the test deadline")
+	_, err = firstPeer.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF, "remote stream endpoint was not closed")
+	wrote := make(chan error, 1)
+	go func() { _, err := io.WriteString(siblingPeer, "next"); wrote <- err }()
+	require.NoError(t, siblingStream.SetReadDeadline(time.Now().Add(time.Second)))
+	data := make([]byte, 4)
+	_, err = io.ReadFull(siblingBody, data)
+	require.NoError(t, err)
+	require.Equal(t, "next", string(data))
+	require.NoError(t, <-wrote)
+	require.NoError(t, siblingStream.Close())
+	sibling.mu.RLock()
+	tracked := len(sibling.workConns)
+	sibling.mu.RUnlock()
+	require.Zero(t, tracked, "normally completed streams must release control ownership")
+}
+
+func checkedOutHTTPStream(t *testing.T, manager *ControlManager, ctl *Control) (net.Conn, net.Conn, io.ReadCloser) {
+	t.Helper()
+	server, peer := net.Pipe()
+	t.Cleanup(func() { _ = server.Close(); _ = peer.Close() })
+	require.NoError(t, manager.RegisterWorkConn(ctl, proxy.NewWorkConn(msg.NewConn(server, msg.NewV1ReadWriter(server)))))
+	ready := make(chan error, 1)
+	go func() {
+		_, err := msg.NewConn(peer, msg.NewV1ReadWriter(peer)).ReadMsg()
+		if err == nil {
+			_, err = http.ReadRequest(bufio.NewReader(peer))
+		}
+		if err == nil {
+			_, err = io.WriteString(peer, "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nfirst")
+		}
+		ready <- err
+	}()
+	pxy, err := proxy.NewProxy(context.Background(), &proxy.Options{
+		Configurer:    &v1.HTTPProxyConfig{ProxyBaseConfig: v1.ProxyBaseConfig{Name: ctl.runID, Type: "http"}},
+		GetWorkConnFn: ctl.GetWorkConn, ServerCfg: ctl.sessionCtx.ServerCfg,
+	})
+	require.NoError(t, err)
+	stream, err := pxy.(*proxy.HTTPProxy).GetRealConn("127.0.0.1:12345")
+	require.NoError(t, err)
+	_, err = io.WriteString(stream, "GET / HTTP/1.1\r\nHost: local.test\r\n\r\n")
+	require.NoError(t, err)
+	response, err := http.ReadResponse(bufio.NewReader(stream), nil)
+	require.NoError(t, err)
+	first := make([]byte, 5)
+	_, err = io.ReadFull(response.Body, first)
+	require.NoError(t, err)
+	require.Equal(t, "first", string(first))
+	require.NoError(t, <-ready)
+	return stream, peer, response.Body
 }
