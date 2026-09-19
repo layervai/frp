@@ -71,6 +71,13 @@ func (c *WorkConn) Start(m *msg.StartWorkConn) (net.Conn, error) {
 	return c.conn, nil
 }
 
+// Interrupt aborts in-flight I/O and bounds any transport close handshake when
+// the owning control retires. Normal stream completion still uses Close.
+func (c *WorkConn) Interrupt() error {
+	_ = c.conn.SetDeadline(time.Now())
+	return c.Close()
+}
+
 func (c *WorkConn) Close() error {
 	c.closeOnce.Do(func() {
 		c.closeErr = c.conn.Close()

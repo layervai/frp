@@ -671,3 +671,70 @@ func checkedOutHTTPStream(t *testing.T, manager *ControlManager, ctl *Control) (
 	require.NoError(t, <-ready)
 	return stream, peer, response.Body
 }
+
+// A peer that stops reading must not make its close handshake block control
+// retirement. Model that handshake as a write performed from Close.
+func TestControlExpiresWorkConnectionBeforeCloseHandshake(t *testing.T) {
+	manager := NewControlManager(registry.NewClientRegistry())
+	ctl, _ := newLifecycleTestControl(t, "blocked-close", "client", newCountingServerMetrics())
+	mustAddAndActivate(t, manager, ctl)
+	require.True(t, ctl.Start())
+	server, peer := net.Pipe()
+	t.Cleanup(func() { _ = server.Close(); _ = peer.Close() })
+	conn := &closeHandshakeConn{Conn: server}
+	require.NoError(t, manager.RegisterWorkConn(ctl, proxy.NewWorkConn(msg.NewConn(conn, msg.NewV1ReadWriter(conn)))))
+	done := make(chan struct{})
+	go func() { ctl.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		_ = peer.Close()
+		<-done
+		t.Fatal("control shutdown blocked on a work connection close handshake")
+	}
+	waitForControlDone(t, ctl)
+}
+
+type closeHandshakeConn struct{ net.Conn }
+
+func (c *closeHandshakeConn) Close() error {
+	_, _ = c.Write([]byte("close handshake"))
+	return c.Conn.Close()
+}
+
+func TestControlClosesWorkTransportsConcurrently(t *testing.T) {
+	manager := NewControlManager(registry.NewClientRegistry())
+	ctl, _ := newLifecycleTestControl(t, "parallel-close", "client", newCountingServerMetrics())
+	mustAddAndActivate(t, manager, ctl)
+	require.True(t, ctl.Start())
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	for range 2 {
+		server, peer := net.Pipe()
+		t.Cleanup(func() { _ = server.Close(); _ = peer.Close() })
+		conn := &waitingCloseConn{Conn: server, entered: entered, release: release}
+		require.NoError(t, manager.RegisterWorkConn(ctl, proxy.NewWorkConn(msg.NewConn(conn, msg.NewV1ReadWriter(conn)))))
+	}
+	done := make(chan struct{})
+	go func() { ctl.Close(); close(done) }()
+	defer func() { close(release); <-done }()
+	for range 2 {
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			t.Fatal("work connection close handshakes were serialized")
+		}
+	}
+}
+
+type waitingCloseConn struct {
+	net.Conn
+	entered chan<- struct{}
+	release <-chan struct{}
+}
+
+func (c *waitingCloseConn) Close() error {
+	c.entered <- struct{}{}
+	<-c.release
+	return c.Conn.Close()
+}

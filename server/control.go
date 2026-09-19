@@ -637,9 +637,13 @@ func (ctl *Control) interruptReadAndClose() error {
 		ctl.workConns = make(map[*proxy.WorkConn]struct{})
 		ctl.mu.Unlock()
 		// Close outside mu: each stream removes itself through its callback.
+		// TLS close_notify can reset its own write deadline. Close the batch in
+		// parallel so its bounded transport timeout is not paid per stream.
+		var closing sync.WaitGroup
 		for conn := range owned {
-			_ = conn.Close()
+			closing.Go(func() { _ = conn.Interrupt() })
 		}
+		closing.Wait()
 	})
 	return ctl.interruptErr
 }

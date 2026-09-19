@@ -52,7 +52,7 @@ func TestUnixDomainSocketFailureClosesStreamWithoutLoggingPath(t *testing.T) {
 	if _, err := client.Read(make([]byte, 1)); err != io.EOF {
 		t.Fatalf("failed origin did not close work stream: %v", err)
 	}
-	if !strings.Contains(output.String(), "local Unix socket origin is unavailable (") {
+	if !strings.Contains(output.String(), "local Unix socket origin is unavailable (errno ") {
 		t.Fatalf("missing origin warning: %s", output.String())
 	}
 	if strings.Contains(output.String(), "nonexistent-private-origin") || strings.Contains(output.String(), "file.sock") {

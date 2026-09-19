@@ -1,4 +1,13 @@
+## Features
+
+* UDP packet payloads for ordinary UDP proxies and SUDP now use a dedicated binary codec when frpc and frps successfully negotiate the capability under wire protocol v2, using a more compact wire representation. Wire protocol v1 remains JSON; wire protocol v2 falls back to JSON `UDPPacket` when the peer does not support or did not negotiate the capability.
+
 ## Fixes
 
-* Closing a client control now closes its active HTTP and other work streams as well as idle work connections. Streams owned by other controls remain connected.
+* Fixed a server panic and remote denial of service caused by a client sending a negative `pool_count`. Negative values are now rejected before work-connection pool resources are allocated.
+* Fixed `frpc verify` ignoring configured `featureGates`, which caused VirtualNet configurations to be rejected even when the feature was enabled.
+* Fixed a case-insensitive validation bypass that allowed `customDomains` under the configured `subDomainHost` to be registered using mixed-case domain names.
+* Closing or replacing a client control now closes its active HTTP and other work streams as well as idle work connections. This also applies to control heartbeat expiry and same-client reconnect handoff; independent work streams no longer drain after their control retires. Streams owned by other controls remain connected.
 * Unix socket origin failures report the OS error code without logging the private socket pathname.
+
+The fork module release is v1.0.3; the embedded upstream compatibility version remains 0.71.0.
