@@ -329,23 +329,11 @@ func (cm *ControlManager) RegisterWorkConn(ctl *Control, conn *proxy.WorkConn) e
 		return fmt.Errorf("client control for run id [%s] is not running", ctl.runID)
 	}
 
-	// Publish tracking before the pool can hand the stream to a proxy.
-	conn.SetCloseCallback(func() {
-		ctl.mu.Lock()
-		delete(ctl.workConns, conn)
-		ctl.mu.Unlock()
-	})
-	ctl.mu.Lock()
-	ctl.workConns[conn] = struct{}{}
-	ctl.mu.Unlock()
 	select {
 	case ctl.workConnCh <- conn:
 		ctl.xl.Debugf("new work connection registered")
 		return nil
 	default:
-		ctl.mu.Lock()
-		delete(ctl.workConns, conn)
-		ctl.mu.Unlock()
 		ctl.xl.Debugf("work connection pool is full, discarding")
 		return fmt.Errorf("work connection pool is full, discarding")
 	}
@@ -413,8 +401,6 @@ type Control struct {
 
 	// work connections
 	workConnCh chan *proxy.WorkConn
-	// Includes both pooled and checked-out streams; protected by mu.
-	workConns map[*proxy.WorkConn]struct{}
 
 	// proxies in one client
 	proxies map[string]registeredProxy
@@ -491,7 +477,6 @@ func NewControl(ctx context.Context, sessionCtx *SessionContext) (*Control, erro
 	ctl := &Control{
 		sessionCtx:    sessionCtx,
 		workConnCh:    make(chan *proxy.WorkConn, poolCount+workConnPoolCapacityOffset),
-		workConns:     make(map[*proxy.WorkConn]struct{}),
 		proxies:       make(map[string]registeredProxy),
 		poolCount:     poolCount,
 		portsUsedNum:  0,
@@ -632,18 +617,6 @@ func (ctl *Control) interruptReadAndClose() error {
 	ctl.interruptOnce.Do(func() {
 		_ = ctl.sessionCtx.Conn.SetReadDeadline(time.Now())
 		ctl.interruptErr = ctl.sessionCtx.Conn.Close()
-		ctl.mu.Lock()
-		owned := ctl.workConns
-		ctl.workConns = make(map[*proxy.WorkConn]struct{})
-		ctl.mu.Unlock()
-		// Close outside mu: each stream removes itself through its callback.
-		// TLS close_notify can reset its own write deadline. Close the batch in
-		// parallel so its bounded transport timeout is not paid per stream.
-		var closing sync.WaitGroup
-		for conn := range owned {
-			closing.Go(func() { _ = conn.Interrupt() })
-		}
-		closing.Wait()
 	})
 	return ctl.interruptErr
 }
@@ -777,16 +750,12 @@ func (ctl *Control) worker() {
 
 	ctl.mu.Lock()
 	close(ctl.workConnCh)
-	idle := make([]*proxy.WorkConn, 0, len(ctl.workConnCh))
-	for conn := range ctl.workConnCh {
-		idle = append(idle, conn)
+	for workConn := range ctl.workConnCh {
+		workConn.Close()
 	}
 	proxies := ctl.proxies
 	ctl.proxies = make(map[string]registeredProxy)
 	ctl.mu.Unlock()
-	for _, conn := range idle {
-		_ = conn.Close()
-	}
 
 	for _, pxy := range proxies {
 		_ = ctl.closeProxy(pxy)
