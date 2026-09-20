@@ -47,23 +47,53 @@ func RegisterProxyFactory(proxyConfType reflect.Type, factory func(*BaseProxy) P
 }
 
 type WorkConn struct {
-	conn *msg.Conn
+	conn      *msg.Conn
+	closeOnce sync.Once
+	closeErr  error
+	onClose   func()
 }
 
 func NewWorkConn(conn *msg.Conn) *WorkConn {
 	return &WorkConn{conn: conn}
 }
 
+// SetCloseCallback records the owning control's release callback. The owner
+// sets it before publishing this connection to its work pool.
+func (c *WorkConn) SetCloseCallback(fn func()) { c.onClose = fn }
+
 func (c *WorkConn) Start(m *msg.StartWorkConn) (net.Conn, error) {
 	if err := c.conn.WriteMsg(m); err != nil {
 		return nil, err
 	}
+	if c.onClose != nil {
+		return &workConnStream{Conn: c.conn, owner: c}, nil
+	}
 	return c.conn, nil
 }
 
-func (c *WorkConn) Close() error {
-	return c.conn.Close()
+// Interrupt aborts in-flight I/O and bounds any transport close handshake when
+// the owning control retires. Normal stream completion still uses Close.
+func (c *WorkConn) Interrupt() error {
+	_ = c.conn.SetDeadline(time.Now())
+	return c.Close()
 }
+
+func (c *WorkConn) Close() error {
+	c.closeOnce.Do(func() {
+		c.closeErr = c.conn.Close()
+		if c.onClose != nil {
+			c.onClose()
+		}
+	})
+	return c.closeErr
+}
+
+type workConnStream struct {
+	net.Conn
+	owner *WorkConn
+}
+
+func (c *workConnStream) Close() error { return c.owner.Close() }
 
 type GetWorkConnFn func() (*WorkConn, error)
 
