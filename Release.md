@@ -10,4 +10,4 @@
 * Closing a server control now closes its checked-out work connections as well as idle connections, ending active streams owned by that control without interrupting sibling controls.
 * Unix socket origin failures report the OS error code without logging the private socket pathname.
 
-The fork module release is v1.0.3; the embedded upstream compatibility version remains 0.71.0.
+The fork module release is v1.0.4; the embedded upstream compatibility version remains 0.71.0.
