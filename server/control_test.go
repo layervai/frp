@@ -15,10 +15,13 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"io"
 	"math"
 	"net"
+	"net/http"
 	"os"
 	"sync"
 	"testing"
@@ -592,4 +595,221 @@ func (m *countingServerMetrics) closedClients() int64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.closeCount
+}
+
+// Exercise the checked-out connection through HTTPProxy's real wrapper stack.
+// Closing just the control channel or the idle pool cannot stop this response.
+func TestCloseControlInterruptsActiveHTTPStreamOnlyForThatControl(t *testing.T) {
+	manager := NewControlManager(registry.NewClientRegistry())
+	first, _ := newLifecycleTestControl(t, "stream-first", "first", newCountingServerMetrics())
+	sibling, _ := newLifecycleTestControl(t, "stream-sibling", "sibling", newCountingServerMetrics())
+	for _, ctl := range []*Control{first, sibling} {
+		mustAddAndActivate(t, manager, ctl)
+		require.True(t, ctl.Start())
+	}
+	firstStream, firstPeer, firstBody := checkedOutHTTPStream(t, manager, first)
+	siblingStream, siblingPeer, siblingBody := checkedOutHTTPStream(t, manager, sibling)
+	defer firstStream.Close()
+	defer siblingStream.Close()
+	service := &Service{ctlManager: manager}
+	require.NoError(t, firstStream.SetReadDeadline(time.Now().Add(time.Second)))
+	require.NoError(t, firstPeer.SetReadDeadline(time.Now().Add(time.Second)))
+	require.True(t, service.CloseControl(first.runID))
+	waitForControlDone(t, first)
+	_, err := firstBody.Read(make([]byte, 1))
+	require.Error(t, err, "active response survived control closure")
+	var timeout net.Error
+	require.False(t, errors.As(err, &timeout) && timeout.Timeout(), "active response only stopped at the test deadline")
+	_, err = firstPeer.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF, "remote stream endpoint was not closed")
+	wrote := make(chan error, 1)
+	go func() { _, err := io.WriteString(siblingPeer, "next"); wrote <- err }()
+	require.NoError(t, siblingStream.SetReadDeadline(time.Now().Add(time.Second)))
+	data := make([]byte, 4)
+	_, err = io.ReadFull(siblingBody, data)
+	require.NoError(t, err)
+	require.Equal(t, "next", string(data))
+	require.NoError(t, <-wrote)
+	require.NoError(t, siblingStream.Close())
+	sibling.mu.RLock()
+	tracked := len(sibling.workConns)
+	sibling.mu.RUnlock()
+	require.Zero(t, tracked, "normally completed streams must release control ownership")
+}
+
+func checkedOutHTTPStream(t *testing.T, manager *ControlManager, ctl *Control) (net.Conn, net.Conn, io.ReadCloser) {
+	t.Helper()
+	server, peer := net.Pipe()
+	t.Cleanup(func() { _ = server.Close(); _ = peer.Close() })
+	require.NoError(t, manager.RegisterWorkConn(ctl, proxy.NewWorkConn(msg.NewConn(server, msg.NewV1ReadWriter(server)))))
+	ready := make(chan error, 1)
+	go func() {
+		_, err := msg.NewConn(peer, msg.NewV1ReadWriter(peer)).ReadMsg()
+		if err == nil {
+			_, err = http.ReadRequest(bufio.NewReader(peer))
+		}
+		if err == nil {
+			_, err = io.WriteString(peer, "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nfirst")
+		}
+		ready <- err
+	}()
+	pxy, err := proxy.NewProxy(context.Background(), &proxy.Options{
+		Configurer:    &v1.HTTPProxyConfig{ProxyBaseConfig: v1.ProxyBaseConfig{Name: ctl.runID, Type: "http"}},
+		GetWorkConnFn: ctl.GetWorkConn, ServerCfg: ctl.sessionCtx.ServerCfg,
+	})
+	require.NoError(t, err)
+	stream, err := pxy.(*proxy.HTTPProxy).GetRealConn("127.0.0.1:12345")
+	require.NoError(t, err)
+	_, err = io.WriteString(stream, "GET / HTTP/1.1\r\nHost: local.test\r\n\r\n")
+	require.NoError(t, err)
+	response, err := http.ReadResponse(bufio.NewReader(stream), nil)
+	require.NoError(t, err)
+	first := make([]byte, 5)
+	_, err = io.ReadFull(response.Body, first)
+	require.NoError(t, err)
+	require.Equal(t, "first", string(first))
+	require.NoError(t, <-ready)
+	return stream, peer, response.Body
+}
+
+// A peer that stops reading must not make its close handshake block control
+// retirement. Model that handshake as a write performed from Close.
+func TestControlExpiresWorkConnectionBeforeCloseHandshake(t *testing.T) {
+	manager := NewControlManager(registry.NewClientRegistry())
+	ctl, _ := newLifecycleTestControl(t, "blocked-close", "client", newCountingServerMetrics())
+	mustAddAndActivate(t, manager, ctl)
+	require.True(t, ctl.Start())
+	server, peer := net.Pipe()
+	t.Cleanup(func() { _ = server.Close(); _ = peer.Close() })
+	conn := &closeHandshakeConn{Conn: server}
+	require.NoError(t, manager.RegisterWorkConn(ctl, proxy.NewWorkConn(msg.NewConn(conn, msg.NewV1ReadWriter(conn)))))
+	done := make(chan struct{})
+	go func() { ctl.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		_ = peer.Close()
+		<-done
+		t.Fatal("control shutdown blocked on a work connection close handshake")
+	}
+	waitForControlDone(t, ctl)
+}
+
+type closeHandshakeConn struct{ net.Conn }
+
+func (c *closeHandshakeConn) Close() error {
+	_, _ = c.Write([]byte("close handshake"))
+	return c.Conn.Close()
+}
+
+func TestControlClosesWorkTransportsConcurrently(t *testing.T) {
+	manager := NewControlManager(registry.NewClientRegistry())
+	ctl, _ := newLifecycleTestControl(t, "parallel-close", "client", newCountingServerMetrics())
+	mustAddAndActivate(t, manager, ctl)
+	require.True(t, ctl.Start())
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	for range 2 {
+		server, peer := net.Pipe()
+		t.Cleanup(func() { _ = server.Close(); _ = peer.Close() })
+		conn := &waitingCloseConn{Conn: server, entered: entered, release: release}
+		require.NoError(t, manager.RegisterWorkConn(ctl, proxy.NewWorkConn(msg.NewConn(conn, msg.NewV1ReadWriter(conn)))))
+	}
+	done := make(chan struct{})
+	go func() { ctl.Close(); close(done) }()
+	defer func() { close(release); <-done }()
+	for range 2 {
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			t.Fatal("work connection close handshakes were serialized")
+		}
+	}
+}
+
+type waitingCloseConn struct {
+	net.Conn
+	entered chan<- struct{}
+	release <-chan struct{}
+}
+
+func (c *waitingCloseConn) Close() error {
+	c.entered <- struct{}{}
+	<-c.release
+	return c.Conn.Close()
+}
+
+func TestControlManagerJoinsConcurrentRetirements(t *testing.T) {
+	manager := NewControlManager(registry.NewClientRegistry())
+	entered := make(chan struct{}, 4)
+	release := make(chan struct{})
+	for _, runID := range []string{"first", "second"} {
+		ctl, _ := newLifecycleTestControl(t, runID, runID, newCountingServerMetrics())
+		mustAddAndActivate(t, manager, ctl)
+		// The dispatcher keeps reading the same underlying connection; only Close blocks.
+		controlConn := &waitingCloseConn{Conn: ctl.sessionCtx.Conn, entered: entered, release: release}
+		ctl.sessionCtx.Conn = msg.NewConn(controlConn, msg.NewV1ReadWriter(controlConn))
+		require.True(t, ctl.Start())
+		server, peer := net.Pipe()
+		t.Cleanup(func() { _ = server.Close(); _ = peer.Close() })
+		conn := &waitingCloseConn{Conn: server, entered: entered, release: release}
+		require.NoError(t, manager.RegisterWorkConn(ctl, proxy.NewWorkConn(msg.NewConn(conn, msg.NewV1ReadWriter(conn)))))
+	}
+	done := make(chan struct{})
+	go func() { _ = manager.Close(); close(done) }()
+	defer func() { close(release); <-done }()
+	for range 4 {
+		select {
+		case <-entered:
+		case <-time.After(3 * time.Second):
+			t.Fatal("manager serialized a control or work transport closure")
+		}
+	}
+	select {
+	case <-done:
+		t.Fatal("manager returned before transport closure completed")
+	default:
+	}
+}
+
+func TestControlReplacementClosesCheckedOutHTTPStream(t *testing.T) {
+	manager := NewControlManager(registry.NewClientRegistry())
+	old, _ := newLifecycleTestControl(t, "same-run", "client", newCountingServerMetrics())
+	mustAddAndActivate(t, manager, old)
+	require.True(t, old.Start())
+	stream, peer, body := checkedOutHTTPStream(t, manager, old)
+	defer stream.Close()
+	require.NoError(t, stream.SetReadDeadline(time.Now().Add(3*time.Second)))
+	require.NoError(t, peer.SetReadDeadline(time.Now().Add(3*time.Second)))
+	next, _ := newLifecycleTestControl(t, "same-run", "client", newCountingServerMetrics())
+	require.NoError(t, manager.Add(next))
+	next.WaitForHandoff()
+	_, err := body.Read(make([]byte, 1))
+	require.Error(t, err)
+	var timeout net.Error
+	require.False(t, errors.As(err, &timeout) && timeout.Timeout())
+	_, err = peer.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF)
+	active, err := manager.Activate(next)
+	require.NoError(t, err)
+	require.True(t, active)
+	require.True(t, next.Start())
+}
+
+func TestControlExpiresControlConnectionBeforeCloseHandshake(t *testing.T) {
+	ctl, _ := newLifecycleTestControl(t, "control-close", "client", newCountingServerMetrics())
+	server, peer := net.Pipe()
+	t.Cleanup(func() { _ = server.Close(); _ = peer.Close() })
+	conn := &closeHandshakeConn{Conn: server}
+	ctl.sessionCtx.Conn = msg.NewConn(conn, msg.NewV1ReadWriter(conn))
+	done := make(chan struct{})
+	go func() { _ = ctl.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		_ = peer.Close()
+		<-done
+		t.Fatal("control shutdown blocked on its control connection close handshake")
+	}
+	waitForControlDone(t, ctl)
 }

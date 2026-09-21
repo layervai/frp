@@ -80,7 +80,7 @@ func NewControlManager(clientRegistry *registry.ClientRegistry) *ControlManager 
 
 // lockCurrentRun returns the current entry with its run gate held. It never
 // waits for the gate while holding cm.mu and revalidates the gate after waiting.
-// The global order is runMu, cm.mu, ctl.lifecycleMu, then registry locks.
+// The global order is runMu, cm.mu, ctl.lifecycleMu, ctl.mu, then registry locks.
 func (cm *ControlManager) lockCurrentRun(runID string, allowClosed bool) (*controlEntry, bool) {
 	cm.mu.RLock()
 	entry, ok := cm.ctlsByRunID[runID]
@@ -329,11 +329,23 @@ func (cm *ControlManager) RegisterWorkConn(ctl *Control, conn *proxy.WorkConn) e
 		return fmt.Errorf("client control for run id [%s] is not running", ctl.runID)
 	}
 
+	// Publish tracking before the pool can hand the stream to a proxy.
+	conn.SetCloseCallback(func() {
+		ctl.mu.Lock()
+		delete(ctl.workConns, conn)
+		ctl.mu.Unlock()
+	})
+	ctl.mu.Lock()
+	ctl.workConns[conn] = struct{}{}
+	ctl.mu.Unlock()
 	select {
 	case ctl.workConnCh <- conn:
 		ctl.xl.Debugf("new work connection registered")
 		return nil
 	default:
+		ctl.mu.Lock()
+		delete(ctl.workConns, conn)
+		ctl.mu.Unlock()
 		ctl.xl.Debugf("work connection pool is full, discarding")
 		return fmt.Errorf("work connection pool is full, discarding")
 	}
@@ -348,10 +360,15 @@ func (cm *ControlManager) Close() error {
 	}
 	cm.mu.Unlock()
 
+	// Join all retirements, but do not pay a transport close timeout per control.
+	var closing sync.WaitGroup
 	for _, ctl := range ctls {
-		cm.Remove(ctl)
-		_ = ctl.Close()
+		closing.Go(func() {
+			cm.Remove(ctl)
+			_ = ctl.Close()
+		})
 	}
+	closing.Wait()
 	return nil
 }
 
@@ -401,6 +418,8 @@ type Control struct {
 
 	// work connections
 	workConnCh chan *proxy.WorkConn
+	// Includes both pooled and checked-out streams; protected by mu.
+	workConns map[*proxy.WorkConn]struct{}
 
 	// proxies in one client
 	proxies map[string]registeredProxy
@@ -477,6 +496,7 @@ func NewControl(ctx context.Context, sessionCtx *SessionContext) (*Control, erro
 	ctl := &Control{
 		sessionCtx:    sessionCtx,
 		workConnCh:    make(chan *proxy.WorkConn, poolCount+workConnPoolCapacityOffset),
+		workConns:     make(map[*proxy.WorkConn]struct{}),
 		proxies:       make(map[string]registeredProxy),
 		poolCount:     poolCount,
 		portsUsedNum:  0,
@@ -615,8 +635,23 @@ func (ctl *Control) markReplaced() <-chan struct{} {
 
 func (ctl *Control) interruptReadAndClose() error {
 	ctl.interruptOnce.Do(func() {
-		_ = ctl.sessionCtx.Conn.SetReadDeadline(time.Now())
-		ctl.interruptErr = ctl.sessionCtx.Conn.Close()
+		_ = ctl.sessionCtx.Conn.SetDeadline(time.Now())
+		ctl.mu.Lock()
+		owned := ctl.workConns
+		ctl.workConns = make(map[*proxy.WorkConn]struct{})
+		ctl.mu.Unlock()
+		// Close outside mu: each stream removes itself through its callback.
+		// TLS close_notify can reset its own write deadline. Close the batch in
+		// parallel, including the control transport, so a slow control close
+		// cannot postpone interruption of the work streams.
+		// ponytail: one closer per live stream; bound workers only after transport
+		// aborts become nonblocking, or peer timeouts accumulate per batch.
+		var closing sync.WaitGroup
+		closing.Go(func() { ctl.interruptErr = ctl.sessionCtx.Conn.Close() })
+		for conn := range owned {
+			closing.Go(func() { _ = conn.Interrupt() })
+		}
+		closing.Wait()
 	})
 	return ctl.interruptErr
 }
@@ -750,12 +785,16 @@ func (ctl *Control) worker() {
 
 	ctl.mu.Lock()
 	close(ctl.workConnCh)
-	for workConn := range ctl.workConnCh {
-		workConn.Close()
+	idle := make([]*proxy.WorkConn, 0, len(ctl.workConnCh))
+	for conn := range ctl.workConnCh {
+		idle = append(idle, conn)
 	}
 	proxies := ctl.proxies
 	ctl.proxies = make(map[string]registeredProxy)
 	ctl.mu.Unlock()
+	for _, conn := range idle {
+		_ = conn.Close()
+	}
 
 	for _, pxy := range proxies {
 		_ = ctl.closeProxy(pxy)
