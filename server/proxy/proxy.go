@@ -65,10 +65,7 @@ func (c *WorkConn) Start(m *msg.StartWorkConn) (net.Conn, error) {
 	if err := c.conn.WriteMsg(m); err != nil {
 		return nil, err
 	}
-	if c.onClose != nil {
-		return &workConnStream{Conn: c.conn, owner: c}, nil
-	}
-	return c.conn, nil
+	return &workConnStream{Conn: c.conn, owner: c}, nil
 }
 
 // Interrupt aborts in-flight I/O and bounds any transport close handshake when

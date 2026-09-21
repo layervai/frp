@@ -52,7 +52,7 @@ func TestWorkConnStartWritesStartWorkConn(t *testing.T) {
 
 	result := <-resultCh
 	require.NoError(t, result.err)
-	require.Same(t, serverMsgConn, result.conn)
+	require.Same(t, workConn, result.conn.(*workConnStream).owner)
 }
 
 func TestGetWorkConnFromPoolStartWorkConnUnchangedForUDPWireV2(t *testing.T) {

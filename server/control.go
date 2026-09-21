@@ -80,7 +80,7 @@ func NewControlManager(clientRegistry *registry.ClientRegistry) *ControlManager 
 
 // lockCurrentRun returns the current entry with its run gate held. It never
 // waits for the gate while holding cm.mu and revalidates the gate after waiting.
-// The global order is runMu, cm.mu, ctl.lifecycleMu, then registry locks.
+// The global order is runMu, cm.mu, ctl.lifecycleMu, ctl.mu, then registry locks.
 func (cm *ControlManager) lockCurrentRun(runID string, allowClosed bool) (*controlEntry, bool) {
 	cm.mu.RLock()
 	entry, ok := cm.ctlsByRunID[runID]
@@ -644,6 +644,8 @@ func (ctl *Control) interruptReadAndClose() error {
 		// TLS close_notify can reset its own write deadline. Close the batch in
 		// parallel, including the control transport, so a slow control close
 		// cannot postpone interruption of the work streams.
+		// ponytail: one closer per live stream; bound workers only after transport
+		// aborts become nonblocking, or peer timeouts accumulate per batch.
 		var closing sync.WaitGroup
 		closing.Go(func() { ctl.interruptErr = ctl.sessionCtx.Conn.Close() })
 		for conn := range owned {

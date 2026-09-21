@@ -746,6 +746,7 @@ func TestControlManagerJoinsConcurrentRetirements(t *testing.T) {
 	for _, runID := range []string{"first", "second"} {
 		ctl, _ := newLifecycleTestControl(t, runID, runID, newCountingServerMetrics())
 		mustAddAndActivate(t, manager, ctl)
+		// The dispatcher keeps reading the same underlying connection; only Close blocks.
 		controlConn := &waitingCloseConn{Conn: ctl.sessionCtx.Conn, entered: entered, release: release}
 		ctl.sessionCtx.Conn = msg.NewConn(controlConn, msg.NewV1ReadWriter(controlConn))
 		require.True(t, ctl.Start())
