@@ -635,7 +635,7 @@ func (ctl *Control) markReplaced() <-chan struct{} {
 
 func (ctl *Control) interruptReadAndClose() error {
 	ctl.interruptOnce.Do(func() {
-		_ = ctl.sessionCtx.Conn.SetReadDeadline(time.Now())
+		_ = ctl.sessionCtx.Conn.SetDeadline(time.Now())
 		ctl.mu.Lock()
 		owned := ctl.workConns
 		ctl.workConns = make(map[*proxy.WorkConn]struct{})

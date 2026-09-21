@@ -795,3 +795,21 @@ func TestControlReplacementClosesCheckedOutHTTPStream(t *testing.T) {
 	require.True(t, active)
 	require.True(t, next.Start())
 }
+
+func TestControlExpiresControlConnectionBeforeCloseHandshake(t *testing.T) {
+	ctl, _ := newLifecycleTestControl(t, "control-close", "client", newCountingServerMetrics())
+	server, peer := net.Pipe()
+	t.Cleanup(func() { _ = server.Close(); _ = peer.Close() })
+	conn := &closeHandshakeConn{Conn: server}
+	ctl.sessionCtx.Conn = msg.NewConn(conn, msg.NewV1ReadWriter(conn))
+	done := make(chan struct{})
+	go func() { _ = ctl.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		_ = peer.Close()
+		<-done
+		t.Fatal("control shutdown blocked on its control connection close handshake")
+	}
+	waitForControlDone(t, ctl)
+}
