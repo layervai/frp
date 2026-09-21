@@ -7,3 +7,6 @@
 * Fixed a server panic and remote denial of service caused by a client sending a negative `pool_count`. Negative values are now rejected before work-connection pool resources are allocated.
 * Fixed `frpc verify` ignoring configured `featureGates`, which caused VirtualNet configurations to be rejected even when the feature was enabled.
 * Fixed a case-insensitive validation bypass that allowed `customDomains` under the configured `subDomainHost` to be registered using mixed-case domain names.
+* Unix socket origin failures report the OS error code without logging the private socket pathname.
+
+The fork module release is v1.0.3; the embedded upstream compatibility version remains 0.71.0.
