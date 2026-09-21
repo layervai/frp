@@ -360,10 +360,15 @@ func (cm *ControlManager) Close() error {
 	}
 	cm.mu.Unlock()
 
+	// Join all retirements, but do not pay a transport close timeout per control.
+	var closing sync.WaitGroup
 	for _, ctl := range ctls {
-		cm.Remove(ctl)
-		_ = ctl.Close()
+		closing.Go(func() {
+			cm.Remove(ctl)
+			_ = ctl.Close()
+		})
 	}
+	closing.Wait()
 	return nil
 }
 

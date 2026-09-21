@@ -7,7 +7,4 @@
 * Fixed a server panic and remote denial of service caused by a client sending a negative `pool_count`. Negative values are now rejected before work-connection pool resources are allocated.
 * Fixed `frpc verify` ignoring configured `featureGates`, which caused VirtualNet configurations to be rejected even when the feature was enabled.
 * Fixed a case-insensitive validation bypass that allowed `customDomains` under the configured `subDomainHost` to be registered using mixed-case domain names.
-
 * Closing a server control now closes its checked-out work connections as well as idle connections, ending active streams owned by that control without interrupting sibling controls.
-
-This independent control-retirement candidate keeps the embedded upstream compatibility version at 0.71.0. Its release version must be assigned after review; no release is created by this change.

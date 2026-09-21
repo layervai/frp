@@ -738,3 +738,57 @@ func (c *waitingCloseConn) Close() error {
 	<-c.release
 	return c.Conn.Close()
 }
+
+func TestControlManagerJoinsConcurrentRetirements(t *testing.T) {
+	manager := NewControlManager(registry.NewClientRegistry())
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	for _, runID := range []string{"first", "second"} {
+		ctl, _ := newLifecycleTestControl(t, runID, runID, newCountingServerMetrics())
+		mustAddAndActivate(t, manager, ctl)
+		require.True(t, ctl.Start())
+		server, peer := net.Pipe()
+		t.Cleanup(func() { _ = server.Close(); _ = peer.Close() })
+		conn := &waitingCloseConn{Conn: server, entered: entered, release: release}
+		require.NoError(t, manager.RegisterWorkConn(ctl, proxy.NewWorkConn(msg.NewConn(conn, msg.NewV1ReadWriter(conn)))))
+	}
+	done := make(chan struct{})
+	go func() { _ = manager.Close(); close(done) }()
+	defer func() { close(release); <-done }()
+	for range 2 {
+		select {
+		case <-entered:
+		case <-time.After(3 * time.Second):
+			t.Fatal("manager serialized control transport closure")
+		}
+	}
+	select {
+	case <-done:
+		t.Fatal("manager returned before transport closure completed")
+	default:
+	}
+}
+
+func TestControlReplacementClosesCheckedOutHTTPStream(t *testing.T) {
+	manager := NewControlManager(registry.NewClientRegistry())
+	old, _ := newLifecycleTestControl(t, "same-run", "client", newCountingServerMetrics())
+	mustAddAndActivate(t, manager, old)
+	require.True(t, old.Start())
+	stream, peer, body := checkedOutHTTPStream(t, manager, old)
+	defer stream.Close()
+	require.NoError(t, stream.SetReadDeadline(time.Now().Add(3*time.Second)))
+	require.NoError(t, peer.SetReadDeadline(time.Now().Add(3*time.Second)))
+	next, _ := newLifecycleTestControl(t, "same-run", "client", newCountingServerMetrics())
+	require.NoError(t, manager.Add(next))
+	next.WaitForHandoff()
+	_, err := body.Read(make([]byte, 1))
+	require.Error(t, err)
+	var timeout net.Error
+	require.False(t, errors.As(err, &timeout) && timeout.Timeout())
+	_, err = peer.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF)
+	active, err := manager.Activate(next)
+	require.NoError(t, err)
+	require.True(t, active)
+	require.True(t, next.Start())
+}
