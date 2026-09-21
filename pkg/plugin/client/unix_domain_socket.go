@@ -18,7 +18,9 @@ package client
 
 import (
 	"context"
+	"errors"
 	"net"
+	"syscall"
 
 	libio "github.com/fatedier/golib/io"
 
@@ -53,7 +55,14 @@ func (uds *UnixDomainSocketPlugin) Handle(ctx context.Context, connInfo *Connect
 	xl := xlog.FromContextSafe(ctx)
 	localConn, err := net.DialUnix("unix", nil, uds.UnixAddr)
 	if err != nil {
-		xl.Warnf("dial to uds %s error: %v", uds.UnixAddr, err)
+		// Socket paths can identify private local origins. Log only the bounded
+		// OS error code, never net.OpError or an arbitrary nested error string.
+		var errno syscall.Errno
+		if errors.As(err, &errno) {
+			xl.Warnf("local Unix socket origin is unavailable (errno %d)", uintptr(errno))
+		} else {
+			xl.Warnf("local Unix socket origin is unavailable (unknown cause)")
+		}
 		connInfo.Conn.Close()
 		return
 	}
