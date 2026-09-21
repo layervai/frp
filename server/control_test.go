@@ -741,11 +741,13 @@ func (c *waitingCloseConn) Close() error {
 
 func TestControlManagerJoinsConcurrentRetirements(t *testing.T) {
 	manager := NewControlManager(registry.NewClientRegistry())
-	entered := make(chan struct{}, 2)
+	entered := make(chan struct{}, 4)
 	release := make(chan struct{})
 	for _, runID := range []string{"first", "second"} {
 		ctl, _ := newLifecycleTestControl(t, runID, runID, newCountingServerMetrics())
 		mustAddAndActivate(t, manager, ctl)
+		controlConn := &waitingCloseConn{Conn: ctl.sessionCtx.Conn, entered: entered, release: release}
+		ctl.sessionCtx.Conn = msg.NewConn(controlConn, msg.NewV1ReadWriter(controlConn))
 		require.True(t, ctl.Start())
 		server, peer := net.Pipe()
 		t.Cleanup(func() { _ = server.Close(); _ = peer.Close() })
@@ -755,11 +757,11 @@ func TestControlManagerJoinsConcurrentRetirements(t *testing.T) {
 	done := make(chan struct{})
 	go func() { _ = manager.Close(); close(done) }()
 	defer func() { close(release); <-done }()
-	for range 2 {
+	for range 4 {
 		select {
 		case <-entered:
 		case <-time.After(3 * time.Second):
-			t.Fatal("manager serialized control transport closure")
+			t.Fatal("manager serialized a control or work transport closure")
 		}
 	}
 	select {

@@ -636,15 +636,16 @@ func (ctl *Control) markReplaced() <-chan struct{} {
 func (ctl *Control) interruptReadAndClose() error {
 	ctl.interruptOnce.Do(func() {
 		_ = ctl.sessionCtx.Conn.SetReadDeadline(time.Now())
-		ctl.interruptErr = ctl.sessionCtx.Conn.Close()
 		ctl.mu.Lock()
 		owned := ctl.workConns
 		ctl.workConns = make(map[*proxy.WorkConn]struct{})
 		ctl.mu.Unlock()
 		// Close outside mu: each stream removes itself through its callback.
 		// TLS close_notify can reset its own write deadline. Close the batch in
-		// parallel so its bounded transport timeout is not paid per stream.
+		// parallel, including the control transport, so a slow control close
+		// cannot postpone interruption of the work streams.
 		var closing sync.WaitGroup
+		closing.Go(func() { ctl.interruptErr = ctl.sessionCtx.Conn.Close() })
 		for conn := range owned {
 			closing.Go(func() { _ = conn.Interrupt() })
 		}
