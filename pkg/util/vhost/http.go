@@ -124,7 +124,10 @@ func NewHTTPReverseProxy(option HTTPReverseProxyOptions, vhostRouter *Routers) *
 			},
 		},
 		BufferPool: pool.NewBuffer(32 * 1024),
-		ErrorLog:   stdlog.New(log.NewWriteLogger(log.WarnLevel, 2), "", 0),
+		// ErrorLog only receives ReverseProxy internals that are not scoped to
+		// a request (ErrorHandler below handles request errors), so it keeps a
+		// fixed WARN level; per-request levels are mapped in ErrorHandler.
+		ErrorLog: stdlog.New(log.NewWriteLogger(log.WarnLevel, 2), "", 0),
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
 			log.Logf(proxyErrorLogLevel(err), 1, "do http proxy request [host: %s] error: %v", req.Host, err)
 			if err != nil {
