@@ -27,6 +27,7 @@ import (
 	"time"
 
 	libio "github.com/fatedier/golib/io"
+	golog "github.com/fatedier/golib/log"
 	"github.com/fatedier/golib/pool"
 
 	httppkg "github.com/fatedier/frp/pkg/util/http"
@@ -126,7 +127,7 @@ func NewHTTPReverseProxy(option HTTPReverseProxyOptions, vhostRouter *Routers) *
 		BufferPool: pool.NewBuffer(32 * 1024),
 		ErrorLog:   stdlog.New(log.NewWriteLogger(log.WarnLevel, 2), "", 0),
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
-			log.Logf(log.WarnLevel, 1, "do http proxy request [host: %s] error: %v", req.Host, err)
+			log.Logf(proxyErrorLogLevel(err), 1, "do http proxy request [host: %s] error: %v", req.Host, err)
 			if err != nil {
 				if e, ok := err.(net.Error); ok && e.Timeout() {
 					rw.WriteHeader(http.StatusGatewayTimeout)
@@ -181,7 +182,25 @@ func (rp *HTTPReverseProxy) CreateConnection(reqRouteInfo *RequestRouteInfo, byE
 			return fn(reqRouteInfo.RemoteAddr)
 		}
 	}
-	return nil, fmt.Errorf("%v: %s %s %s", ErrNoRouteFound, host, reqRouteInfo.URL, reqRouteInfo.HTTPUser)
+	return nil, fmt.Errorf("%w: %s %s %s", ErrNoRouteFound, host, reqRouteInfo.URL, reqRouteInfo.HTTPUser)
+}
+
+// proxyErrorLogLevel keeps reverse-proxy errors that any internet client can
+// trigger at will out of WARN. A client that disconnects mid-request surfaces
+// as context.Canceled, which is normal browser behavior, so it logs at Debug.
+// A request for a host with no registered route is unauthenticated input (a
+// scanner or an offline tunnel), so it logs at Info. Every other error, such
+// as a backend EOF or a response-header timeout, still indicates a degraded
+// tunnel and stays at Warn.
+func proxyErrorLogLevel(err error) golog.Level {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return log.DebugLevel
+	case errors.Is(err, ErrNoRouteFound):
+		return log.InfoLevel
+	default:
+		return log.WarnLevel
+	}
 }
 
 func checkRouteAuthByRequest(req *http.Request, rc *RouteConfig) bool {

@@ -2,13 +2,18 @@ package vhost
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"testing"
 	"time"
 
+	golog "github.com/fatedier/golib/log"
 	"github.com/stretchr/testify/require"
 
 	httppkg "github.com/fatedier/frp/pkg/util/http"
@@ -179,4 +184,63 @@ func TestGetRequestRouteUser(t *testing.T) {
 
 		require.Empty(t, getRequestRouteUser(req))
 	})
+}
+
+func TestProxyErrorLogLevel(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want golog.Level
+	}{
+		{name: "client canceled", err: context.Canceled, want: golog.DebugLevel},
+		{name: "wrapped client canceled", err: fmt.Errorf("read: %w", context.Canceled), want: golog.DebugLevel},
+		{name: "no route", err: fmt.Errorf("%w: example.com / ", ErrNoRouteFound), want: golog.InfoLevel},
+		{name: "backend eof", err: io.EOF, want: golog.WarnLevel},
+		{name: "deadline exceeded", err: context.DeadlineExceeded, want: golog.WarnLevel},
+		{name: "other", err: errors.New("dial backend: connection refused"), want: golog.WarnLevel},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, proxyErrorLogLevel(tt.err))
+		})
+	}
+}
+
+// The level mapping depends on the transport handing ErrorHandler an error
+// that still wraps the sentinel; pin that through the real proxy path.
+func TestHTTPReverseProxyNoRouteErrorWrapsSentinel(t *testing.T) {
+	rp := NewHTTPReverseProxy(HTTPReverseProxyOptions{}, NewRouters())
+	var got error
+	reverseProxy := rp.proxy.(*httputil.ReverseProxy)
+	handle := reverseProxy.ErrorHandler
+	reverseProxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+		got = err
+		handle(rw, req, err)
+	}
+
+	rec := httptest.NewRecorder()
+	rp.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://unrouted.example/", nil))
+
+	require.Equal(t, http.StatusNotFound, rec.Code)
+	require.ErrorIs(t, got, ErrNoRouteFound)
+	require.Equal(t, golog.InfoLevel, proxyErrorLogLevel(got))
+}
+
+func TestHTTPReverseProxyClientCancelLogsAtDebug(t *testing.T) {
+	rp := NewHTTPReverseProxy(HTTPReverseProxyOptions{}, NewRouters())
+	var got error
+	reverseProxy := rp.proxy.(*httputil.ReverseProxy)
+	handle := reverseProxy.ErrorHandler
+	reverseProxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+		got = err
+		handle(rw, req, err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "http://unrouted.example/", nil).WithContext(ctx)
+	rp.ServeHTTP(httptest.NewRecorder(), req)
+
+	require.ErrorIs(t, got, context.Canceled)
+	require.Equal(t, golog.DebugLevel, proxyErrorLogLevel(got))
 }
