@@ -124,9 +124,10 @@ func NewHTTPReverseProxy(option HTTPReverseProxyOptions, vhostRouter *Routers) *
 			},
 		},
 		BufferPool: pool.NewBuffer(32 * 1024),
-		// ErrorLog only receives ReverseProxy internals that are not scoped to
-		// a request (ErrorHandler below handles request errors), so it keeps a
-		// fixed WARN level; per-request levels are mapped in ErrorHandler.
+		// ErrorHandler below maps levels for RoundTrip failures. ErrorLog keeps
+		// a fixed WARN for everything ReverseProxy reports directly (for
+		// example body-copy errors, which the stdlib already skips when the
+		// cause is context.Canceled).
 		ErrorLog: stdlog.New(log.NewWriteLogger(log.WarnLevel, 2), "", 0),
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
 			log.Logf(proxyErrorLogLevel(err), 1, "do http proxy request [host: %s] error: %v", req.Host, err)
@@ -187,9 +188,11 @@ func (rp *HTTPReverseProxy) CreateConnection(reqRouteInfo *RequestRouteInfo, byE
 	return nil, fmt.Errorf("%w: %s %s %s", ErrNoRouteFound, host, reqRouteInfo.URL, reqRouteInfo.HTTPUser)
 }
 
-// proxyErrorLogLevel keeps reverse-proxy errors that any internet client can
-// trigger at will out of WARN. A client that disconnects mid-request surfaces
-// as context.Canceled, which is normal browser behavior, so it logs at Debug.
+// proxyErrorLogLevel keeps two reverse-proxy errors that any internet client
+// can trigger at will out of WARN. It demotes exactly these two; other
+// client-side failures (for example a reset surfacing as ECONNRESET) stay at
+// WARN. A client that disconnects mid-request surfaces as context.Canceled,
+// which is normal browser behavior, so it logs at Debug.
 // A request for a host with no registered route is unauthenticated input (a
 // scanner or an offline tunnel), so it logs at Info. Every other error, such
 // as a backend EOF or a response-header timeout, still indicates a degraded
