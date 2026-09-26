@@ -27,7 +27,6 @@ import (
 	"time"
 
 	libio "github.com/fatedier/golib/io"
-	golog "github.com/fatedier/golib/log"
 	"github.com/fatedier/golib/pool"
 
 	httppkg "github.com/fatedier/frp/pkg/util/http"
@@ -192,7 +191,7 @@ func (rp *HTTPReverseProxy) CreateConnection(reqRouteInfo *RequestRouteInfo, byE
 // scanner or an offline tunnel), so it logs at Info. Every other error, such
 // as a backend EOF or a response-header timeout, still indicates a degraded
 // tunnel and stays at Warn.
-func proxyErrorLogLevel(err error) golog.Level {
+func proxyErrorLogLevel(err error) log.Level {
 	switch {
 	case errors.Is(err, context.Canceled):
 		return log.DebugLevel

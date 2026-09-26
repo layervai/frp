@@ -21,6 +21,9 @@ import (
 	"github.com/fatedier/golib/log"
 )
 
+// Level lets callers name a log level without importing golib/log directly.
+type Level = log.Level
+
 var (
 	TraceLevel = log.TraceLevel
 	DebugLevel = log.DebugLevel

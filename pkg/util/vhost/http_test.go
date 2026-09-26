@@ -2,6 +2,7 @@ package vhost
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	httppkg "github.com/fatedier/frp/pkg/util/http"
+	"github.com/fatedier/frp/pkg/util/log"
 )
 
 func TestHTTPServerProtocols(t *testing.T) {
@@ -224,6 +226,34 @@ func TestHTTPReverseProxyNoRouteErrorWrapsSentinel(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, rec.Code)
 	require.ErrorIs(t, got, ErrNoRouteFound)
 	require.Equal(t, golog.InfoLevel, proxyErrorLogLevel(got))
+}
+
+// Pins the wire between ErrorHandler and proxyErrorLogLevel: the emitted line
+// must carry the mapped level, not a hard-coded WARN. Mutates the package-level
+// logger, so it must not run in parallel.
+func TestHTTPReverseProxyErrorHandlerEmitsMappedLevel(t *testing.T) {
+	var buf bytes.Buffer
+	orig := log.Logger
+	log.Logger = log.Logger.WithOptions(golog.WithOutput(&buf), golog.WithLevel(golog.TraceLevel))
+	t.Cleanup(func() { log.Logger = orig })
+
+	rp := NewHTTPReverseProxy(HTTPReverseProxyOptions{}, NewRouters())
+
+	// Origin-form request with a Host header: the shape vhost traffic takes.
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "unrouted.example"
+	rp.ServeHTTP(httptest.NewRecorder(), req)
+	require.Contains(t, buf.String(), "[I]")
+	require.Contains(t, buf.String(), "no route found")
+	require.NotContains(t, buf.String(), "[W]")
+
+	buf.Reset()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rp.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil).WithContext(ctx))
+	require.Contains(t, buf.String(), "[D]")
+	require.Contains(t, buf.String(), "context canceled")
+	require.NotContains(t, buf.String(), "[W]")
 }
 
 func TestHTTPReverseProxyClientCancelLogsAtDebug(t *testing.T) {
