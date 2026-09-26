@@ -192,14 +192,14 @@ func TestProxyErrorLogLevel(t *testing.T) {
 	tests := []struct {
 		name string
 		err  error
-		want golog.Level
+		want log.Level
 	}{
-		{name: "client canceled", err: context.Canceled, want: golog.DebugLevel},
-		{name: "wrapped client canceled", err: fmt.Errorf("read: %w", context.Canceled), want: golog.DebugLevel},
-		{name: "no route", err: fmt.Errorf("%w: example.com / ", ErrNoRouteFound), want: golog.InfoLevel},
-		{name: "backend eof", err: io.EOF, want: golog.WarnLevel},
-		{name: "deadline exceeded", err: context.DeadlineExceeded, want: golog.WarnLevel},
-		{name: "other", err: errors.New("dial backend: connection refused"), want: golog.WarnLevel},
+		{name: "client canceled", err: context.Canceled, want: log.DebugLevel},
+		{name: "wrapped client canceled", err: fmt.Errorf("read: %w", context.Canceled), want: log.DebugLevel},
+		{name: "no route", err: fmt.Errorf("%w: example.com / ", ErrNoRouteFound), want: log.InfoLevel},
+		{name: "backend eof", err: io.EOF, want: log.WarnLevel},
+		{name: "deadline exceeded", err: context.DeadlineExceeded, want: log.WarnLevel},
+		{name: "other", err: errors.New("dial backend: connection refused"), want: log.WarnLevel},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -225,7 +225,7 @@ func TestHTTPReverseProxyNoRouteErrorWrapsSentinel(t *testing.T) {
 
 	require.Equal(t, http.StatusNotFound, rec.Code)
 	require.ErrorIs(t, got, ErrNoRouteFound)
-	require.Equal(t, golog.InfoLevel, proxyErrorLogLevel(got))
+	require.Equal(t, log.InfoLevel, proxyErrorLogLevel(got))
 }
 
 // Pins the wire between ErrorHandler and proxyErrorLogLevel: the emitted line
@@ -234,7 +234,7 @@ func TestHTTPReverseProxyNoRouteErrorWrapsSentinel(t *testing.T) {
 func TestHTTPReverseProxyErrorHandlerEmitsMappedLevel(t *testing.T) {
 	var buf bytes.Buffer
 	orig := log.Logger
-	log.Logger = log.Logger.WithOptions(golog.WithOutput(&buf), golog.WithLevel(golog.TraceLevel))
+	log.Logger = log.Logger.WithOptions(golog.WithOutput(&buf), golog.WithLevel(log.TraceLevel))
 	t.Cleanup(func() { log.Logger = orig })
 
 	rp := NewHTTPReverseProxy(HTTPReverseProxyOptions{}, NewRouters())
@@ -272,5 +272,5 @@ func TestHTTPReverseProxyClientCancelLogsAtDebug(t *testing.T) {
 	rp.ServeHTTP(httptest.NewRecorder(), req)
 
 	require.ErrorIs(t, got, context.Canceled)
-	require.Equal(t, golog.DebugLevel, proxyErrorLogLevel(got))
+	require.Equal(t, log.DebugLevel, proxyErrorLogLevel(got))
 }
