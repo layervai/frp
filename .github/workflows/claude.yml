@@ -627,6 +627,9 @@ jobs:
               ! "${GITHUB_REPOSITORY:-}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
               return 1
             fi
+            # GITHUB_SERVER_URL and GITHUB_REPOSITORY are runner defaults. A step
+            # cannot replace GITHUB_* defaults through GITHUB_ENV, so the action
+            # cannot move this comparison target.
             repository_origin="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
             for url in "$(git remote get-url --all origin 2>/dev/null)" \
               "$(git remote get-url --push --all origin 2>/dev/null)"; do
