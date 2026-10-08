@@ -24,7 +24,7 @@ const (
 
 	// From v1.0.187 the pinned action rewrites origin to this shape before
 	// Claude starts. The value is a fixture, not a credential.
-	actionOriginURL = "https://x-access-token:fixture-token@github.com/layervai/frp.git"
+	actionOriginURL = "https://x-access-token:fixture-token@github.com/layervai/frp.git" //nolint:gosec // G101: fixture, not a credential
 )
 
 type trigger struct {
