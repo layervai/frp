@@ -51,8 +51,9 @@ jobs:
         with:
           # Agent mode reads the immutable PR head only through GitHub MCP. Keep
           # PR-authored files out of the credential-bearing workspace entirely:
-          # v1.0.180 snapshots sensitive paths with recursive symlink
-          # dereferencing before it restores base config. pull_request_target's
+          # the pinned action copies sensitive paths into a .claude-pr snapshot
+          # (following symlinks that resolve to tracked in-tree content) before
+          # it restores base config. pull_request_target's
           # immutable event SHA is trusted default-branch input, unlike API data
           # resolved from the pull request.
           ref: ${{ github.sha }}
@@ -124,6 +125,14 @@ jobs:
           git branch -f "$EXPECTED_BASE_REF" "$EXPECTED_BASE_SHA"
           git update-ref "refs/remotes/origin/$EXPECTED_HEAD_REF" "$EXPECTED_HEAD_SHA"
           git update-ref "refs/remotes/origin/$EXPECTED_BASE_REF" "$EXPECTED_BASE_SHA"
+          # Workflow-owned snapshot evidence. From v1.0.187 the pinned action
+          # re-points origin at this repository on GitHub and fetches the base
+          # branch through it, so refs/remotes/origin/* belong to the action
+          # and may legitimately advance if the base branch moves mid-run.
+          # Nothing the action does writes refs/automatic-review/*; the
+          # terminal step compares these instead.
+          git update-ref refs/automatic-review/head "$EXPECTED_HEAD_SHA"
+          git update-ref refs/automatic-review/base "$EXPECTED_BASE_SHA"
           git config --local fetch.recurseSubmodules false
 
           # This repository's base CLAUDE.md is a symlink to AGENTS.md. The
@@ -171,6 +180,8 @@ jobs:
           if [[ "$(git rev-parse --verify FETCH_HEAD 2>/dev/null)" != "$EXPECTED_BASE_SHA" ||
             "$(git rev-parse "refs/remotes/origin/$EXPECTED_HEAD_REF")" != "$EXPECTED_HEAD_SHA" ||
             "$(git rev-parse "refs/remotes/origin/$EXPECTED_BASE_REF")" != "$EXPECTED_BASE_SHA" ||
+            "$(git rev-parse --verify refs/automatic-review/head 2>/dev/null)" != "$EXPECTED_HEAD_SHA" ||
+            "$(git rev-parse --verify refs/automatic-review/base 2>/dev/null)" != "$EXPECTED_BASE_SHA" ||
             "$(git --git-dir="$local_origin" rev-parse "refs/heads/$EXPECTED_HEAD_REF")" != "$EXPECTED_HEAD_SHA" ||
             "$(git --git-dir="$local_origin" rev-parse "refs/heads/$EXPECTED_BASE_REF")" != "$EXPECTED_BASE_SHA" ]]; then
             echo "::error::Credential-free Claude review origin changed during fetch proof."
@@ -242,22 +253,28 @@ jobs:
         # The pinned action also replaces PR-controlled Claude startup config
         # with the trusted base version before CLI startup; preserve that
         # protection on action upgrades so hooks cannot bypass tool policy.
-        # v1.0.180 includes upstream #1496: an SDK result with
-        # `subtype: success` plus `is_error: true` fails the job instead of
-        # recording a false-green review.
+        # The pinned action includes upstream #1496 (first shipped in
+        # v1.0.180): an SDK result with `subtype: success` plus
+        # `is_error: true` fails the job instead of recording a false-green
+        # review.
         # Under the job cap on purpose: an overrun fails this step and leaves
         # the job alive to report it. A kill at the JOB cap cancels every later
         # step, so the verify step never runs and the PR gets a bare
         # `cancelled` check with no comment and nothing saying why.
         timeout-minutes: 10
-        uses: anthropics/claude-code-action@fa7e2f0a29a126f0b81cdcf360561b36e44cf608 # v1.0.180
+        uses: anthropics/claude-code-action@12dd8d74c712f5f3669365b2369b558c495b1104 # v1.0.238
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
-          # Agent mode otherwise rewrites origin with the workflow token even
-          # though this job cannot and must not commit. API-signing mode skips
-          # that Git credential setup; its file-write MCP tools remain explicitly
-          # denied below and contents:read is the final authority backstop.
+          # API-signing mode skips the action's Git identity setup, but it does
+          # not leave origin alone: from v1.0.187 the action calls
+          # replaceCheckoutCredentials() on this path too. Before Claude starts
+          # it rewrites origin in the workspace .git/config to a token-bearing
+          # URL for this repository and then fetches the base branch through
+          # it. That token is this job's contents:read token. The model has no
+          # shell, file, or network tool here (deny list below), its file-write
+          # MCP tools remain explicitly denied, and the verify steps prove that
+          # origin still addresses only this repository.
           use_commit_signing: true
           prompt: |
             REPO: ${{ github.repository }}
@@ -322,9 +339,13 @@ jobs:
           # Reads go only through the action's GitHub MCP subprocess, which holds
           # the repository token but not the Anthropic key. Local, network,
           # delegation, and GitHub file-write tools stay denied.
-          claude_args: '--model claude-opus-5 --disallowed-tools "Bash,Read,Glob,Grep,LS,Task,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,mcp__github_file_ops__commit_files,mcp__github_file_ops__delete_files,mcp__github__create_or_update_file,mcp__github__push_files,mcp__github__delete_file" --allowed-tools "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_file_contents,mcp__github__search_code,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github__add_issue_comment"'
+          # Review model setting: Opus 5.5 at medium effort. Keep the model and
+          # effort identical in claude.yml; change both together.
+          claude_args: '--model claude-opus-5-5 --effort medium --disallowed-tools "Bash,Read,Glob,Grep,LS,Task,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,mcp__github_file_ops__commit_files,mcp__github_file_ops__delete_files,mcp__github__create_or_update_file,mcp__github__push_files,mcp__github__delete_file" --allowed-tools "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_file_contents,mcp__github__search_code,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github__add_issue_comment"'
 
-      - name: Verify credential-free Claude review origin
+      - name: Verify Claude review origin destination
+        # Never print config values, environment values, or a remote URL in
+        # this step; after the action runs, origin carries a token.
         if: always() && steps.review_origin.outputs.ready == 'true'
         env:
           EXPECTED_ORIGIN: ${{ steps.review_origin.outputs.path }}
@@ -332,14 +353,56 @@ jobs:
         run: |
           set -euo pipefail
 
+          # From v1.0.187 the pinned action rewrites origin to
+          # https://x-access-token:<token>@<server>/<owner>/<repo>.git, so the
+          # exact local pin no longer survives a normal run. The property the
+          # pin bought must still hold: origin, the only remote, addresses only
+          # this repository. Accept the untouched local pin or this
+          # repository's URL (with or without ".git") after stripping userinfo.
+          # Parse the authority explicitly (everything up to the first "/")
+          # and strip through its LAST "@": stripping to the first "@" of the
+          # whole URL would accept
+          # https://evil.example/@github.com/<owner>/<repo>.git. Never print a
+          # remote URL here; it carries the token.
+          origin_destination() {
+            local url="$1" scheme rest authority
+            if [[ "$url" != *://* ]]; then
+              printf '%s' "$url"
+              return
+            fi
+            scheme="${url%%://*}"
+            rest="${url#*://}"
+            authority="${rest%%/*}"
+            printf '%s://%s%s' "$scheme" "${authority##*@}" "${rest#"$authority"}"
+          }
+          origin_addresses_only_this_repository() {
+            local pinned="$1" url destination repository_origin
+            if [[ -z "$pinned" ||
+              ! "${GITHUB_SERVER_URL:-}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ||
+              ! "${GITHUB_REPOSITORY:-}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+              return 1
+            fi
+            repository_origin="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+            for url in "$(git remote get-url --all origin 2>/dev/null)" \
+              "$(git remote get-url --push --all origin 2>/dev/null)"; do
+              if [[ "$url" == "$pinned" ]]; then
+                continue
+              fi
+              destination="$(origin_destination "$url")"
+              if [[ "${destination,,}" != "${repository_origin,,}.git" &&
+                "${destination,,}" != "${repository_origin,,}" ]]; then
+                return 1
+              fi
+            done
+          }
+
           remote_keys="$(git config --local --name-only --get-regexp '^remote\..*\.(url|pushurl)$' || true)"
           if [[ -z "$EXPECTED_ORIGIN" ||
             "$(git remote)" != "origin" ||
             "$remote_keys" != "remote.origin.url" ||
-            "$(git remote get-url --all origin 2>/dev/null)" != "$EXPECTED_ORIGIN" ||
-            "$(git remote get-url --push --all origin 2>/dev/null)" != "$EXPECTED_ORIGIN" ||
-            "$(git config --local --get-all fetch.recurseSubmodules 2>/dev/null)" != "false" ]]; then
-            echo "::error::Claude action changed the credential-free review origin."
+            "$(git config --local --get-all fetch.recurseSubmodules 2>/dev/null)" != "false" ]] ||
+            ! origin_addresses_only_this_repository "$EXPECTED_ORIGIN"; then
+            echo "::error::Claude review origin no longer addresses only this repository."
             exit 1
           fi
 
@@ -405,24 +468,57 @@ jobs:
             echo "::error::Claude terminal verification received invalid pull request metadata."
             exit 1
           fi
+          # Same destination check as the always() step above; see the comment
+          # there. Never print a remote URL.
+          origin_destination() {
+            local url="$1" scheme rest authority
+            if [[ "$url" != *://* ]]; then
+              printf '%s' "$url"
+              return
+            fi
+            scheme="${url%%://*}"
+            rest="${url#*://}"
+            authority="${rest%%/*}"
+            printf '%s://%s%s' "$scheme" "${authority##*@}" "${rest#"$authority"}"
+          }
+          origin_addresses_only_this_repository() {
+            local pinned="$1" url destination repository_origin
+            if [[ -z "$pinned" ||
+              ! "${GITHUB_SERVER_URL:-}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ||
+              ! "${GITHUB_REPOSITORY:-}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+              return 1
+            fi
+            repository_origin="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+            for url in "$(git remote get-url --all origin 2>/dev/null)" \
+              "$(git remote get-url --push --all origin 2>/dev/null)"; do
+              if [[ "$url" == "$pinned" ]]; then
+                continue
+              fi
+              destination="$(origin_destination "$url")"
+              if [[ "${destination,,}" != "${repository_origin,,}.git" &&
+                "${destination,,}" != "${repository_origin,,}" ]]; then
+                return 1
+              fi
+            done
+          }
+
           remote_keys="$(git config --local --name-only --get-regexp '^remote\..*\.(url|pushurl)$' || true)"
           if [[ -z "$LOCAL_ORIGIN" ||
             "$(git remote)" != "origin" ||
             "$remote_keys" != "remote.origin.url" ||
-            "$(git remote get-url --all origin 2>/dev/null)" != "$LOCAL_ORIGIN" ||
-            "$(git remote get-url --push --all origin 2>/dev/null)" != "$LOCAL_ORIGIN" ||
             "$(git config --local --get-all fetch.recurseSubmodules 2>/dev/null)" != "false" ]] ||
+            ! origin_addresses_only_this_repository "$LOCAL_ORIGIN" ||
             git config --local --get-regexp '^http\..*\.extraheader$' >/dev/null 2>&1 ||
             git config --local --get-regexp '^credential(\..*)?\.helper$' >/dev/null 2>&1; then
-            echo "::error::Claude review changed the credential-free repository configuration."
+            echo "::error::Claude review changed the pinned repository configuration."
             exit 1
           fi
           if [[ "$(git --git-dir="$LOCAL_ORIGIN" rev-parse --verify "refs/heads/$EXPECTED_HEAD_REF" 2>/dev/null)" != "$EXPECTED_HEAD_SHA" ||
             "$(git --git-dir="$LOCAL_ORIGIN" rev-parse --verify "refs/heads/$EXPECTED_BASE_REF" 2>/dev/null)" != "$EXPECTED_BASE_SHA" ||
             "$(git rev-parse --verify "refs/heads/$EXPECTED_HEAD_REF" 2>/dev/null)" != "$EXPECTED_HEAD_SHA" ||
             "$(git rev-parse --verify "refs/heads/$EXPECTED_BASE_REF" 2>/dev/null)" != "$EXPECTED_BASE_SHA" ||
-            "$(git rev-parse --verify "refs/remotes/origin/$EXPECTED_HEAD_REF" 2>/dev/null)" != "$EXPECTED_HEAD_SHA" ||
-            "$(git rev-parse --verify "refs/remotes/origin/$EXPECTED_BASE_REF" 2>/dev/null)" != "$EXPECTED_BASE_SHA" ]]; then
+            "$(git rev-parse --verify refs/automatic-review/head 2>/dev/null)" != "$EXPECTED_HEAD_SHA" ||
+            "$(git rev-parse --verify refs/automatic-review/base 2>/dev/null)" != "$EXPECTED_BASE_SHA" ]]; then
             echo "::error::Claude review local origin no longer contains the authorized snapshots."
             exit 1
           fi

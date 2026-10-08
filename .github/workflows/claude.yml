@@ -201,9 +201,9 @@ jobs:
             echo "::error::Claude commands require a currently open pull request."
             exit 1
           fi
-          # SHA-1/SHA-256 shapes and the pinned action's stricter branch grammar
-          # are defined once in the trusted validator library used again after
-          # checkout. The ref grammar rejects leading '+' even though Git itself
+          # SHA-1/SHA-256 shapes and a branch grammar no wider than the pinned
+          # action's are defined once in the trusted validator library used
+          # again after checkout. The ref grammar rejects leading '+' even though Git itself
           # accepts it, because the pinned action's unqualified fetch does not.
           validate_sha "pull request head" "$head_sha"
           validate_sha "pull request base" "$base_sha"
@@ -256,7 +256,8 @@ jobs:
           # PR-authored checkout before the trusted authorization/local-origin
           # steps run. Checkout the trusted default branch with full history;
           # the next step seeds the separately authorized PR head/base objects,
-          # and v1.0.180 performs the first head checkout from that local origin.
+          # and the pinned action performs the first head checkout from that
+          # local origin (tag mode sets up the branch before it rewrites origin).
           # Ordinary issue commands retain their immutable default-branch event
           # snapshot. Depth 0 is also required because a shallow boundary commit
           # cannot seed a new bare origin with receive.shallowUpdate=false.
@@ -317,10 +318,13 @@ jobs:
           validate_sha "Claude head" "$head_sha"
           validate_ref "Claude head" "$head_ref"
           git cat-file -e "$head_sha^{commit}"
-          # v1.0.180 snapshots these paths with recursive symlink
-          # dereferencing before restoring base configuration. Reject every
-          # PR-authored symlink/gitlink leaf before the action can materialize a
-          # runner file such as /proc/self/environ into the workspace.
+          # The action snapshots these paths before restoring base
+          # configuration. v1.0.180 did so with recursive symlink dereferencing;
+          # the pinned v1.0.238 follows only links to tracked in-tree content
+          # and records a placeholder otherwise. Keep rejecting every
+          # PR-authored symlink/gitlink leaf here so that materializing a runner
+          # file such as /proc/self/environ into the workspace never depends on
+          # the action's own filter.
           validate_sensitive_tree "Claude head" "$head_sha"
           push_refspecs=("${head_sha}:refs/heads/${head_ref}")
           default_ref="$head_ref"
@@ -344,9 +348,12 @@ jobs:
 
           # Tag mode performs its own branch fetches before Claude starts. Build
           # a local bare origin containing only the already-authenticated exact
-          # snapshots so those fetches need no repository credential. Missing
-          # objects (for example after a force-push) deliberately fail here
-          # instead of reviewing a mixed snapshot.
+          # snapshots so the head fetch and checkout need no repository
+          # credential and cannot observe a moved branch. Missing objects (for
+          # example after a force-push) deliberately fail here instead of
+          # reviewing a mixed snapshot. From v1.0.187 the action then re-points
+          # origin at this repository on GitHub with its own token, and its
+          # later trusted-base restore fetches the base branch from there.
           local_origin_parent="$(mktemp -d "$RUNNER_TEMP/claude-origin.XXXXXX")"
           local_origin="$local_origin_parent/origin.git"
           object_format="$(git rev-parse --show-object-format)"
@@ -361,16 +368,24 @@ jobs:
 
           # The pinned action checks out these local branches and restores
           # trusted startup files from origin/<base>. Pin both namespaces to the
-          # API/event snapshots; an unqualified fetch updates FETCH_HEAD only.
+          # API/event snapshots before handing over control.
+          # refs/remotes/origin/* belong to the action afterwards: its base
+          # fetch from GitHub may advance origin/<base> if that branch moves
+          # mid-run. refs/claude-command/* are workflow-owned snapshot evidence
+          # that nothing in the action writes; the terminal step compares
+          # those instead.
           git branch -f "$head_ref" "$head_sha"
           git update-ref "refs/remotes/origin/$head_ref" "$head_sha"
+          git update-ref refs/claude-command/head "$head_sha"
           if [[ "$PR_MODE" == "true" ]]; then
             git branch -f "$base_ref" "$base_sha"
             git update-ref "refs/remotes/origin/$base_ref" "$base_sha"
+            git update-ref refs/claude-command/base "$base_sha"
           fi
 
           # CLAUDE.md is a base-branch symlink to AGENTS.md in this repository.
-          # v1.0.180 restores the symlink before CLI startup but not its target.
+          # The pinned action restores the symlink before CLI startup but not
+          # its target.
           # Materialize the target from the authorized base (or the immutable
           # default-branch issue snapshot) and preserve it across tag mode's
           # branch checkout with skip-worktree. This makes startup guidance
@@ -449,12 +464,14 @@ jobs:
             git fetch origin "$head_ref" --depth=1
           fi
 
-          if [[ "$(git rev-parse "refs/remotes/origin/$head_ref")" != "$head_sha" ]]; then
+          if [[ "$(git rev-parse "refs/remotes/origin/$head_ref")" != "$head_sha" ||
+            "$(git rev-parse --verify refs/claude-command/head 2>/dev/null)" != "$head_sha" ]]; then
             echo "::error::Pinned Claude head tracking ref changed during fetch proof."
             exit 1
           fi
           if [[ "$PR_MODE" == "true" ]] &&
-            [[ "$(git rev-parse "refs/remotes/origin/$base_ref")" != "$base_sha" ]]; then
+            [[ "$(git rev-parse "refs/remotes/origin/$base_ref")" != "$base_sha" ||
+              "$(git rev-parse --verify refs/claude-command/base 2>/dev/null)" != "$base_sha" ]]; then
             echo "::error::Pinned Claude base tracking ref changed during fetch proof."
             exit 1
           fi
@@ -527,17 +544,24 @@ jobs:
           steps.checkout.outcome == 'success' &&
           steps.local_origin.outputs.ready == 'true' &&
           steps.current_target.outputs.ready == 'true'
-        # v1.0.180 includes upstream #1496, so provider/SDK failures cannot
-        # make a review command or `/simplify` wrapper appear successful.
-        uses: anthropics/claude-code-action@fa7e2f0a29a126f0b81cdcf360561b36e44cf608 # v1.0.180
+        # The pinned action includes upstream #1496 (first shipped in
+        # v1.0.180), so provider/SDK failures cannot make a review command or
+        # `/simplify` wrapper appear successful.
+        uses: anthropics/claude-code-action@12dd8d74c712f5f3669365b2369b558c495b1104 # v1.0.238
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
           exclude_comments_by_actor: 'github-actions[bot]'
-          # At the exact action pin, API commit signing skips configureGitAuth,
-          # which would otherwise replace the proven local origin with an HTTPS
-          # URL embedding the reply-capable token before Claude starts. Review
-          # commands never commit, and contents:read is the final write backstop.
+          # API commit signing skips the action's Git identity setup, but it
+          # does not leave origin alone: from v1.0.187 the action calls
+          # replaceCheckoutCredentials() on this path too. After its head
+          # checkout from the local origin and before Claude starts, it
+          # rewrites origin in the workspace .git/config to an HTTPS URL for
+          # this repository embedding the reply-capable token, then fetches the
+          # base branch through it. The model has no shell, file, or network
+          # tool here (deny list below), review commands never commit,
+          # contents:read is the final write backstop, and the verify step
+          # proves origin still addresses only this repository.
           use_commit_signing: true
           # Commands are review-only. GitHub reads and inline feedback use the
           # pinned action's MCP containers, which receive the repository token
@@ -550,18 +574,23 @@ jobs:
           # API signing makes the action provision file-write MCP tools; deny
           # those explicitly too. On every pin change, re-derive the complete
           # injected write-tool set from tag mode and re-audit the action's
-          # local-origin/configureGitAuth behavior; do not append by guesswork.
+          # origin/replaceCheckoutCredentials behavior; do not append by
+          # guesswork. (Re-derived at v1.0.238: unchanged from v1.0.180.)
+          # Model setting: Opus 5.5 at medium effort. Keep the model and effort
+          # identical in claude-code-review.yml; change both together.
           claude_args: >-
-            --model claude-opus-5
+            --model claude-opus-5-5
+            --effort medium
             --disallowed-tools "Bash,Read,Glob,Grep,LS,Task,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,mcp__github_file_ops__commit_files,mcp__github_file_ops__delete_files,mcp__github__create_or_update_file,mcp__github__push_files,mcp__github__delete_file"
             --allowed-tools "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_file_contents,mcp__github__search_code,mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__search_issues,mcp__github__search_pull_requests,mcp__github__list_issues,mcp__github__list_pull_requests,mcp__github_inline_comment__create_inline_comment"
 
-      - name: Verify credential-free Claude origin
+      - name: Verify Claude origin destination
         # This postcondition is intentionally always() checked after the action:
-        # a future pin that rewrites origin or restores a checkout credential
-        # must make the command job non-terminal instead of passing unnoticed.
-        # Never print config values, environment values, or an unexpected URL;
-        # any of them could contain a credential.
+        # a pin that points origin anywhere but this repository, adds a remote,
+        # or restores a checkout credential must make the command job
+        # non-terminal instead of passing unnoticed.
+        # Never print config values, environment values, or a remote URL; after
+        # the action runs, origin carries a token.
         if: always() && steps.local_origin.outputs.ready == 'true'
         env:
           EXPECTED_ORIGIN: ${{ steps.local_origin.outputs.path }}
@@ -569,13 +598,55 @@ jobs:
         run: |
           set -euo pipefail
 
+          # From v1.0.187 the pinned action rewrites origin to
+          # https://x-access-token:<token>@<server>/<owner>/<repo>.git, so the
+          # exact local pin no longer survives a normal run. The property the
+          # pin bought must still hold: origin, the only remote, addresses only
+          # this repository. Accept the untouched local pin or this
+          # repository's URL (with or without ".git") after stripping userinfo.
+          # Parse the authority explicitly (everything up to the first "/")
+          # and strip through its LAST "@": stripping to the first "@" of the
+          # whole URL would accept
+          # https://evil.example/@github.com/<owner>/<repo>.git. Never print a
+          # remote URL here; it carries the token.
+          origin_destination() {
+            local url="$1" scheme rest authority
+            if [[ "$url" != *://* ]]; then
+              printf '%s' "$url"
+              return
+            fi
+            scheme="${url%%://*}"
+            rest="${url#*://}"
+            authority="${rest%%/*}"
+            printf '%s://%s%s' "$scheme" "${authority##*@}" "${rest#"$authority"}"
+          }
+          origin_addresses_only_this_repository() {
+            local pinned="$1" url destination repository_origin
+            if [[ -z "$pinned" ||
+              ! "${GITHUB_SERVER_URL:-}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ||
+              ! "${GITHUB_REPOSITORY:-}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+              return 1
+            fi
+            repository_origin="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+            for url in "$(git remote get-url --all origin 2>/dev/null)" \
+              "$(git remote get-url --push --all origin 2>/dev/null)"; do
+              if [[ "$url" == "$pinned" ]]; then
+                continue
+              fi
+              destination="$(origin_destination "$url")"
+              if [[ "${destination,,}" != "${repository_origin,,}.git" &&
+                "${destination,,}" != "${repository_origin,,}" ]]; then
+                return 1
+              fi
+            done
+          }
+
           remote_keys="$(git config --local --name-only --get-regexp '^remote\..*\.(url|pushurl)$' || true)"
           if [[ -z "$EXPECTED_ORIGIN" ||
             "$(git remote)" != "origin" ||
-            "$remote_keys" != "remote.origin.url" ||
-            "$(git remote get-url --all origin 2>/dev/null)" != "$EXPECTED_ORIGIN" ||
-            "$(git remote get-url --push --all origin 2>/dev/null)" != "$EXPECTED_ORIGIN" ]]; then
-            echo "::error::Claude action changed the credential-free local origin."
+            "$remote_keys" != "remote.origin.url" ]] ||
+            ! origin_addresses_only_this_repository "$EXPECTED_ORIGIN"; then
+            echo "::error::Claude origin no longer addresses only this repository."
             exit 1
           fi
 
@@ -666,7 +737,7 @@ jobs:
           fi
           if [[ "$(git --git-dir="$LOCAL_ORIGIN" rev-parse --verify "refs/heads/$EXPECTED_HEAD_REF" 2>/dev/null)" != "$EXPECTED_HEAD_SHA" ||
             "$(git rev-parse --verify "refs/heads/$EXPECTED_HEAD_REF" 2>/dev/null)" != "$EXPECTED_HEAD_SHA" ||
-            "$(git rev-parse --verify "refs/remotes/origin/$EXPECTED_HEAD_REF" 2>/dev/null)" != "$EXPECTED_HEAD_SHA" ]]; then
+            "$(git rev-parse --verify refs/claude-command/head 2>/dev/null)" != "$EXPECTED_HEAD_SHA" ]]; then
             echo "::error::Claude local origin no longer contains the authorized head."
             exit 1
           fi
@@ -685,7 +756,7 @@ jobs:
               ! validate_ref "$TRUSTED_DEFAULT_REF" ||
               [[ "$(git --git-dir="$LOCAL_ORIGIN" rev-parse --verify "refs/heads/$EXPECTED_BASE_REF" 2>/dev/null)" != "$EXPECTED_BASE_SHA" ||
                 "$(git rev-parse --verify "refs/heads/$EXPECTED_BASE_REF" 2>/dev/null)" != "$EXPECTED_BASE_SHA" ||
-                "$(git rev-parse --verify "refs/remotes/origin/$EXPECTED_BASE_REF" 2>/dev/null)" != "$EXPECTED_BASE_SHA" ]]; then
+                "$(git rev-parse --verify refs/claude-command/base 2>/dev/null)" != "$EXPECTED_BASE_SHA" ]]; then
               echo "::error::Claude terminal verification received invalid base metadata."
               exit 1
             fi
