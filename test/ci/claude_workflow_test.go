@@ -17,9 +17,14 @@ import (
 )
 
 const (
-	claudeAction  = "anthropics/claude-code-action@fa7e2f0a29a126f0b81cdcf360561b36e44cf608"
-	claudeModel   = "claude-opus-5"
+	claudeAction  = "anthropics/claude-code-action@12dd8d74c712f5f3669365b2369b558c495b1104"
+	claudeModel   = "claude-opus-5-5"
+	claudeEffort  = "medium"
 	helperPattern = `^credential(\..*)?\.helper$`
+
+	// From v1.0.187 the pinned action rewrites origin to this shape before
+	// Claude starts. The value is a fixture, not a credential.
+	actionOriginURL = "https://x-access-token:fixture-token@github.com/layervai/frp.git"
 )
 
 type trigger struct {
@@ -104,6 +109,15 @@ func modelFromArgs(t *testing.T, args string) string {
 	matches := regexp.MustCompile(`(?:^|\s)--model\s+([^\s]+)`).FindAllStringSubmatch(args, -1)
 	if len(matches) != 1 || len(matches[0]) != 2 {
 		t.Fatalf("model argument occurrence count = %d, want 1", len(matches))
+	}
+	return matches[0][1]
+}
+
+func effortFromArgs(t *testing.T, args string) string {
+	t.Helper()
+	matches := regexp.MustCompile(`(?:^|\s)--effort(?:\s+|=)([^\s]+)`).FindAllStringSubmatch(args, -1)
+	if len(matches) != 1 || len(matches[0]) != 2 {
+		t.Fatalf("effort argument occurrence count = %d, want 1", len(matches))
 	}
 	return matches[0][1]
 }
@@ -224,6 +238,8 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 		`git init --bare --quiet --object-format="$object_format" "$local_origin"`,
 		`git config --local fetch.recurseSubmodules false`,
 		`git checkout --quiet --detach`,
+		`git update-ref refs/claude-command/head "$head_sha"`,
+		`git update-ref refs/claude-command/base "$base_sha"`,
 		`trusted_guidance_sha="$base_sha"`,
 		`git update-index --skip-worktree AGENTS.md`,
 		`echo "path=$local_origin"`,
@@ -248,7 +264,7 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 	}
 	requireFragments(t, commandAction.If, `steps.current_target.outputs.ready == 'true'`)
 	if got, ok := commandAction.With["use_commit_signing"].(bool); !ok || !got {
-		t.Fatal("interactive action must skip Git credential installation")
+		t.Fatal("interactive action must use API commit signing")
 	}
 	if got := commandAction.With["exclude_comments_by_actor"]; got != "github-actions[bot]" {
 		t.Fatalf("interactive actor exclusion = %#v", got)
@@ -260,12 +276,14 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 	}
 	commandArgs := stringInput(t, commandAction, "claude_args")
 
-	credentialPostcondition := namedStep(t, command, "Verify credential-free Claude origin")
+	credentialPostcondition := namedStep(t, command, "Verify Claude origin destination")
 	if credentialPostcondition.If != "always() && steps.local_origin.outputs.ready == 'true'" {
 		t.Fatalf("credential postcondition if = %q", credentialPostcondition.If)
 	}
 	requireFragments(t, credentialPostcondition.Run,
 		`git remote get-url --all origin`, `git remote get-url --push --all origin`,
+		`"$(git remote)" != "origin"`, `"$remote_keys" != "remote.origin.url"`,
+		`! origin_addresses_only_this_repository "$EXPECTED_ORIGIN"`,
 		`fetch.recurseSubmodules`, `credential_config_pattern=`, `--local --global --system`,
 		`git hash-object AGENTS.md`, `git hash-object CLAUDE.md`, `S AGENTS.md`)
 	commandTerminal := namedStep(t, command, "Verify terminal Claude result")
@@ -275,7 +293,8 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 		`gh api graphql`, `defaultBranchRef{name target{... on Commit{oid}}}`,
 		`git --git-dir="$LOCAL_ORIGIN" rev-parse --verify "refs/heads/$EXPECTED_HEAD_REF"`,
 		`git rev-parse --verify "refs/heads/$EXPECTED_HEAD_REF"`,
-		`git rev-parse --verify "refs/remotes/origin/$EXPECTED_HEAD_REF"`,
+		`"$(git rev-parse --verify refs/claude-command/head 2>/dev/null)" != "$EXPECTED_HEAD_SHA"`,
+		`"$(git rev-parse --verify refs/claude-command/base 2>/dev/null)" != "$EXPECTED_BASE_SHA"`,
 		`"$current_state" != "open"`, `"$current_default_branch" != "$TRUSTED_DEFAULT_REF"`,
 		`"$current_head_ref" == "$current_default_branch"`,
 		`"$current_head" != "$EXPECTED_HEAD_SHA"`, `"$current_base" != "$EXPECTED_BASE_SHA"`)
@@ -320,6 +339,8 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 		`^[A-Za-z0-9@_][A-Za-z0-9/_.#+,@-]*$`,
 		`[[ "$1" != "@" ]]`,
 		`git checkout --quiet --detach "$trusted_start_sha"`,
+		`git update-ref refs/automatic-review/head "$EXPECTED_HEAD_SHA"`,
+		`git update-ref refs/automatic-review/base "$EXPECTED_BASE_SHA"`,
 		`git config --local fetch.recurseSubmodules false`,
 		`git update-index --skip-worktree AGENTS.md`,
 		`echo "path=$local_origin"`,
@@ -339,7 +360,7 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 	}
 	requireFragments(t, reviewAction.If, `steps.current_target.outputs.ready == 'true'`)
 	if got, ok := reviewAction.With["use_commit_signing"].(bool); !ok || !got {
-		t.Fatal("automatic action must skip Git credential installation")
+		t.Fatal("automatic action must use API commit signing")
 	}
 	if _, ok := reviewAction.With["exclude_comments_by_actor"]; ok {
 		t.Fatal("automatic agent mode must not carry ignored tag-mode actor exclusions")
@@ -383,6 +404,9 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 	if got := []string{modelFromArgs(t, commandArgs), modelFromArgs(t, reviewArgs)}; !reflect.DeepEqual(got, []string{claudeModel, claudeModel}) {
 		t.Fatalf("Claude models are not locked: %v", got)
 	}
+	if got := []string{effortFromArgs(t, commandArgs), effortFromArgs(t, reviewArgs)}; !reflect.DeepEqual(got, []string{claudeEffort, claudeEffort}) {
+		t.Fatalf("Claude effort levels are not locked: %v", got)
+	}
 	var claudeInvocations []step
 	for _, candidate := range []workflow{interactive, automatic} {
 		for _, candidateJob := range candidate.Jobs {
@@ -397,8 +421,9 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 		t.Fatalf("Claude action invocation count = %d, want 2", len(claudeInvocations))
 	}
 	for _, invocation := range claudeInvocations {
-		if invocation.Uses != claudeAction || modelFromArgs(t, stringInput(t, invocation, "claude_args")) != claudeModel {
-			t.Fatalf("Claude action/model drift in %q", invocation.Name)
+		args := stringInput(t, invocation, "claude_args")
+		if invocation.Uses != claudeAction || modelFromArgs(t, args) != claudeModel || effortFromArgs(t, args) != claudeEffort {
+			t.Fatalf("Claude action/model/effort drift in %q", invocation.Name)
 		}
 	}
 	reviewTerminal := namedStep(t, review, "Verify terminal Claude review")
@@ -408,9 +433,12 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 	requireFragments(t, reviewTerminal.Run,
 		`-z "$EXECUTION_FILE"`, `! -f "$EXECUTION_FILE"`, `! -s "$EXECUTION_FILE"`,
 		`git remote get-url --all origin`, `git remote get-url --push --all origin`, helperGuard,
+		`"$(git remote)" != "origin"`, `"$remote_keys" != "remote.origin.url"`,
+		`! origin_addresses_only_this_repository "$LOCAL_ORIGIN"`,
 		`"$local_head" != "$TRUSTED_START_SHA"`,
 		`git rev-parse --verify "refs/heads/$EXPECTED_HEAD_REF"`,
-		`git rev-parse --verify "refs/remotes/origin/$EXPECTED_HEAD_REF"`,
+		`"$(git rev-parse --verify refs/automatic-review/head 2>/dev/null)" != "$EXPECTED_HEAD_SHA"`,
+		`"$(git rev-parse --verify refs/automatic-review/base 2>/dev/null)" != "$EXPECTED_BASE_SHA"`,
 		`git hash-object AGENTS.md`, `git hash-object CLAUDE.md`,
 		`"$current_state" != "open"`, `"$current_default_branch" != "$TRUSTED_DEFAULT_REF"`,
 		`"$current_head_ref" == "$current_default_branch"`,
@@ -418,11 +446,47 @@ func TestClaudeWorkflowContracts(t *testing.T) {
 		`timeout 30s gh api --paginate`, `github-actions[bot]`, `endswith("\n" + $marker)`,
 		`sub("[\\r\\n]+$"; "")`, `indices($marker)`, `rtrimstr($marker)`,
 		`test("[^[:space:]]")`, `length) == 1`)
-	reviewCredentialPostcondition := namedStep(t, review, "Verify credential-free Claude review origin")
+	reviewCredentialPostcondition := namedStep(t, review, "Verify Claude review origin destination")
 	if reviewCredentialPostcondition.If != "always() && steps.review_origin.outputs.ready == 'true'" {
 		t.Fatalf("automatic credential postcondition if = %q", reviewCredentialPostcondition.If)
 	}
+	// From v1.0.187 the action owns refs/remotes/origin/* and the origin URL.
+	// A post-action step that pins either one fails closed on every run.
+	for name, run := range map[string]string{
+		"interactive origin":   credentialPostcondition.Run,
+		"interactive terminal": commandTerminal.Run,
+		"automatic origin":     reviewCredentialPostcondition.Run,
+		"automatic terminal":   reviewTerminal.Run,
+	} {
+		for _, stale := range []string{
+			"refs/remotes/origin/",
+			`origin 2>/dev/null)" != "$EXPECTED_ORIGIN"`,
+			`origin 2>/dev/null)" != "$LOCAL_ORIGIN"`,
+		} {
+			if strings.Contains(run, stale) {
+				t.Errorf("%s step still asserts action-owned origin state: %s", name, stale)
+			}
+		}
+	}
+	for name, run := range map[string]string{
+		"interactive origin": credentialPostcondition.Run,
+		"automatic origin":   reviewCredentialPostcondition.Run,
+		"automatic terminal": reviewTerminal.Run,
+	} {
+		for _, fragment := range []string{
+			`authority="${rest%%/*}"`, `"${authority##*@}"`,
+			`^https://[A-Za-z0-9.-]+(:[0-9]+)?$`,
+			`"${destination,,}" != "${repository_origin,,}.git"`,
+			`"${destination,,}" != "${repository_origin,,}"`,
+		} {
+			if !strings.Contains(run, fragment) {
+				t.Errorf("%s step is missing destination check fragment %q", name, fragment)
+			}
+		}
+	}
 	requireFragments(t, reviewCredentialPostcondition.Run,
+		`"$(git remote)" != "origin"`, `"$remote_keys" != "remote.origin.url"`,
+		`! origin_addresses_only_this_repository "$EXPECTED_ORIGIN"`,
 		`credential_config_pattern=`, `--local --global --system`,
 		`git hash-object AGENTS.md`, `git hash-object CLAUDE.md`)
 	requireFragments(t, stringInput(t, reviewAction, "prompt"),
@@ -773,6 +837,100 @@ func simulatePinnedPRCheckout(t *testing.T, fixture reviewFixture, origin string
 	if got := gitOutput(t, fixture.workspace, "remote", "get-url", "origin"); got != origin {
 		t.Fatalf("origin = %q, want %q", got, origin)
 	}
+	simulateActionOriginRewrite(t, fixture)
+}
+
+// simulateActionOriginRewrite models what the pinned action leaves behind on
+// the API-signing path: origin re-pointed at this repository on GitHub with a
+// token in the URL, and origin/<base> advanced by the action's own base fetch
+// because the base branch moved mid-run. The real action rewrites origin
+// before that fetch; the order is swapped by the callers so no test touches
+// the network.
+func simulateActionOriginRewrite(t *testing.T, fixture reviewFixture) {
+	t.Helper()
+	gitOutput(t, fixture.workspace, "remote", "set-url", "origin", actionOriginURL)
+	gitOutput(t, fixture.workspace, "update-ref", "refs/remotes/origin/main", fixture.headSHA)
+}
+
+// requireOriginDestinationContract drives one post-action verify script over
+// every origin shape that matters. It leaves origin at actionOriginURL.
+func requireOriginDestinationContract(
+	t *testing.T, fixture reviewFixture, localPin, script string, values map[string]string, home string,
+) {
+	t.Helper()
+	run := func(t *testing.T, overrides map[string]string, wantSuccess bool) {
+		t.Helper()
+		merged := make(map[string]string, len(values)+len(overrides))
+		maps.Copy(merged, values)
+		maps.Copy(merged, overrides)
+		requireScriptResult(t, fixture.workspace, script, cleanEnvironment(t, home, merged), wantSuccess)
+	}
+	cases := []struct {
+		name   string
+		origin string
+		want   bool
+	}{
+		{"local-pin", localPin, true},
+		{"token-url-with-git-suffix", actionOriginURL, true},
+		{"token-url-without-git-suffix", strings.TrimSuffix(actionOriginURL, ".git"), true},
+		{"plain-url", "https://github.com/layervai/frp.git", true},
+		{"case-folded", "https://x-access-token:fixture-token@GitHub.com/LayerVAI/FRP.git", true},
+		{"other-host", "https://x-access-token:fixture-token@evil.example/layervai/frp.git", false},
+		{"other-owner", "https://x-access-token:fixture-token@github.com/attacker/frp.git", false},
+		{"other-repository", "https://x-access-token:fixture-token@github.com/layervai/frp_other.git", false},
+		{"repository-prefix", "https://x-access-token:fixture-token@github.com/layervai/frp.git.evil", false},
+		{"extra-path", "https://x-access-token:fixture-token@github.com/layervai/frp.git/extra", false},
+		{"userinfo-lookalike-path", "https://evil.example/@github.com/layervai/frp.git", false},
+		{"userinfo-lookalike-host", "https://github.com@evil.example/layervai/frp.git", false},
+		{"userinfo-lookalike-double-at", "https://github.com/layervai/frp.git@evil.example/layervai/frp.git", false},
+		{"other-port", "https://x-access-token:fixture-token@github.com:8443/layervai/frp.git", false},
+		{"other-scheme", "http://x-access-token:fixture-token@github.com/layervai/frp.git", false},
+		{"scp-style", "git@github.com:layervai/frp.git", false},
+		{"other-local-path", filepath.Join(t.TempDir(), "origin.git"), false},
+	}
+	for _, tc := range cases {
+		t.Run("origin-"+tc.name, func(t *testing.T) {
+			gitOutput(t, fixture.workspace, "remote", "set-url", "origin", tc.origin)
+			run(t, nil, tc.want)
+		})
+	}
+	gitOutput(t, fixture.workspace, "remote", "set-url", "origin", actionOriginURL)
+
+	t.Run("origin-extra-remote", func(t *testing.T) {
+		gitOutput(t, fixture.workspace, "remote", "add", "exfil", actionOriginURL)
+		run(t, nil, false)
+		gitOutput(t, fixture.workspace, "remote", "remove", "exfil")
+		run(t, nil, true)
+	})
+	t.Run("origin-extra-remote-without-url", func(t *testing.T) {
+		gitOutput(t, fixture.workspace, "config", "--local", "remote.exfil.fetch", "+refs/heads/*:refs/remotes/exfil/*")
+		run(t, nil, false)
+		gitOutput(t, fixture.workspace, "config", "--local", "--remove-section", "remote.exfil")
+		run(t, nil, true)
+	})
+	t.Run("origin-foreign-push-url", func(t *testing.T) {
+		gitOutput(t, fixture.workspace, "remote", "set-url", "--push", "origin", "https://evil.example/layervai/frp.git")
+		run(t, nil, false)
+		gitOutput(t, fixture.workspace, "config", "--unset-all", "remote.origin.pushurl")
+		run(t, nil, true)
+	})
+	t.Run("origin-second-fetch-url", func(t *testing.T) {
+		gitOutput(t, fixture.workspace, "remote", "set-url", "--add", "origin", "https://evil.example/layervai/frp.git")
+		run(t, nil, false)
+		gitOutput(t, fixture.workspace, "remote", "set-url", "--delete", "origin", "^https://evil")
+		run(t, nil, true)
+	})
+	for name, overrides := range map[string]map[string]string{
+		"missing-server-url":   {"GITHUB_SERVER_URL": ""},
+		"malformed-server-url": {"GITHUB_SERVER_URL": "https://github.com/"},
+		"other-server-url":     {"GITHUB_SERVER_URL": "https://evil.example"},
+		"missing-repository":   {"GITHUB_REPOSITORY": ""},
+		"other-repository":     {"GITHUB_REPOSITORY": "attacker/frp"},
+	} {
+		t.Run("origin-env-"+name, func(t *testing.T) {
+			run(t, overrides, false)
+		})
+	}
 }
 
 func TestInteractiveClaudeOriginRejectsDefaultBranchDriftBeforeGitWork(t *testing.T) {
@@ -932,7 +1090,8 @@ func TestInteractiveClaudeRuntimeContracts(t *testing.T) {
 	common := map[string]string{
 		"PATH":              bin + string(os.PathListSeparator) + os.Getenv("PATH"),
 		"GITHUB_REPOSITORY": "layervai/frp", "GITHUB_WORKSPACE": fixture.workspace,
-		"EXPECTED_ORIGIN": outputs["path"], "LOCAL_ORIGIN": outputs["path"],
+		"GITHUB_SERVER_URL": "https://github.com",
+		"EXPECTED_ORIGIN":   outputs["path"], "LOCAL_ORIGIN": outputs["path"],
 		"TRUSTED_GUIDANCE_OID": outputs["trusted_guidance_oid"],
 		"PR_MODE":              "true", "PR_NUMBER": "11", "EXPECTED_HEAD_SHA": fixture.headSHA,
 		"EXPECTED_HEAD_REF": fixture.headRef, "EXPECTED_BASE_SHA": fixture.baseSHA,
@@ -941,7 +1100,9 @@ func TestInteractiveClaudeRuntimeContracts(t *testing.T) {
 		"MOCK_BASE_SHA": fixture.baseSHA, "MOCK_BASE_REF": "main",
 	}
 	postEnv := cleanEnvironment(t, home, common)
-	requireScriptResult(t, fixture.workspace, namedStep(t, job, "Verify credential-free Claude origin").Run, postEnv, true)
+	originCheck := namedStep(t, job, "Verify Claude origin destination").Run
+	requireScriptResult(t, fixture.workspace, originCheck, postEnv, true)
+	requireOriginDestinationContract(t, fixture, outputs["path"], originCheck, common, home)
 	terminalValues := make(map[string]string, len(common)+1)
 	maps.Copy(terminalValues, common)
 	terminalValues["GH_TOKEN"] = "test-token"
@@ -961,15 +1122,32 @@ func TestInteractiveClaudeRuntimeContracts(t *testing.T) {
 	}
 
 	gitOutput(t, fixture.workspace, "remote", "set-url", "--add", "--push", "origin", "https://example.invalid/credential")
-	requireScriptResult(t, fixture.workspace, namedStep(t, job, "Verify credential-free Claude origin").Run, postEnv, false)
+	requireScriptResult(t, fixture.workspace, originCheck, postEnv, false)
 	gitOutput(t, fixture.workspace, "config", "--unset-all", "remote.origin.pushurl")
+	requireScriptResult(t, fixture.workspace, originCheck, postEnv, true)
+	// The action-owned tracking refs may move; the workflow-owned snapshot
+	// refs and the local branches may not.
 	gitOutput(t, fixture.workspace, "update-ref", "refs/remotes/origin/"+fixture.headRef, fixture.baseSHA)
-	requireScriptResult(t, fixture.workspace, terminal, terminalEnv, false)
-	gitOutput(t, fixture.workspace, "update-ref", "refs/remotes/origin/"+fixture.headRef, fixture.headSHA)
+	requireScriptResult(t, fixture.workspace, terminal, terminalEnv, true)
+	for ref, want := range map[string]string{
+		"refs/claude-command/head": fixture.headSHA,
+		"refs/claude-command/base": fixture.baseSHA,
+	} {
+		tampered := fixture.baseSHA
+		if want == fixture.baseSHA {
+			tampered = fixture.headSHA
+		}
+		gitOutput(t, fixture.workspace, "update-ref", ref, tampered)
+		requireScriptResult(t, fixture.workspace, terminal, terminalEnv, false)
+		gitOutput(t, fixture.workspace, "update-ref", "-d", ref)
+		requireScriptResult(t, fixture.workspace, terminal, terminalEnv, false)
+		gitOutput(t, fixture.workspace, "update-ref", ref, want)
+		requireScriptResult(t, fixture.workspace, terminal, terminalEnv, true)
+	}
 	if err := os.WriteFile(filepath.Join(fixture.workspace, "AGENTS.md"), []byte("tampered\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	requireScriptResult(t, fixture.workspace, namedStep(t, job, "Verify credential-free Claude origin").Run, postEnv, false)
+	requireScriptResult(t, fixture.workspace, originCheck, postEnv, false)
 }
 
 func TestAutomaticClaudeRuntimeContracts(t *testing.T) {
@@ -1015,6 +1193,7 @@ func TestAutomaticClaudeRuntimeContracts(t *testing.T) {
 	gitOutput(t, fixture.workspace, "fetch", "origin", "main", "--depth=1", "--no-recurse-submodules")
 	gitOutput(t, fixture.workspace, "checkout", "origin/main", "--", "CLAUDE.md")
 	gitOutput(t, fixture.workspace, "reset", "--", "CLAUDE.md")
+	simulateActionOriginRewrite(t, fixture)
 
 	bin := writeMockGH(t, filepath.Join(runnerTemp, "bin"))
 	executionFile := filepath.Join(runnerTemp, "execution.json")
@@ -1024,7 +1203,8 @@ func TestAutomaticClaudeRuntimeContracts(t *testing.T) {
 	common := map[string]string{
 		"PATH":              bin + string(os.PathListSeparator) + os.Getenv("PATH"),
 		"GITHUB_REPOSITORY": "layervai/frp", "GITHUB_WORKSPACE": fixture.workspace,
-		"EXPECTED_ORIGIN": outputs["path"], "LOCAL_ORIGIN": outputs["path"],
+		"GITHUB_SERVER_URL": "https://github.com",
+		"EXPECTED_ORIGIN":   outputs["path"], "LOCAL_ORIGIN": outputs["path"],
 		"TRUSTED_GUIDANCE_OID": outputs["trusted_guidance_oid"],
 		"TRUSTED_START_SHA":    outputs["trusted_start_sha"],
 		"PR_NUMBER":            "11", "EXPECTED_HEAD_SHA": fixture.headSHA, "EXPECTED_HEAD_REF": fixture.headRef,
@@ -1036,13 +1216,33 @@ func TestAutomaticClaudeRuntimeContracts(t *testing.T) {
 		"MOCK_BASE_SHA": fixture.baseSHA, "MOCK_BASE_REF": "main",
 	}
 	postEnv := cleanEnvironment(t, home, common)
-	requireScriptResult(t, fixture.workspace, namedStep(t, job, "Verify credential-free Claude review origin").Run, postEnv, true)
+	originCheck := namedStep(t, job, "Verify Claude review origin destination").Run
+	requireScriptResult(t, fixture.workspace, originCheck, postEnv, true)
+	requireOriginDestinationContract(t, fixture, outputs["path"], originCheck, common, home)
 	terminalValues := make(map[string]string, len(common)+1)
 	maps.Copy(terminalValues, common)
 	terminalValues["GH_TOKEN"] = "test-token"
 	terminalEnv := cleanEnvironment(t, home, terminalValues)
 	terminal := namedStep(t, job, "Verify terminal Claude review").Run
 	requireScriptResult(t, fixture.workspace, terminal, terminalEnv, true)
+	t.Run("terminal", func(t *testing.T) {
+		requireOriginDestinationContract(t, fixture, outputs["path"], terminal, terminalValues, home)
+	})
+	for ref, want := range map[string]string{
+		"refs/automatic-review/head": fixture.headSHA,
+		"refs/automatic-review/base": fixture.baseSHA,
+	} {
+		tampered := fixture.baseSHA
+		if want == fixture.baseSHA {
+			tampered = fixture.headSHA
+		}
+		gitOutput(t, fixture.workspace, "update-ref", ref, tampered)
+		requireScriptResult(t, fixture.workspace, terminal, terminalEnv, false)
+		gitOutput(t, fixture.workspace, "update-ref", "-d", ref)
+		requireScriptResult(t, fixture.workspace, terminal, terminalEnv, false)
+		gitOutput(t, fixture.workspace, "update-ref", ref, want)
+		requireScriptResult(t, fixture.workspace, terminal, terminalEnv, true)
+	}
 	for name, overrides := range map[string]map[string]string{
 		"closed":       {"MOCK_PR_STATE": "closed"},
 		"default-head": {"MOCK_HEAD_REF": "main"},
@@ -1069,8 +1269,9 @@ func TestAutomaticClaudeRuntimeContracts(t *testing.T) {
 	requireScriptResult(t, fixture.workspace, terminal, terminalEnv, false)
 	gitOutput(t, fixture.workspace, "branch", "-f", fixture.headRef, fixture.headSHA)
 	gitOutput(t, fixture.workspace, "remote", "set-url", "--add", "origin", "https://example.invalid/credential")
-	requireScriptResult(t, fixture.workspace, namedStep(t, job, "Verify credential-free Claude review origin").Run, postEnv, false)
+	requireScriptResult(t, fixture.workspace, originCheck, postEnv, false)
 	gitOutput(t, fixture.workspace, "remote", "set-url", "--delete", "origin", "https://example.invalid/credential")
+	requireScriptResult(t, fixture.workspace, originCheck, postEnv, true)
 	if err := os.WriteFile(executionFile, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
