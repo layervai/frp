@@ -51,6 +51,9 @@ linters:
     modernize:
       disable:
       - omitzero
+      # Go 1.26 allows new(expr); keep the existing pointer helpers for now so
+      # the toolchain bump stays separate from a mechanical rewrite.
+      - newexpr
     unparam:
       check-exported: false
   exclusions:
