@@ -150,11 +150,15 @@ func (c *defaultConnectorImpl) Open() error {
 	if err != nil {
 		return err
 	}
+	local, remote := conn.LocalAddr(), conn.RemoteAddr()
+	conn = &transportErrorConn{Conn: conn, report: func(operation string, err error) {
+		xl.Warnf("TCP multiplexer transport %s failed (%s -> %s): %v", operation, local, remote, err)
+	}}
 
 	fmuxCfg := fmux.DefaultConfig()
 	fmuxCfg.KeepAliveInterval = time.Duration(c.cfg.Transport.TCPMuxKeepaliveInterval) * time.Second
-	// Use trace level for yamux logs
-	fmuxCfg.LogOutput = xlog.NewTraceWriter(xl)
+	// Keepalive failures close every stream and must survive normal log levels.
+	fmuxCfg.LogOutput = muxFailureWriter{logger: xl}
 	fmuxCfg.MaxStreamWindowSize = 6 * 1024 * 1024
 	session, err := fmux.Client(conn, fmuxCfg)
 	if err != nil {
