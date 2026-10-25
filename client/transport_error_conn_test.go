@@ -1,4 +1,4 @@
-// Copyright 2023 The frp Authors
+// Copyright 2026 The frp Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -169,7 +169,7 @@ func TestDroppedMuxKeepaliveReplyIsLoggedAtWarn(t *testing.T) {
 	clientConfig := fmux.DefaultConfig()
 	clientConfig.KeepAliveInterval = 10 * time.Millisecond
 	clientConfig.ConnectionWriteTimeout = 30 * time.Millisecond
-	clientConfig.LogOutput = xlog.NewWarnWriter(xlog.New())
+	clientConfig.LogOutput = muxFailureWriter{logger: xlog.New()}
 	observed := &transportErrorConn{Conn: a, report: func(operation string, err error) {
 		t.Errorf("multiplexer local close reported as transport %s failure: %v", operation, err)
 	}}
@@ -187,5 +187,32 @@ func TestDroppedMuxKeepaliveReplyIsLoggedAtWarn(t *testing.T) {
 	case <-client.CloseChan():
 	case <-time.After(3 * time.Second):
 		t.Fatal("failed keepalive did not close the session")
+	}
+}
+
+func TestMuxFailureWriterKeepsStreamMessagesQuiet(t *testing.T) {
+	var output bytes.Buffer
+	oldLogger := frplog.Logger
+	frplog.Logger = log.New(log.WithLevel(log.WarnLevel), log.WithOutput(&output))
+	defer func() { frplog.Logger = oldLogger }()
+	writer := muxFailureWriter{logger: xlog.New()}
+	for _, message := range []string{
+		"[WARN] yamux: Discarding data for stream: 3",
+		"[WARN] yamux: frame for missing stream: 3",
+		"[ERR] yamux: unexpected FIN flag in state 4",
+		"[ERR] yamux: Failed to read header: connection reset by peer",
+	} {
+		if n, err := writer.Write([]byte(message)); n != len(message) || err != nil {
+			t.Fatalf("write = %d, %v", n, err)
+		}
+	}
+	if output.Len() != 0 {
+		t.Fatalf("stream or duplicate transport errors promoted to WARN: %s", output.String())
+	}
+	if _, err := writer.Write([]byte("[ERR] yamux: received protocol error go away")); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "received protocol error go away") {
+		t.Fatal("session-fatal protocol error was hidden")
 	}
 }

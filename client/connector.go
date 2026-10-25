@@ -158,7 +158,7 @@ func (c *defaultConnectorImpl) Open() error {
 	fmuxCfg := fmux.DefaultConfig()
 	fmuxCfg.KeepAliveInterval = time.Duration(c.cfg.Transport.TCPMuxKeepaliveInterval) * time.Second
 	// Keepalive failures close every stream and must survive normal log levels.
-	fmuxCfg.LogOutput = xlog.NewWarnWriter(xl)
+	fmuxCfg.LogOutput = muxFailureWriter{logger: xl}
 	fmuxCfg.MaxStreamWindowSize = 6 * 1024 * 1024
 	session, err := fmux.Client(conn, fmuxCfg)
 	if err != nil {
