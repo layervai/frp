@@ -1,4 +1,4 @@
-GO_TOOL_BIN := $(or $(shell go env GOBIN),$(firstword $(subst :, ,$(shell go env GOPATH)))/bin)
+GO_TOOL_BIN := $(or $(shell go env GOBIN),$(shell go_path=$$(go env GOPATH); printf '%s/bin' "$${go_path%%:*}"))
 export PATH := $(PATH):$(GO_TOOL_BIN)
 export GO111MODULE=on
 LDFLAGS := -s -w

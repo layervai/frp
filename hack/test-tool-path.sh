@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export GOENV=off
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 fixture=$(mktemp -d)
@@ -20,7 +21,7 @@ GO
 
 # Exercise Go's actual install destination, including a multi-entry GOPATH.
 for mode in gobin gopath; do
-  export GOPATH="$fixture/$mode/first:$fixture/$mode/second"
+  export GOPATH="$fixture/$mode/first path:$fixture/$mode/second"
   if [[ "$mode" == gobin ]]; then
     export GOBIN="$fixture/explicit-bin"
   else
