@@ -307,6 +307,7 @@ func (s *TunnelServer) handleNewChannel(channel ssh.NewChannel, extraPayloadCh c
 	if err != nil {
 		return
 	}
+	// The first accepted channel to claim this slot keeps server output for the connection.
 	s.firstChannelMu.Lock()
 	if s.firstChannel == nil {
 		s.firstChannel = ch

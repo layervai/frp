@@ -113,3 +113,39 @@ func TestWriteToClientSerializesChannelWrites(t *testing.T) {
 		t.Fatal("channel writes were concurrent")
 	}
 }
+
+type acceptedChannel struct{ channel cryptossh.Channel }
+
+func (c acceptedChannel) ChannelType() string                            { return "session" }
+func (c acceptedChannel) ExtraData() []byte                              { return nil }
+func (c acceptedChannel) Reject(cryptossh.RejectionReason, string) error { return nil }
+func (c acceptedChannel) Accept() (cryptossh.Channel, <-chan *cryptossh.Request, error) {
+	requests := make(chan *cryptossh.Request)
+	close(requests)
+	return c.channel, requests, nil
+}
+
+func TestConcurrentChannelsKeepFirstSelection(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	s := &TunnelServer{doneCh: done}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Go(func() {
+			<-start
+			s.handleNewChannel(acceptedChannel{&trackingChannel{}}, nil)
+		})
+		wg.Go(func() {
+			<-start
+			s.writeToClient("concurrent output")
+		})
+	}
+	close(start)
+	wg.Wait()
+	first := s.firstChannel
+	require.NotNil(t, first)
+	s.handleNewChannel(acceptedChannel{&trackingChannel{}}, nil)
+	require.Same(t, first, s.firstChannel, "a late channel must not replace the selected output channel")
+	require.False(t, first.(*trackingChannel).concurrent.Load())
+}
