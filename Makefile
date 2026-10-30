@@ -1,11 +1,12 @@
-export PATH := $(PATH):`go env GOPATH`/bin
+GO_TOOL_BIN := $(or $(shell go env GOBIN),$(shell go_path=$$(go env GOPATH); printf '%s/bin' "$${go_path%%:*}"))
+export PATH := $(PATH):$(GO_TOOL_BIN)
 export GO111MODULE=on
 LDFLAGS := -s -w
 NOWEB_TAG = $(shell [ ! -d web/frps/dist ] || [ ! -d web/frpc/dist ] && echo ',noweb')
 FRP_COMPAT_BASELINE_COUNT ?= 8
 FRP_COMPAT_FLOOR_VERSION ?= 0.61.0
 
-.PHONY: web web-ci frps-web frpc-web frps frpc e2e-compatibility-smoke e2e-compatibility e2e-compatibility-floor
+.PHONY: web web-ci frps-web frpc-web frps frpc e2e-compatibility-smoke e2e-compatibility e2e-compatibility-floor test-tool-path
 
 all: env fmt web build
 
@@ -89,3 +90,6 @@ clean:
 	rm -rf ./lastversion
 	rm -rf ./.cache
 	rm -rf ./.compat
+
+test-tool-path:
+	./hack/test-tool-path.sh
