@@ -19,32 +19,35 @@ jobs:
     steps:
       # environment
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: '0'
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # get image tag name
       - name: Get Image Tag Name
+        env:
+          FRP_IMAGE_TAG_INPUT: ${{ github.event.inputs.tag }}
         run: |
-          if [ x${{ github.event.inputs.tag }} == x"" ]; then
-            echo "TAG_NAME=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
-          else
-            echo "TAG_NAME=${{ github.event.inputs.tag }}" >> $GITHUB_ENV
+          image_tag="${FRP_IMAGE_TAG_INPUT:-${GITHUB_REF#refs/*/}}"
+          if [[ ! "$image_tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "::error::Invalid Docker image tag"
+            exit 1
           fi
+          printf 'TAG_NAME=%s\n' "$image_tag" >> "$GITHUB_ENV"
       - name: Login to DockerHub
-        uses: docker/login-action@v4
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_PASSWORD }}
 
       - name: Login to the GPR
-        uses: docker/login-action@v4
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -53,15 +56,17 @@ jobs:
       # prepare image tags
       - name: Prepare Image Tags
         run: |
-          echo "DOCKERFILE_FRPC_PATH=dockerfiles/Dockerfile-for-frpc" >> $GITHUB_ENV
-          echo "DOCKERFILE_FRPS_PATH=dockerfiles/Dockerfile-for-frps" >> $GITHUB_ENV
-          echo "TAG_FRPC=fatedier/frpc:${{ env.TAG_NAME }}" >> $GITHUB_ENV
-          echo "TAG_FRPS=fatedier/frps:${{ env.TAG_NAME }}" >> $GITHUB_ENV
-          echo "TAG_FRPC_GPR=ghcr.io/fatedier/frpc:${{ env.TAG_NAME }}" >> $GITHUB_ENV
-          echo "TAG_FRPS_GPR=ghcr.io/fatedier/frps:${{ env.TAG_NAME }}" >> $GITHUB_ENV
+          {
+            printf 'DOCKERFILE_FRPC_PATH=%s\n' 'dockerfiles/Dockerfile-for-frpc'
+            printf 'DOCKERFILE_FRPS_PATH=%s\n' 'dockerfiles/Dockerfile-for-frps'
+            printf 'TAG_FRPC=fatedier/frpc:%s\n' "$TAG_NAME"
+            printf 'TAG_FRPS=fatedier/frps:%s\n' "$TAG_NAME"
+            printf 'TAG_FRPC_GPR=ghcr.io/fatedier/frpc:%s\n' "$TAG_NAME"
+            printf 'TAG_FRPS_GPR=ghcr.io/fatedier/frps:%s\n' "$TAG_NAME"
+          } >> "$GITHUB_ENV"
 
       - name: Build and push frpc
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ./dockerfiles/Dockerfile-for-frpc
@@ -72,7 +77,7 @@ jobs:
             ${{ env.TAG_FRPC_GPR }}
 
       - name: Build and push frps
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ./dockerfiles/Dockerfile-for-frps
