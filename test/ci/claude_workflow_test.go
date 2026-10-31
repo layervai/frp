@@ -1337,3 +1337,49 @@ func TestIssueClaudeRuntimeAndShallowRegression(t *testing.T) {
 		t.Fatalf("prior shallow-origin failure was not reproduced:\n%s", output)
 	}
 }
+
+func TestInteractiveClaudePreparesDivergentSnapshots(t *testing.T) {
+	wf := loadWorkflow(t, "claude.yml")
+	job := wf.Jobs["claude"]
+	if got := namedStep(t, job, "Checkout repository").With["fetch-depth"]; got != 0 {
+		t.Fatalf("initial checkout depth = %v, want full history", got)
+	}
+	fixture := createReviewFixture(t)
+	commonSHA := fixture.baseSHA
+	mustGit(t, fixture.seed, "switch", "--quiet", "main")
+	mustGit(t, fixture.seed, "commit", "--quiet", "--allow-empty", "-m", "base-only change")
+	fixture.baseSHA = gitOutput(t, fixture.seed, "rev-parse", "HEAD")
+	mustGit(t, fixture.workspace, "fetch", "--quiet", "origin", "main")
+	if got := gitOutput(t, fixture.workspace, "merge-base", fixture.baseSHA, fixture.headSHA); got != commonSHA {
+		t.Fatalf("divergent fixture merge base = %s, want %s", got, commonSHA)
+	}
+	runnerTemp := t.TempDir()
+	validator := filepath.Join(runnerTemp, "validators.sh")
+	writeValidator(t, wf, validator)
+	outputPath := filepath.Join(runnerTemp, "output")
+	env := cleanEnvironment(t, t.TempDir(), map[string]string{
+		"PR_MODE": "true", "PR_HEAD_SHA": fixture.headSHA, "PR_HEAD_REF": fixture.headRef,
+		"PR_BASE_SHA": fixture.baseSHA, "PR_BASE_REF": "main", "PR_DEFAULT_REF": "main", "PR_HEAD_FETCH_DEPTH": "25",
+		"ISSUE_SHA": fixture.baseSHA, "ISSUE_REF": "main", "VALIDATORS": validator,
+		"RUNNER_TEMP": runnerTemp, "GITHUB_OUTPUT": outputPath, "GITHUB_WORKSPACE": fixture.workspace,
+	})
+	requireScriptResult(t, fixture.workspace, namedStep(t, job, "Prepare credential-free Claude origin").Run, env, true)
+	outputs := readOutputs(t, outputPath)
+	if outputs["ready"] != "true" {
+		t.Fatalf("snapshot preparation did not complete: %v", outputs)
+	}
+	for ref, sha := range map[string]string{fixture.headRef: fixture.headSHA, "main": fixture.baseSHA} {
+		if got := gitOutput(t, fixture.workspace, "--git-dir="+outputs["path"], "rev-parse", "refs/heads/"+ref); got != sha {
+			t.Errorf("local origin %s = %s, want %s", ref, got, sha)
+		}
+	}
+	if got := gitOutput(t, fixture.workspace, "--git-dir="+outputs["path"], "rev-parse", "--is-shallow-repository"); got != "false" {
+		t.Fatalf("local origin must retain complete divergent histories, shallow=%s", got)
+	}
+	simulatePinnedPRCheckout(t, fixture, outputs["path"], 25)
+	for ref, sha := range map[string]string{"head": fixture.headSHA, "base": fixture.baseSHA} {
+		if got := gitOutput(t, fixture.workspace, "rev-parse", "refs/claude-command/"+ref); got != sha {
+			t.Errorf("workflow snapshot %s = %s, want %s", ref, got, sha)
+		}
+	}
+}

@@ -326,13 +326,13 @@ jobs:
           # file such as /proc/self/environ into the workspace never depends on
           # the action's own filter.
           validate_sensitive_tree "Claude head" "$head_sha"
-          push_refspecs=("${head_sha}:refs/heads/${head_ref}")
+          snapshots=("${head_sha}:${head_ref}")
           default_ref="$head_ref"
           if [[ "$PR_MODE" == "true" ]]; then
             validate_sha "Claude base" "$base_sha"
             validate_ref "Claude base" "$base_ref"
             git cat-file -e "$base_sha^{commit}"
-            push_refspecs+=("${base_sha}:refs/heads/${base_ref}")
+            snapshots+=("${base_sha}:${base_ref}")
             default_ref="$base_ref"
           fi
 
@@ -358,6 +358,10 @@ jobs:
           local_origin="$local_origin_parent/origin.git"
           object_format="$(git rev-parse --show-object-format)"
           git init --bare --quiet --object-format="$object_format" "$local_origin"
+          push_refspecs=()
+          for snapshot in "${snapshots[@]}"; do
+            push_refspecs+=("${snapshot%%:*}:refs/heads/${snapshot#*:}")
+          done
           git push --quiet "$local_origin" "${push_refspecs[@]}"
           git --git-dir="$local_origin" symbolic-ref HEAD "refs/heads/${default_ref}"
           git remote set-url origin "$local_origin"
@@ -374,12 +378,14 @@ jobs:
           # mid-run. refs/claude-command/* are workflow-owned snapshot evidence
           # that nothing in the action writes; the terminal step compares
           # those instead.
-          git branch -f "$head_ref" "$head_sha"
-          git update-ref "refs/remotes/origin/$head_ref" "$head_sha"
+          for snapshot in "${snapshots[@]}"; do
+            snapshot_sha="${snapshot%%:*}"
+            snapshot_ref="${snapshot#*:}"
+            git branch -f "$snapshot_ref" "$snapshot_sha"
+            git update-ref "refs/remotes/origin/$snapshot_ref" "$snapshot_sha"
+          done
           git update-ref refs/claude-command/head "$head_sha"
           if [[ "$PR_MODE" == "true" ]]; then
-            git branch -f "$base_ref" "$base_sha"
-            git update-ref "refs/remotes/origin/$base_ref" "$base_sha"
             git update-ref refs/claude-command/base "$base_sha"
           fi
 
@@ -429,22 +435,17 @@ jobs:
             echo "::error::Checkout credential remained in local Git config."
             exit 1
           fi
-          remote_line="$(git ls-remote --exit-code origin "refs/heads/$head_ref")"
-          resolved_sha="${remote_line%%$'\t'*}"
-          resolved_ref="${remote_line#*$'\t'}"
-          if [[ "$resolved_sha" != "$head_sha" || "$resolved_ref" != "refs/heads/$head_ref" ]]; then
-            echo "::error::Local Claude origin resolved $resolved_ref at $resolved_sha, want refs/heads/$head_ref at $head_sha."
-            exit 1
-          fi
-          if [[ "$PR_MODE" == "true" ]]; then
-            base_line="$(git ls-remote --exit-code origin "refs/heads/$base_ref")"
-            resolved_base_sha="${base_line%%$'\t'*}"
-            resolved_base_ref="${base_line#*$'\t'}"
-            if [[ "$resolved_base_sha" != "$base_sha" || "$resolved_base_ref" != "refs/heads/$base_ref" ]]; then
-              echo "::error::Local Claude origin resolved $resolved_base_ref at $resolved_base_sha, want refs/heads/$base_ref at $base_sha."
+          for snapshot in "${snapshots[@]}"; do
+            snapshot_sha="${snapshot%%:*}"
+            snapshot_ref="${snapshot#*:}"
+            remote_line="$(git ls-remote --exit-code origin "refs/heads/$snapshot_ref")"
+            resolved_sha="${remote_line%%$'\t'*}"
+            resolved_ref="${remote_line#*$'\t'}"
+            if [[ "$resolved_sha" != "$snapshot_sha" || "$resolved_ref" != "refs/heads/$snapshot_ref" ]]; then
+              echo "::error::Local Claude origin resolved $resolved_ref at $resolved_sha, want refs/heads/$snapshot_ref at $snapshot_sha."
               exit 1
             fi
-          fi
+          done
 
           # Exercise the pinned action's fetch shapes before handing it control.
           # The action's setup head fetch lacks --no-recurse-submodules, so the
@@ -464,15 +465,21 @@ jobs:
             git fetch origin "$head_ref" --depth=1
           fi
 
-          if [[ "$(git rev-parse "refs/remotes/origin/$head_ref")" != "$head_sha" ||
-            "$(git rev-parse --verify refs/claude-command/head 2>/dev/null)" != "$head_sha" ]]; then
-            echo "::error::Pinned Claude head tracking ref changed during fetch proof."
+          for snapshot in "${snapshots[@]}"; do
+            snapshot_sha="${snapshot%%:*}"
+            snapshot_ref="${snapshot#*:}"
+            if [[ "$(git rev-parse "refs/remotes/origin/$snapshot_ref")" != "$snapshot_sha" ]]; then
+              echo "::error::Pinned Claude tracking ref changed during fetch proof."
+              exit 1
+            fi
+          done
+          if [[ "$(git rev-parse --verify refs/claude-command/head 2>/dev/null)" != "$head_sha" ]]; then
+            echo "::error::Pinned Claude head snapshot changed during fetch proof."
             exit 1
           fi
           if [[ "$PR_MODE" == "true" ]] &&
-            [[ "$(git rev-parse "refs/remotes/origin/$base_ref")" != "$base_sha" ||
-              "$(git rev-parse --verify refs/claude-command/base 2>/dev/null)" != "$base_sha" ]]; then
-            echo "::error::Pinned Claude base tracking ref changed during fetch proof."
+            [[ "$(git rev-parse --verify refs/claude-command/base 2>/dev/null)" != "$base_sha" ]]; then
+            echo "::error::Pinned Claude base snapshot changed during fetch proof."
             exit 1
           fi
           if git config --local --get-regexp '^http\..*\.extraheader$' >/dev/null 2>&1 ||
