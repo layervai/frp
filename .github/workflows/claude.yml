@@ -469,7 +469,7 @@ jobs:
             snapshot_sha="${snapshot%%:*}"
             snapshot_ref="${snapshot#*:}"
             if [[ "$(git rev-parse "refs/remotes/origin/$snapshot_ref")" != "$snapshot_sha" ]]; then
-              echo "::error::Pinned Claude tracking ref changed during fetch proof."
+              echo "::error::Pinned Claude tracking ref refs/remotes/origin/$snapshot_ref changed during fetch proof, want $snapshot_sha."
               exit 1
             fi
           done
