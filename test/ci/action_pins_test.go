@@ -13,9 +13,13 @@ import (
 )
 
 func TestWorkflowActionPins(t *testing.T) {
-	files, err := filepath.Glob(filepath.Join(repositoryRoot(t), ".github", "workflows", "*.yml"))
-	if err != nil {
-		t.Fatal(err)
+	var files []string
+	for _, pattern := range []string{"*.yml", "*.yaml"} {
+		matches, err := filepath.Glob(filepath.Join(repositoryRoot(t), ".github", "workflows", pattern))
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, matches...)
 	}
 	if len(files) == 0 {
 		t.Fatal("no workflows found")
