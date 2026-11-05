@@ -238,8 +238,9 @@ func (ctl *Control) Drain(ctx context.Context) error {
 	return ctl.workConnections.wait(ctx)
 }
 
-// CloseProxyConnections revokes local work until this proxy is changed or removed.
-// Use Drain or a config update to withdraw routing as well.
+// CloseProxyConnections cuts work on this control until the proxy changes or is removed.
+// Unknown names are ignored. This does not withdraw routing or change authorization;
+// remove the proxy configuration or Drain to stop routing.
 func (ctl *Control) CloseProxyConnections(proxyName string) {
 	ctl.updateMu.Lock()
 	defer ctl.updateMu.Unlock()

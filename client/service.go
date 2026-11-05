@@ -571,9 +571,10 @@ func (svr *Service) Drain(ctx context.Context) error {
 	return ctl.Drain(ctx)
 }
 
-// CloseProxyConnections revokes local work until this proxy is changed or removed.
-// It leaves siblings untouched and also works while Drain waits for work.
-// It does not withdraw routing; callers must Drain or update the configured set.
+// CloseProxyConnections cuts work on the current control, leaving siblings untouched.
+// It is ignored without a control or for an unknown name. A reconnect uses the configured
+// proxy set again; this is not persistent authorization. Remove the proxy configuration
+// or Drain to stop routing. It also works while Drain waits for existing work.
 func (svr *Service) CloseProxyConnections(proxyName string) {
 	svr.ctlMu.RLock()
 	ctl := svr.ctl
