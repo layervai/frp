@@ -114,6 +114,7 @@ type ServiceOptions struct {
 	// HandleWorkConnCb is a callback function that is called when a new work connection is created.
 	//
 	// If it is not set, the default frpc implementation will be used.
+	// Returning false takes ownership of conn; close it when the work ends.
 	HandleWorkConnCb func(*v1.ProxyBaseConfig, net.Conn, *msg.StartWorkConn) bool
 }
 
@@ -426,8 +427,8 @@ func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginE
 
 		// A completed dial cannot publish a replacement after Drain fences login.
 		svr.lifecycleMu.Lock()
-		defer svr.lifecycleMu.Unlock()
 		if svr.closeRequested {
+			svr.lifecycleMu.Unlock()
 			closeSessionContext(sessionCtx)
 			return true, nil
 		}
@@ -438,6 +439,7 @@ func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginE
 
 		ctl, err := NewControl(svr.ctx, sessionCtx)
 		if err != nil {
+			svr.lifecycleMu.Unlock()
 			closeSessionContext(sessionCtx)
 			xl.Errorf("new control error: %v", err)
 			return false, err
@@ -445,13 +447,15 @@ func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginE
 		ctl.SetInWorkConnCallback(svr.handleWorkConnCb)
 
 		ctl.Run(proxyCfgs, visitorCfgs)
-		// close and replace previous control
 		svr.ctlMu.Lock()
-		if svr.ctl != nil {
-			svr.ctl.Close()
-		}
+		previous := svr.ctl
 		svr.ctl = ctl
 		svr.ctlMu.Unlock()
+		svr.lifecycleMu.Unlock()
+		// Teardown cannot hold the service shutdown or publication locks.
+		if previous != nil {
+			previous.Close()
+		}
 		return true, nil
 	}
 
@@ -541,6 +545,7 @@ func (svr *Service) UpdateConfigSource(
 
 // Drain withdraws proxy routing and keeps existing work alive until it finishes
 // or ctx expires. Close can interrupt the drain. The service cannot reconnect.
+// With no active control, it closes the service immediately.
 func (svr *Service) Drain(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("drain context is nil")
@@ -560,6 +565,7 @@ func (svr *Service) Drain(ctx context.Context) error {
 
 // CloseProxyConnections revokes one local proxy until the next config update.
 // It leaves siblings untouched and also works while Drain waits for work.
+// It does not withdraw routing; callers must Drain or update the configured set.
 func (svr *Service) CloseProxyConnections(proxyName string) {
 	svr.ctlMu.RLock()
 	ctl := svr.ctl

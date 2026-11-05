@@ -237,7 +237,8 @@ func (ctl *Control) Drain(ctx context.Context) error {
 	return ctl.workConnections.wait(ctx)
 }
 
-// CloseProxyConnections revokes a local proxy until the next config update.
+// CloseProxyConnections revokes local work until the next config update.
+// Use Drain or a config update to withdraw routing as well.
 func (ctl *Control) CloseProxyConnections(proxyName string) {
 	ctl.updateMu.Lock()
 	defer ctl.updateMu.Unlock()
@@ -251,15 +252,18 @@ func (ctl *Control) Close() error {
 }
 
 func (ctl *Control) GracefulClose(d time.Duration) error {
-	// Release work before closing plugins on a forced stop: a plugin may wait
-	// for its handlers, which themselves need the work connection to close.
+	// Arm teardown before waiting for plugins that may wait for work connections.
+	deadline := time.Now().Add(d)
 	if d <= 0 {
 		ctl.closeSession()
+	} else {
+		timer := time.AfterFunc(d, ctl.closeSession)
+		defer timer.Stop()
 	}
 	ctl.pm.Close()
 	ctl.vm.Close()
 	if d > 0 {
-		time.Sleep(d)
+		time.Sleep(time.Until(deadline))
 		ctl.closeSession()
 	}
 	return nil
@@ -337,6 +341,7 @@ func (ctl *Control) worker() {
 	close(ctl.doneCh)
 }
 
+// UpdateAllConfigurer closes work for changed or removed proxies before replacing handlers.
 func (ctl *Control) UpdateAllConfigurer(proxyCfgs []v1.ProxyConfigurer, visitorCfgs []v1.VisitorConfigurer) error {
 	ctl.updateMu.Lock()
 	defer ctl.updateMu.Unlock()

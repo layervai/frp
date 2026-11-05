@@ -18,6 +18,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -28,6 +29,7 @@ import (
 	"github.com/fatedier/frp/pkg/auth"
 	v1 "github.com/fatedier/frp/pkg/config/v1"
 	"github.com/fatedier/frp/pkg/msg"
+	clientplugin "github.com/fatedier/frp/pkg/plugin/client"
 	"github.com/fatedier/frp/pkg/proto/wire"
 )
 
@@ -201,5 +203,100 @@ func TestControlConfigRemovalClosesWorkAndReaddClearsRevocation(t *testing.T) {
 	_ = freshPeer.SetReadDeadline(time.Now().Add(time.Second))
 	if _, err := freshPeer.Read(make([]byte, 1)); err != io.EOF {
 		t.Fatalf("config removal did not release work before plugin teardown: %v", err)
+	}
+}
+
+type waitingDrainPlugin struct{ entered, done chan struct{} }
+
+func (*waitingDrainPlugin) Name() string { return "test-drain-wait" }
+func (p *waitingDrainPlugin) Handle(_ context.Context, info *clientplugin.ConnectionInfo) {
+	close(p.entered)
+	_, _ = io.Copy(io.Discard, info.Conn)
+	_ = info.Conn.Close()
+	close(p.done)
+}
+
+func (p *waitingDrainPlugin) Close() error {
+	select {
+	case <-p.entered:
+		<-p.done
+	default:
+	}
+	return nil
+}
+
+type waitingDrainPluginOptions struct{ plugin *waitingDrainPlugin }
+
+func (*waitingDrainPluginOptions) Complete() {}
+func (o *waitingDrainPluginOptions) Clone() v1.ClientPluginOptions {
+	return &waitingDrainPluginOptions{plugin: o.plugin}
+}
+
+func init() {
+	clientplugin.Register("test-drain-wait", func(_ clientplugin.PluginContext, options v1.ClientPluginOptions) (clientplugin.Plugin, error) {
+		return options.(*waitingDrainPluginOptions).plugin, nil
+	})
+}
+
+func TestControlGracefulCloseDeadlineInterruptsWaitingPlugin(t *testing.T) {
+	control, peer := net.Pipe()
+	defer peer.Close()
+	authRuntime, err := auth.BuildClientAuth(&v1.AuthClientConfig{Method: v1.AuthMethodToken, Token: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctl, err := NewControl(t.Context(), &SessionContext{
+		Common: &v1.ClientCommonConfig{}, RunID: "plugin-grace", Conn: msg.NewConn(control, msg.NewV1ReadWriter(control)), Auth: authRuntime,
+		Connector: &gracefulCloseTestConnector{conn: peer},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctl.Close()
+	plugin := &waitingDrainPlugin{entered: make(chan struct{}), done: make(chan struct{})}
+	cfg := &v1.TCPProxyConfig{ProxyBaseConfig: v1.ProxyBaseConfig{
+		Name: "waiting", Type: "tcp",
+		ProxyBackend: v1.ProxyBackend{Plugin: v1.TypedClientPluginOptions{Type: "test-drain-wait", ClientPluginOptions: &waitingDrainPluginOptions{plugin: plugin}}},
+	}}
+	ctl.pm.UpdateAll([]v1.ProxyConfigurer{cfg})
+	deadline := time.Now().Add(time.Second)
+	for {
+		status, ok := ctl.pm.GetProxyStatus("waiting")
+		if ok && status.Phase == clientproxy.ProxyPhaseWaitStart {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("plugin proxy did not register")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := ctl.pm.StartProxy("waiting", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	work, workPeer := net.Pipe()
+	defer workPeer.Close()
+	conn := msg.NewConn(work, msg.NewV1ReadWriter(work))
+	if !ctl.workConnections.track(conn, "waiting") {
+		t.Fatal("initial work rejected")
+	}
+	ctl.pm.HandleWorkConn("waiting", conn, &msg.StartWorkConn{ProxyName: "waiting"})
+	select {
+	case <-plugin.entered:
+	case <-time.After(time.Second):
+		t.Fatal("plugin did not take work")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- ctl.GracefulClose(20 * time.Millisecond) }()
+	_ = workPeer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := workPeer.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("plugin teardown prevented grace deadline: %v", err)
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("plugin close stayed blocked after work EOF")
 	}
 }
