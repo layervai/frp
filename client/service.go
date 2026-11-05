@@ -552,7 +552,8 @@ func (svr *Service) UpdateConfigSource(
 // Drain withdraws proxy routing and keeps existing work alive until it finishes
 // or ctx expires. Close can interrupt the drain. The service cannot reconnect.
 // With no active control, it closes the service immediately.
-// A failed control returns net.ErrClosed so a lost connection is not hidden.
+// Control loss closes independent non-mux work too. If it precedes drain
+// completion, Drain returns net.ErrClosed instead of hiding the lost connection.
 func (svr *Service) Drain(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("drain context is nil")

@@ -291,3 +291,78 @@ func TestServiceDrainReportsAlreadyFailedControl(t *testing.T) {
 		t.Fatalf("already failed control was hidden by drain: %v", err)
 	}
 }
+
+func TestControlLossClosesIndependentNonMuxTCPWork(t *testing.T) {
+	ctl := newGracefulCloseTestService().ctl
+	defer ctl.Close()
+	disabled := false
+	ctl.sessionCtx.Common.Transport.TCPMux = &disabled
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	peer, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	work, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := msg.NewConn(work, msg.NewV1ReadWriter(work))
+	if !ctl.workConnections.track(conn, "independent") {
+		t.Fatal("initial work rejected")
+	}
+	ctl.closeSession()
+	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := peer.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("control loss left non-mux work alive: %v", err)
+	}
+	if err := ctl.Drain(t.Context()); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("lost non-mux work was hidden: %v", err)
+	}
+}
+
+func TestServiceCloseInterruptsWaitingDrain(t *testing.T) {
+	service := newGracefulCloseTestService()
+	ctl := service.ctl
+	defer ctl.Close()
+	runCtx, cancelRun := context.WithCancelCause(t.Context())
+	defer cancelRun(nil)
+	service.ctx, service.cancel = runCtx, cancelRun
+	stopped := make(chan struct{})
+	go func() { <-runCtx.Done(); service.stop(); close(stopped) }()
+	conn, peer := net.Pipe()
+	defer peer.Close()
+	tracked := msg.NewConn(conn, msg.NewV1ReadWriter(conn))
+	if !ctl.workConnections.track(tracked, "retained") {
+		t.Fatal("initial work rejected")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	drained := make(chan error, 1)
+	go func() { drained <- service.Drain(ctx) }()
+	deadline := time.Now().Add(time.Second)
+	for !ctl.workConnections.isDraining() {
+		if time.Now().After(deadline) {
+			t.Fatal("drain did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	service.Close()
+	select {
+	case err := <-drained:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Close did not interrupt drain as a failure: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close left drain waiting")
+	}
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("service did not finish stopping")
+	}
+}

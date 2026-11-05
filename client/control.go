@@ -210,7 +210,7 @@ func (ctl *Control) handlePong(m msg.Message) {
 	xl.Debugf("receive heartbeat from server")
 }
 
-// closeSession closes the control connection.
+// closeSession fails closed on control loss, including independent non-mux work.
 func (ctl *Control) closeSession() {
 	ctl.workConnections.closeAll()
 	ctl.sessionCtx.Conn.Close()
@@ -218,7 +218,7 @@ func (ctl *Control) closeSession() {
 }
 
 // Drain withdraws proxy routing and waits for assigned work until ctx expires.
-// Visitors stop immediately. Expiry or an explicit Close still forces teardown.
+// Visitors stop immediately. Expiry, control loss or explicit Close forces teardown.
 func (ctl *Control) Drain(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("drain context is nil")
