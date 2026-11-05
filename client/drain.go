@@ -152,3 +152,9 @@ func (t *workConnTracker) closeProxy(proxyName string) {
 		_ = conn.Close()
 	}
 }
+
+func (t *workConnTracker) clearRevocations() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.revoked = nil
+}

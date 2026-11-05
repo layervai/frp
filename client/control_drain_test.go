@@ -144,3 +144,62 @@ func TestControlDrainSerializesAcceptedWorkHandoff(t *testing.T) {
 		t.Fatal("drain did not finish after work closed")
 	}
 }
+
+func TestControlConfigRemovalClosesWorkAndReaddClearsRevocation(t *testing.T) {
+	control, peer := net.Pipe()
+	defer peer.Close()
+	authRuntime, err := auth.BuildClientAuth(&v1.AuthClientConfig{Method: v1.AuthMethodToken, Token: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctl, err := NewControl(t.Context(), &SessionContext{
+		Common: &v1.ClientCommonConfig{}, RunID: "reload", Conn: msg.NewConn(control, msg.NewV1ReadWriter(control)), Auth: authRuntime,
+		Connector: &gracefulCloseTestConnector{conn: peer},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctl.Close()
+	cfg := &v1.TCPProxyConfig{ProxyBaseConfig: v1.ProxyBaseConfig{Name: "readded", Type: "tcp"}}
+	if err := ctl.UpdateAllConfigurer([]v1.ProxyConfigurer{cfg}, nil); err != nil {
+		t.Fatal(err)
+	}
+	work, workPeer := net.Pipe()
+	defer workPeer.Close()
+	tracked := msg.NewConn(work, msg.NewV1ReadWriter(work))
+	if !ctl.workConnections.track(tracked, "readded") {
+		t.Fatal("initial work rejected")
+	}
+	ctl.CloseProxyConnections("readded")
+	if err := ctl.UpdateAllConfigurer(nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	_ = workPeer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := workPeer.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("removed work remained open: %v", err)
+	}
+	if err := ctl.UpdateAllConfigurer([]v1.ProxyConfigurer{cfg}, nil); err != nil {
+		t.Fatal(err)
+	}
+	fresh, freshPeer := net.Pipe()
+	defer freshPeer.Close()
+	accepted := msg.NewConn(fresh, msg.NewV1ReadWriter(fresh))
+	defer accepted.Close()
+	if !ctl.workConnections.track(accepted, "readded") {
+		t.Fatal("readded proxy kept stale revocation")
+	}
+	ctl.CloseProxyConnections("unknown")
+	ctl.workConnections.mu.Lock()
+	unknownCount := len(ctl.workConnections.revoked)
+	ctl.workConnections.mu.Unlock()
+	if unknownCount != 0 {
+		t.Fatal("unknown proxy grew revocation state")
+	}
+	if err := ctl.UpdateAllConfigurer(nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	_ = freshPeer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := freshPeer.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("config removal did not release work before plugin teardown: %v", err)
+	}
+}

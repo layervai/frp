@@ -182,7 +182,7 @@ func TestWorkConnDrainPreservesConnectionContext(t *testing.T) {
 		t.Fatal("initial work rejected")
 	}
 	defer tracked.Close()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	tracked.WithContext(ctx)
 	if tracked.Context() != ctx || base.Context() != ctx {
@@ -209,4 +209,40 @@ func TestWorkConnRevocationRejectsLateNameBeforeDrain(t *testing.T) {
 		t.Fatal("revocation blocked sibling assignment")
 	}
 	_ = accepted.Close()
+}
+
+func TestWorkConnRevocationClearsOnConfigUpdate(t *testing.T) {
+	var tracker workConnTracker
+	tracker.closeProxy("readded")
+	tracker.clearRevocations()
+	conn, peer := net.Pipe()
+	defer peer.Close()
+	tracked := msg.NewConn(conn, msg.NewReadWriter(conn, wire.ProtocolV1))
+	if !tracker.track(tracked, "readded") {
+		t.Fatal("configuration update kept old revocation")
+	}
+	_ = tracked.Close()
+}
+
+func TestControlDrainDeadlineClosesLiveWorkAndRejectsUpdate(t *testing.T) {
+	ctl := newGracefulCloseTestService().ctl
+	defer ctl.Close()
+	conn, peer := net.Pipe()
+	defer peer.Close()
+	tracked := msg.NewConn(conn, msg.NewReadWriter(conn, wire.ProtocolV1))
+	if !ctl.workConnections.track(tracked, "live") {
+		t.Fatal("initial work rejected")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	if err := ctl.Drain(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("drain deadline = %v", err)
+	}
+	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := peer.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("expired work stayed open: %v", err)
+	}
+	if err := ctl.UpdateAllConfigurer(nil, nil); err == nil {
+		t.Fatal("draining control accepted configuration update")
+	}
 }

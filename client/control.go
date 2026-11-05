@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -222,18 +223,27 @@ func (ctl *Control) Drain(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("drain context is nil")
 	}
+	defer ctl.Close()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stopDeadline := context.AfterFunc(ctx, ctl.closeSession)
+	defer stopDeadline()
 	ctl.updateMu.Lock()
 	ctl.workConnections.beginDrain()
 	ctl.pm.Withdraw()
 	ctl.vm.Close()
 	ctl.updateMu.Unlock()
-	defer ctl.Close()
 	return ctl.workConnections.wait(ctx)
 }
 
-// CloseProxyConnections closes only work assigned to this local proxy name.
+// CloseProxyConnections revokes a local proxy until the next config update.
 func (ctl *Control) CloseProxyConnections(proxyName string) {
-	ctl.workConnections.closeProxy(proxyName)
+	ctl.updateMu.Lock()
+	defer ctl.updateMu.Unlock()
+	if _, exists := ctl.pm.GetProxyStatus(proxyName); exists {
+		ctl.workConnections.closeProxy(proxyName)
+	}
 }
 
 func (ctl *Control) Close() error {
@@ -333,7 +343,18 @@ func (ctl *Control) UpdateAllConfigurer(proxyCfgs []v1.ProxyConfigurer, visitorC
 	if ctl.workConnections.isDraining() {
 		return errors.New("control is draining")
 	}
+	next := make(map[string]v1.ProxyConfigurer, len(proxyCfgs))
+	for _, cfg := range proxyCfgs {
+		next[cfg.GetBaseConfig().Name] = cfg
+	}
+	for _, previous := range ctl.pm.GetAllProxyStatus() {
+		if cfg, keep := next[previous.Name]; !keep || !reflect.DeepEqual(previous.Cfg, cfg) {
+			// Release retained work before a removed plugin waits for its handlers.
+			ctl.workConnections.closeProxy(previous.Name)
+		}
+	}
 	ctl.vm.UpdateAll(visitorCfgs)
 	ctl.pm.UpdateAll(proxyCfgs)
+	ctl.workConnections.clearRevocations()
 	return nil
 }

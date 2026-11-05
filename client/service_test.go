@@ -762,7 +762,12 @@ func TestServiceDrainDuringAcceptedLoginCannotPublishControl(t *testing.T) {
 		}
 		serverErr <- rw.WriteMsg(&msg.LoginResp{RunID: "drain-raced-login"})
 	}()
-	proxyCfg := &observedProxyConfigurer{TCPProxyConfig: &v1.TCPProxyConfig{ProxyBaseConfig: v1.ProxyBaseConfig{Name: "must-not-start-after-drain", Type: "tcp", ProxyBackend: v1.ProxyBackend{LocalPort: 10080}}}}
+	proxyCfg := &observedProxyConfigurer{TCPProxyConfig: &v1.TCPProxyConfig{
+		ProxyBaseConfig: v1.ProxyBaseConfig{
+			Name: "must-not-start-after-drain", Type: "tcp",
+			ProxyBackend: v1.ProxyBackend{LocalPort: 10080},
+		},
+	}}
 	configSource := source.NewConfigSource()
 	if err := configSource.ReplaceAll([]v1.ProxyConfigurer{proxyCfg}, nil); err != nil {
 		t.Fatal(err)

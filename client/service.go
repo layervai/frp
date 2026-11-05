@@ -558,8 +558,8 @@ func (svr *Service) Drain(ctx context.Context) error {
 	return ctl.Drain(ctx)
 }
 
-// CloseProxyConnections stops existing work for one local proxy name without
-// interrupting siblings. It also works while Drain waits for remaining work.
+// CloseProxyConnections revokes one local proxy until the next config update.
+// It leaves siblings untouched and also works while Drain waits for work.
 func (svr *Service) CloseProxyConnections(proxyName string) {
 	svr.ctlMu.RLock()
 	ctl := svr.ctl
