@@ -16,7 +16,10 @@ package client
 
 import (
 	"context"
+	"errors"
 	"net"
+	"reflect"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -65,7 +68,9 @@ type Control struct {
 	// manage all visitors
 	vm *visitor.Manager
 
-	doneCh chan struct{}
+	doneCh          chan struct{}
+	workConnections workConnTracker
+	updateMu        sync.Mutex
 
 	// of time.Time, last time got the Pong message
 	lastPong atomic.Value
@@ -157,7 +162,13 @@ func (ctl *Control) handleReqWorkConn(_ msg.Message) {
 
 	startMsg.ProxyName = naming.StripUserPrefix(ctl.sessionCtx.Common.User, startMsg.ProxyName)
 
-	// dispatch this work connection to related proxy
+	// Keep acceptance and handler handoff atomic with routing withdrawal.
+	ctl.updateMu.Lock()
+	defer ctl.updateMu.Unlock()
+	// Only assigned work is active; idle pool connections must not hold a drain open.
+	if !ctl.workConnections.track(workConn, startMsg.ProxyName) {
+		return
+	}
 	ctl.pm.HandleWorkConn(startMsg.ProxyName, workConn, &startMsg)
 }
 
@@ -199,10 +210,43 @@ func (ctl *Control) handlePong(m msg.Message) {
 	xl.Debugf("receive heartbeat from server")
 }
 
-// closeSession closes the control connection.
+// closeSession fails closed on control loss, including independent non-mux work.
 func (ctl *Control) closeSession() {
+	ctl.workConnections.closeAll()
 	ctl.sessionCtx.Conn.Close()
 	ctl.sessionCtx.Connector.Close()
+}
+
+// Drain withdraws proxy routing and waits for assigned work until ctx expires.
+// New assignments after local withdrawal are rejected. Visitors stop immediately.
+// Expiry, control loss or explicit Close forces teardown.
+func (ctl *Control) Drain(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("drain context is nil")
+	}
+	defer ctl.Close()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stopDeadline := context.AfterFunc(ctx, ctl.closeSession)
+	defer stopDeadline()
+	ctl.updateMu.Lock()
+	ctl.workConnections.beginDrain()
+	ctl.pm.Withdraw()
+	ctl.vm.Close()
+	ctl.updateMu.Unlock()
+	return ctl.workConnections.wait(ctx)
+}
+
+// CloseProxyConnections cuts work on this control until the proxy changes or is removed.
+// Unknown names are ignored. This does not withdraw routing or change authorization;
+// remove the proxy configuration or Drain to stop routing.
+func (ctl *Control) CloseProxyConnections(proxyName string) {
+	ctl.updateMu.Lock()
+	defer ctl.updateMu.Unlock()
+	if _, exists := ctl.pm.GetProxyStatus(proxyName); exists {
+		ctl.workConnections.closeProxy(proxyName)
+	}
 }
 
 func (ctl *Control) Close() error {
@@ -210,12 +254,20 @@ func (ctl *Control) Close() error {
 }
 
 func (ctl *Control) GracefulClose(d time.Duration) error {
+	// Arm teardown before waiting for plugins that may wait for work connections.
+	deadline := time.Now().Add(d)
+	if d <= 0 {
+		ctl.closeSession()
+	} else {
+		timer := time.AfterFunc(d, ctl.closeSession)
+		defer timer.Stop()
+	}
 	ctl.pm.Close()
 	ctl.vm.Close()
-
-	time.Sleep(d)
-
-	ctl.closeSession()
+	if d > 0 {
+		time.Sleep(time.Until(deadline))
+		ctl.closeSession()
+	}
 	return nil
 }
 
@@ -291,7 +343,29 @@ func (ctl *Control) worker() {
 	close(ctl.doneCh)
 }
 
+// UpdateAllConfigurer closes removed work and changed plugin work before replacing handlers.
 func (ctl *Control) UpdateAllConfigurer(proxyCfgs []v1.ProxyConfigurer, visitorCfgs []v1.VisitorConfigurer) error {
+	ctl.updateMu.Lock()
+	defer ctl.updateMu.Unlock()
+	if ctl.workConnections.isDraining() {
+		return errors.New("control is draining")
+	}
+	next := make(map[string]v1.ProxyConfigurer, len(proxyCfgs))
+	for _, cfg := range proxyCfgs {
+		next[cfg.GetBaseConfig().Name] = cfg
+	}
+	for _, previous := range ctl.pm.GetAllProxyStatus() {
+		cfg, keep := next[previous.Name]
+		changed := !reflect.DeepEqual(previous.Cfg, cfg)
+		changedPlugin := previous.Cfg.GetBaseConfig().Plugin.Type != "" && changed
+		if !keep || changedPlugin {
+			// Release retained work before a removed plugin waits for its handlers.
+			ctl.workConnections.closeProxy(previous.Name)
+		}
+		if !keep || changed {
+			ctl.workConnections.clearRevocation(previous.Name)
+		}
+	}
 	ctl.vm.UpdateAll(visitorCfgs)
 	ctl.pm.UpdateAll(proxyCfgs)
 	return nil

@@ -84,6 +84,8 @@ type Wrapper struct {
 	closeCh          chan struct{}
 	healthNotifyCh   chan struct{}
 	mu               sync.RWMutex
+	withdrawOnce     sync.Once
+	stopOnce         sync.Once
 
 	xl  *xlog.Logger
 	ctx context.Context
@@ -171,17 +173,24 @@ func (pw *Wrapper) Start() {
 	}
 }
 
+// Withdraw stops registration without destroying handlers used by existing work.
+func (pw *Wrapper) Withdraw() {
+	pw.withdrawOnce.Do(func() {
+		pw.mu.Lock()
+		defer pw.mu.Unlock()
+		close(pw.closeCh)
+		close(pw.healthNotifyCh)
+		if pw.monitor != nil {
+			pw.monitor.Stop()
+		}
+		pw.Phase = ProxyPhaseClosed
+		pw.close()
+	})
+}
+
 func (pw *Wrapper) Stop() {
-	pw.mu.Lock()
-	defer pw.mu.Unlock()
-	close(pw.closeCh)
-	close(pw.healthNotifyCh)
-	pw.pxy.Close()
-	if pw.monitor != nil {
-		pw.monitor.Stop()
-	}
-	pw.Phase = ProxyPhaseClosed
-	pw.close()
+	pw.Withdraw()
+	pw.stopOnce.Do(func() { pw.pxy.Close() })
 }
 
 func (pw *Wrapper) close() {

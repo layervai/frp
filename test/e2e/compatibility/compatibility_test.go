@@ -192,6 +192,22 @@ transport.wireProtocol = "v2"
 	})
 })
 
+var _ = ginkgo.Describe("[Compatibility: UDPDefaultProtocol]", func() {
+	f := framework.NewDefaultFramework()
+	ginkgo.It("current frps serves baseline frpc UDP using the default protocol", func() {
+		portName := port.GenName("CompatDefaultUDPBaselineFRPC")
+		f.RunProcessesWithBinaries(compatCtx.CurrentFRPSPath, compatCtx.BaselineFRPCPath,
+			consts.DefaultServerConfig, []string{udpClientConfig(portName, "")})
+		framework.NewRequestExpect(f).Protocol("udp").PortName(portName).Ensure()
+	})
+	ginkgo.It("baseline frps serves current frpc UDP using the default protocol", func() {
+		portName := port.GenName("CompatDefaultUDPBaselineFRPS")
+		f.RunProcessesWithBinaries(compatCtx.BaselineFRPSPath, compatCtx.CurrentFRPCPath,
+			consts.DefaultServerConfig, []string{udpClientConfig(portName, "")})
+		framework.NewRequestExpect(f).Protocol("udp").PortName(portName).Ensure()
+	})
+})
+
 var _ = ginkgo.Describe("[Compatibility: BinaryUDPPacket]", func() {
 	f := framework.NewDefaultFramework()
 
@@ -200,11 +216,16 @@ var _ = ginkgo.Describe("[Compatibility: BinaryUDPPacket]", func() {
 		if !knownVersion || !supportsV2 {
 			ginkgo.Skip(fmt.Sprintf("baseline version %q does not have known wire protocol v2 support", compatCtx.BaselineVersion))
 		}
+		// Upstream 0.69.0 used v1 UDP payload framing even with v2 control;
+		// 0.69.1 fixed both proxy directions. Default-protocol UDP is tested above.
+		if strings.TrimPrefix(compatCtx.BaselineVersion, "v") == "0.69.0" {
+			ginkgo.Skip("upstream 0.69.0 UDP/v2 payload framing is broken; fixed in 0.69.1")
+		}
 	})
 
 	ginkgo.It("current frps falls back to JSON for baseline frpc", func() {
 		portName := port.GenName("CompatBinaryUDPBaselineFRPC")
-		clientConf := udpClientConfig("udp", portName, `transport.wireProtocol = "v2"`)
+		clientConf := udpClientConfig(portName, `transport.wireProtocol = "v2"`)
 		f.RunProcessesWithBinaries(
 			compatCtx.CurrentFRPSPath,
 			compatCtx.BaselineFRPCPath,
@@ -216,7 +237,7 @@ var _ = ginkgo.Describe("[Compatibility: BinaryUDPPacket]", func() {
 
 	ginkgo.It("current frpc falls back to JSON for baseline frps", func() {
 		portName := port.GenName("CompatBinaryUDPBaselineFRPS")
-		clientConf := udpClientConfig("udp", portName, `transport.wireProtocol = "v2"`)
+		clientConf := udpClientConfig(portName, `transport.wireProtocol = "v2"`)
 		f.RunProcessesWithBinaries(
 			compatCtx.BaselineFRPSPath,
 			compatCtx.CurrentFRPCPath,
@@ -243,7 +264,7 @@ remotePort = {{ .%s }}
 `, consts.PortServerName, extra, proxyName, framework.TCPEchoServerPort, remotePortName)
 }
 
-func udpClientConfig(proxyName string, remotePortName string, extra string) string {
+func udpClientConfig(remotePortName string, extra string) string {
 	return fmt.Sprintf(`
 serverAddr = "127.0.0.1"
 serverPort = {{ .%s }}
@@ -252,11 +273,11 @@ log.level = "trace"
 %s
 
 [[proxies]]
-name = "%s"
+name = "udp"
 type = "udp"
 localPort = {{ .%s }}
 remotePort = {{ .%s }}
-`, consts.PortServerName, extra, proxyName, framework.UDPEchoServerPort, remotePortName)
+`, consts.PortServerName, extra, framework.UDPEchoServerPort, remotePortName)
 }
 
 func expectProcessExit(p *process.Process, timeout time.Duration) {

@@ -114,6 +114,7 @@ type ServiceOptions struct {
 	// HandleWorkConnCb is a callback function that is called when a new work connection is created.
 	//
 	// If it is not set, the default frpc implementation will be used.
+	// Returning false takes ownership of conn; close it when the work ends.
 	HandleWorkConnCb func(*v1.ProxyBaseConfig, net.Conn, *msg.StartWorkConn) bool
 }
 
@@ -336,12 +337,24 @@ func (svr *Service) keepControllerWorking() {
 		return
 	}
 	<-ctl.Done()
+	svr.lifecycleMu.Lock()
+	closing := svr.closeRequested
+	svr.lifecycleMu.Unlock()
+	if closing {
+		return
+	}
 
 	// There is a situation where the login is successful but due to certain reasons,
 	// the control immediately exits. It is necessary to limit the frequency of reconnection in this case.
 	// The interval for the first three retries in 1 minute will be very short, and then it will increase exponentially.
 	// The maximum interval is 20 seconds.
 	wait.BackoffUntil(func() (bool, error) {
+		svr.lifecycleMu.Lock()
+		closing := svr.closeRequested
+		svr.lifecycleMu.Unlock()
+		if closing {
+			return true, nil
+		}
 		// loopLoginUntilSuccess is another layer of loop that will continuously attempt to
 		// login to the server until successful.
 		svr.loopLoginUntilSuccess(20*time.Second, false)
@@ -372,6 +385,12 @@ func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginE
 	xl := xlog.FromContextSafe(svr.ctx)
 
 	loginFunc := func() (bool, error) {
+		svr.lifecycleMu.Lock()
+		closing := svr.closeRequested
+		svr.lifecycleMu.Unlock()
+		if closing {
+			return true, nil
+		}
 		xl.Infof("try to connect to server...")
 		dialer := &controlSessionDialer{
 			ctx:              svr.ctx,
@@ -394,6 +413,14 @@ func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginE
 			return false, context.Cause(svr.ctx)
 		}
 
+		svr.lifecycleMu.Lock()
+		closing = svr.closeRequested
+		svr.lifecycleMu.Unlock()
+		if closing {
+			closeSessionContext(sessionCtx)
+			return true, nil
+		}
+
 		svr.runID = sessionCtx.RunID
 		xl.AddPrefix(xlog.LogPrefix{Name: "runID", Value: svr.runID})
 		xl.Infof("login to server success, get run id [%s]", svr.runID)
@@ -404,6 +431,13 @@ func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginE
 			return false, err
 		}
 
+		// A completed dial cannot publish a replacement after Drain fences login.
+		svr.lifecycleMu.Lock()
+		if svr.closeRequested {
+			svr.lifecycleMu.Unlock()
+			closeSessionContext(sessionCtx)
+			return true, nil
+		}
 		svr.cfgMu.RLock()
 		proxyCfgs := svr.proxyCfgs
 		visitorCfgs := svr.visitorCfgs
@@ -411,6 +445,7 @@ func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginE
 
 		ctl, err := NewControl(svr.ctx, sessionCtx)
 		if err != nil {
+			svr.lifecycleMu.Unlock()
 			closeSessionContext(sessionCtx)
 			xl.Errorf("new control error: %v", err)
 			return false, err
@@ -418,13 +453,15 @@ func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginE
 		ctl.SetInWorkConnCallback(svr.handleWorkConnCb)
 
 		ctl.Run(proxyCfgs, visitorCfgs)
-		// close and replace previous control
 		svr.ctlMu.Lock()
-		if svr.ctl != nil {
-			svr.ctl.Close()
-		}
+		previous := svr.ctl
 		svr.ctl = ctl
 		svr.ctlMu.Unlock()
+		svr.lifecycleMu.Unlock()
+		// Teardown cannot hold the service shutdown or publication locks.
+		if previous != nil {
+			previous.Close()
+		}
 		return true, nil
 	}
 
@@ -510,6 +547,47 @@ func (svr *Service) UpdateConfigSource(
 		return err
 	}
 	return nil
+}
+
+// PrepareDrain synchronously prevents another control from being published.
+// Call it before scheduling Drain; Drain still withdraws routing and waits for work.
+func (svr *Service) PrepareDrain() {
+	svr.lifecycleMu.Lock()
+	svr.closeRequested = true
+	svr.lifecycleMu.Unlock()
+}
+
+// Drain withdraws proxy routing and keeps existing work alive until it finishes
+// or ctx expires. Close can interrupt the drain. The service cannot reconnect.
+// With no active control, it closes the service immediately.
+// Control loss closes independent non-mux work too. If it precedes drain
+// completion, Drain returns net.ErrClosed instead of hiding the lost connection.
+func (svr *Service) Drain(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("drain context is nil")
+	}
+	svr.PrepareDrain()
+	svr.ctlMu.RLock()
+	ctl := svr.ctl
+	svr.ctlMu.RUnlock()
+	defer svr.Close()
+	if ctl == nil {
+		return ctx.Err()
+	}
+	return ctl.Drain(ctx)
+}
+
+// CloseProxyConnections cuts work on the current control, leaving siblings untouched.
+// It is ignored without a control or for an unknown name. A reconnect uses the configured
+// proxy set again; this is not persistent authorization. Remove the proxy configuration
+// or Drain to stop routing. It also works while Drain waits for existing work.
+func (svr *Service) CloseProxyConnections(proxyName string) {
+	svr.ctlMu.RLock()
+	ctl := svr.ctl
+	svr.ctlMu.RUnlock()
+	if ctl != nil {
+		ctl.CloseProxyConnections(proxyName)
+	}
 }
 
 func (svr *Service) Close() {

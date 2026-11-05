@@ -22,12 +22,16 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/fatedier/frp/client/event"
 	v1 "github.com/fatedier/frp/pkg/config/v1"
 	"github.com/fatedier/frp/pkg/msg"
 	"github.com/fatedier/frp/pkg/util/xlog"
 )
 
-type closingProxy struct{ calls atomic.Int64 }
+type closingProxy struct {
+	calls  atomic.Int64
+	closes atomic.Int64
+}
 
 func (*closingProxy) Run() error { return nil }
 func (p *closingProxy) InWorkConn(conn net.Conn, _ *msg.StartWorkConn) {
@@ -37,7 +41,7 @@ func (p *closingProxy) InWorkConn(conn net.Conn, _ *msg.StartWorkConn) {
 
 func (*closingProxy) SetInWorkConnCallback(func(*v1.ProxyBaseConfig, net.Conn, *msg.StartWorkConn) bool) {
 }
-func (*closingProxy) Close() {}
+func (p *closingProxy) Close() { p.closes.Add(1) }
 
 func TestWrapperInWorkConnSynchronizesPhase(t *testing.T) {
 	proxy := &closingProxy{}
@@ -97,5 +101,31 @@ func TestWrapperInWorkConnSynchronizesPhase(t *testing.T) {
 		var buffer [1]byte
 		_, _ = peer.Read(buffer[:])
 		_ = peer.Close()
+	}
+}
+
+func TestWrapperWithdrawPreservesHandlerUntilStop(t *testing.T) {
+	pxy := &closingProxy{}
+	var withdrawals atomic.Int64
+	wrapper := &Wrapper{
+		WorkingStatus: WorkingStatus{Phase: ProxyPhaseRunning},
+		pxy:           pxy, closeCh: make(chan struct{}), healthNotifyCh: make(chan struct{}),
+		handler: func(payload any) error {
+			if _, ok := payload.(*event.CloseProxyPayload); !ok {
+				t.Errorf("unexpected withdrawal event %T", payload)
+			}
+			withdrawals.Add(1)
+			return nil
+		},
+	}
+	wrapper.Withdraw()
+	wrapper.Withdraw()
+	if pxy.closes.Load() != 0 || withdrawals.Load() != 1 || wrapper.Phase != ProxyPhaseClosed {
+		t.Fatal("withdrawal closed the handler or repeated registration cleanup")
+	}
+	wrapper.Stop()
+	wrapper.Stop()
+	if pxy.closes.Load() != 1 || withdrawals.Load() != 1 {
+		t.Fatal("final stop did not close the handler exactly once")
 	}
 }
