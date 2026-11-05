@@ -188,6 +188,19 @@ func TestControlConfigRemovalClosesWorkAndReaddClearsRevocation(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctl.CloseProxyConnections("readded")
+	sibling := &v1.TCPProxyConfig{ProxyBaseConfig: v1.ProxyBaseConfig{Name: "sibling", Type: "tcp"}}
+	if err := ctl.UpdateAllConfigurer([]v1.ProxyConfigurer{&changed, sibling}, nil); err != nil {
+		t.Fatal(err)
+	}
+	late, latePeer := net.Pipe()
+	defer latePeer.Close()
+	if ctl.workConnections.track(msg.NewConn(late, msg.NewV1ReadWriter(late)), "readded") {
+		t.Fatal("unrelated proxy reload cleared revocation")
+	}
+	_ = latePeer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := latePeer.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("revoked work stayed open after unrelated reload: %v", err)
+	}
 	if err := ctl.UpdateAllConfigurer(nil, nil); err != nil {
 		t.Fatal(err)
 	}

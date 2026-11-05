@@ -571,7 +571,7 @@ func (svr *Service) Drain(ctx context.Context) error {
 	return ctl.Drain(ctx)
 }
 
-// CloseProxyConnections revokes one local proxy until the next config update.
+// CloseProxyConnections revokes local work until this proxy is changed or removed.
 // It leaves siblings untouched and also works while Drain waits for work.
 // It does not withdraw routing; callers must Drain or update the configured set.
 func (svr *Service) CloseProxyConnections(proxyName string) {

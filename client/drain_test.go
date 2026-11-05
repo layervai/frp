@@ -211,10 +211,14 @@ func TestWorkConnRevocationRejectsLateNameBeforeDrain(t *testing.T) {
 	_ = accepted.Close()
 }
 
-func TestWorkConnRevocationClearsOnConfigUpdate(t *testing.T) {
+func TestWorkConnRevocationClearsForOneProxy(t *testing.T) {
 	var tracker workConnTracker
 	tracker.closeProxy("readded")
-	tracker.clearRevocations()
+	tracker.closeProxy("sibling")
+	tracker.clearRevocation("readded")
+	if _, revoked := tracker.revoked["sibling"]; !revoked {
+		t.Fatal("clearing one proxy cleared sibling revocation")
+	}
 	conn, peer := net.Pipe()
 	defer peer.Close()
 	tracked := msg.NewConn(conn, msg.NewReadWriter(conn, wire.ProtocolV1))

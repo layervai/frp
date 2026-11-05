@@ -218,7 +218,8 @@ func (ctl *Control) closeSession() {
 }
 
 // Drain withdraws proxy routing and waits for assigned work until ctx expires.
-// Visitors stop immediately. Expiry, control loss or explicit Close forces teardown.
+// New assignments after local withdrawal are rejected. Visitors stop immediately.
+// Expiry, control loss or explicit Close forces teardown.
 func (ctl *Control) Drain(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("drain context is nil")
@@ -237,7 +238,7 @@ func (ctl *Control) Drain(ctx context.Context) error {
 	return ctl.workConnections.wait(ctx)
 }
 
-// CloseProxyConnections revokes local work until the next config update.
+// CloseProxyConnections revokes local work until this proxy is changed or removed.
 // Use Drain or a config update to withdraw routing as well.
 func (ctl *Control) CloseProxyConnections(proxyName string) {
 	ctl.updateMu.Lock()
@@ -354,14 +355,17 @@ func (ctl *Control) UpdateAllConfigurer(proxyCfgs []v1.ProxyConfigurer, visitorC
 	}
 	for _, previous := range ctl.pm.GetAllProxyStatus() {
 		cfg, keep := next[previous.Name]
-		changedPlugin := previous.Cfg.GetBaseConfig().Plugin.Type != "" && !reflect.DeepEqual(previous.Cfg, cfg)
+		changed := !reflect.DeepEqual(previous.Cfg, cfg)
+		changedPlugin := previous.Cfg.GetBaseConfig().Plugin.Type != "" && changed
 		if !keep || changedPlugin {
 			// Release retained work before a removed plugin waits for its handlers.
 			ctl.workConnections.closeProxy(previous.Name)
 		}
+		if !keep || changed {
+			ctl.workConnections.clearRevocation(previous.Name)
+		}
 	}
 	ctl.vm.UpdateAll(visitorCfgs)
 	ctl.pm.UpdateAll(proxyCfgs)
-	ctl.workConnections.clearRevocations()
 	return nil
 }

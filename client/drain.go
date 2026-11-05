@@ -153,8 +153,8 @@ func (t *workConnTracker) closeProxy(proxyName string) {
 	}
 }
 
-func (t *workConnTracker) clearRevocations() {
+func (t *workConnTracker) clearRevocation(proxyName string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.revoked = nil
+	delete(t.revoked, proxyName)
 }
