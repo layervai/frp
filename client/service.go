@@ -336,6 +336,12 @@ func (svr *Service) keepControllerWorking() {
 		return
 	}
 	<-ctl.Done()
+	svr.lifecycleMu.Lock()
+	closing := svr.closeRequested
+	svr.lifecycleMu.Unlock()
+	if closing {
+		return
+	}
 
 	// There is a situation where the login is successful but due to certain reasons,
 	// the control immediately exits. It is necessary to limit the frequency of reconnection in this case.
@@ -372,6 +378,12 @@ func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginE
 	xl := xlog.FromContextSafe(svr.ctx)
 
 	loginFunc := func() (bool, error) {
+		svr.lifecycleMu.Lock()
+		closing := svr.closeRequested
+		svr.lifecycleMu.Unlock()
+		if closing {
+			return true, nil
+		}
 		xl.Infof("try to connect to server...")
 		dialer := &controlSessionDialer{
 			ctx:              svr.ctx,
@@ -394,6 +406,14 @@ func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginE
 			return false, context.Cause(svr.ctx)
 		}
 
+		svr.lifecycleMu.Lock()
+		closing = svr.closeRequested
+		svr.lifecycleMu.Unlock()
+		if closing {
+			closeSessionContext(sessionCtx)
+			return true, nil
+		}
+
 		svr.runID = sessionCtx.RunID
 		xl.AddPrefix(xlog.LogPrefix{Name: "runID", Value: svr.runID})
 		xl.Infof("login to server success, get run id [%s]", svr.runID)
@@ -404,6 +424,13 @@ func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginE
 			return false, err
 		}
 
+		// A completed dial cannot publish a replacement after Drain fences login.
+		svr.lifecycleMu.Lock()
+		defer svr.lifecycleMu.Unlock()
+		if svr.closeRequested {
+			closeSessionContext(sessionCtx)
+			return true, nil
+		}
 		svr.cfgMu.RLock()
 		proxyCfgs := svr.proxyCfgs
 		visitorCfgs := svr.visitorCfgs
@@ -510,6 +537,36 @@ func (svr *Service) UpdateConfigSource(
 		return err
 	}
 	return nil
+}
+
+// Drain withdraws proxy routing and keeps existing work alive until it finishes
+// or ctx expires. Close can interrupt the drain. The service cannot reconnect.
+func (svr *Service) Drain(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("drain context is nil")
+	}
+	svr.lifecycleMu.Lock()
+	svr.closeRequested = true
+	svr.lifecycleMu.Unlock()
+	svr.ctlMu.RLock()
+	ctl := svr.ctl
+	svr.ctlMu.RUnlock()
+	defer svr.Close()
+	if ctl == nil {
+		return ctx.Err()
+	}
+	return ctl.Drain(ctx)
+}
+
+// CloseProxyConnections stops existing work for one local proxy name without
+// interrupting siblings. It also works while Drain waits for remaining work.
+func (svr *Service) CloseProxyConnections(proxyName string) {
+	svr.ctlMu.RLock()
+	ctl := svr.ctl
+	svr.ctlMu.RUnlock()
+	if ctl != nil {
+		ctl.CloseProxyConnections(proxyName)
+	}
 }
 
 func (svr *Service) Close() {

@@ -86,9 +86,20 @@ func (pm *Manager) SetInWorkConnCallback(cb func(*v1.ProxyBaseConfig, net.Conn, 
 	pm.inWorkConnCallback = cb
 }
 
+// Withdraw removes routing while retaining handlers for already assigned work.
+func (pm *Manager) Withdraw() {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.closed = true
+	for _, pxy := range pm.proxies {
+		pxy.Withdraw()
+	}
+}
+
 func (pm *Manager) Close() {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+	pm.closed = true
 	for _, pxy := range pm.proxies {
 		pxy.Stop()
 	}
@@ -146,6 +157,9 @@ func (pm *Manager) UpdateAll(proxyCfgs []v1.ProxyConfigurer) {
 	})
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+	if pm.closed {
+		return
+	}
 
 	delPxyNames := make([]string, 0)
 	for name, pxy := range pm.proxies {

@@ -16,7 +16,9 @@ package client
 
 import (
 	"context"
+	"errors"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -65,7 +67,9 @@ type Control struct {
 	// manage all visitors
 	vm *visitor.Manager
 
-	doneCh chan struct{}
+	doneCh          chan struct{}
+	workConnections workConnTracker
+	updateMu        sync.Mutex
 
 	// of time.Time, last time got the Pong message
 	lastPong atomic.Value
@@ -157,7 +161,13 @@ func (ctl *Control) handleReqWorkConn(_ msg.Message) {
 
 	startMsg.ProxyName = naming.StripUserPrefix(ctl.sessionCtx.Common.User, startMsg.ProxyName)
 
-	// dispatch this work connection to related proxy
+	// Keep acceptance and handler handoff atomic with routing withdrawal.
+	ctl.updateMu.Lock()
+	defer ctl.updateMu.Unlock()
+	// Only assigned work is active; idle pool connections must not hold a drain open.
+	if !ctl.workConnections.track(workConn, startMsg.ProxyName) {
+		return
+	}
 	ctl.pm.HandleWorkConn(startMsg.ProxyName, workConn, &startMsg)
 }
 
@@ -201,8 +211,29 @@ func (ctl *Control) handlePong(m msg.Message) {
 
 // closeSession closes the control connection.
 func (ctl *Control) closeSession() {
+	ctl.workConnections.closeAll()
 	ctl.sessionCtx.Conn.Close()
 	ctl.sessionCtx.Connector.Close()
+}
+
+// Drain withdraws proxy routing and waits for assigned work until ctx expires.
+// Visitors stop immediately. Expiry or an explicit Close still forces teardown.
+func (ctl *Control) Drain(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("drain context is nil")
+	}
+	ctl.updateMu.Lock()
+	ctl.workConnections.beginDrain()
+	ctl.pm.Withdraw()
+	ctl.vm.Close()
+	ctl.updateMu.Unlock()
+	defer ctl.Close()
+	return ctl.workConnections.wait(ctx)
+}
+
+// CloseProxyConnections closes only work assigned to this local proxy name.
+func (ctl *Control) CloseProxyConnections(proxyName string) {
+	ctl.workConnections.closeProxy(proxyName)
 }
 
 func (ctl *Control) Close() error {
@@ -210,12 +241,17 @@ func (ctl *Control) Close() error {
 }
 
 func (ctl *Control) GracefulClose(d time.Duration) error {
+	// Release work before closing plugins on a forced stop: a plugin may wait
+	// for its handlers, which themselves need the work connection to close.
+	if d <= 0 {
+		ctl.closeSession()
+	}
 	ctl.pm.Close()
 	ctl.vm.Close()
-
-	time.Sleep(d)
-
-	ctl.closeSession()
+	if d > 0 {
+		time.Sleep(d)
+		ctl.closeSession()
+	}
 	return nil
 }
 
@@ -292,6 +328,11 @@ func (ctl *Control) worker() {
 }
 
 func (ctl *Control) UpdateAllConfigurer(proxyCfgs []v1.ProxyConfigurer, visitorCfgs []v1.VisitorConfigurer) error {
+	ctl.updateMu.Lock()
+	defer ctl.updateMu.Unlock()
+	if ctl.workConnections.isDraining() {
+		return errors.New("control is draining")
+	}
 	ctl.vm.UpdateAll(visitorCfgs)
 	ctl.pm.UpdateAll(proxyCfgs)
 	return nil
