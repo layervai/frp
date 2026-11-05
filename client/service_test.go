@@ -746,73 +746,79 @@ func TestServiceCloseBeforeOrDuringRun(t *testing.T) {
 }
 
 func TestServiceDrainDuringAcceptedLoginCannotPublishControl(t *testing.T) {
-	clientConn, serverConn := net.Pipe()
-	connector := &testConnector{conn: clientConn}
-	defer clientConn.Close()
-	defer serverConn.Close()
-	accepted := make(chan struct{})
-	resume := make(chan struct{})
-	serverErr := make(chan error, 1)
-	go func() {
-		rw := msg.NewV1ReadWriter(serverConn)
-		var login msg.Login
-		if err := rw.ReadMsgInto(&login); err != nil {
-			serverErr <- err
-			return
-		}
-		serverErr <- rw.WriteMsg(&msg.LoginResp{RunID: "drain-raced-login"})
-	}()
-	proxyCfg := &observedProxyConfigurer{TCPProxyConfig: &v1.TCPProxyConfig{
-		ProxyBaseConfig: v1.ProxyBaseConfig{
-			Name: "must-not-start-after-drain", Type: "tcp",
-			ProxyBackend: v1.ProxyBackend{LocalPort: 10080},
-		},
-	}}
-	configSource := source.NewConfigSource()
-	if err := configSource.ReplaceAll([]v1.ProxyConfigurer{proxyCfg}, nil); err != nil {
-		t.Fatal(err)
-	}
-	svr, err := NewService(ServiceOptions{
-		Common:                 &v1.ClientCommonConfig{},
-		ConfigSourceAggregator: source.NewAggregator(configSource),
-		ConnectorCreator:       func(context.Context, *v1.ClientCommonConfig) Connector { return connector },
-		OnFirstLoginSuccess:    func(string) error { close(accepted); <-resume; return nil },
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	proxyCfg.baseConfigReads.Store(0)
-	runDone := make(chan error, 1)
-	go func() { runDone <- svr.Run(context.Background()) }()
-	select {
-	case <-accepted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("login not accepted")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if err := svr.Drain(ctx); err != nil {
-		t.Fatal(err)
-	}
-	close(resume)
-	select {
-	case <-runDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("drained service did not exit")
-	}
-	if err := <-serverErr; err != nil {
-		t.Fatal(err)
-	}
-	svr.ctlMu.RLock()
-	ctl := svr.ctl
-	svr.ctlMu.RUnlock()
-	if proxyCfg.baseConfigReads.Load() != 0 {
-		t.Fatal("raced login started proxy registration after drain")
-	}
-	if ctl != nil {
-		t.Fatal("in-flight login published a control after drain")
-	}
-	if !connector.closed.Load() {
-		t.Fatal("raced login connector not closed")
+	for _, prepareOnly := range []bool{false, true} {
+		t.Run(fmt.Sprintf("prepareOnly=%t", prepareOnly), func(t *testing.T) {
+			clientConn, serverConn := net.Pipe()
+			connector := &testConnector{conn: clientConn}
+			defer clientConn.Close()
+			defer serverConn.Close()
+			accepted := make(chan struct{})
+			resume := make(chan struct{})
+			serverErr := make(chan error, 1)
+			go func() {
+				rw := msg.NewV1ReadWriter(serverConn)
+				var login msg.Login
+				if err := rw.ReadMsgInto(&login); err != nil {
+					serverErr <- err
+					return
+				}
+				serverErr <- rw.WriteMsg(&msg.LoginResp{RunID: "drain-raced-login"})
+			}()
+			proxyCfg := &observedProxyConfigurer{TCPProxyConfig: &v1.TCPProxyConfig{
+				ProxyBaseConfig: v1.ProxyBaseConfig{
+					Name: "must-not-start-after-drain", Type: "tcp",
+					ProxyBackend: v1.ProxyBackend{LocalPort: 10080},
+				},
+			}}
+			configSource := source.NewConfigSource()
+			if err := configSource.ReplaceAll([]v1.ProxyConfigurer{proxyCfg}, nil); err != nil {
+				t.Fatal(err)
+			}
+			svr, err := NewService(ServiceOptions{
+				Common:                 &v1.ClientCommonConfig{},
+				ConfigSourceAggregator: source.NewAggregator(configSource),
+				ConnectorCreator:       func(context.Context, *v1.ClientCommonConfig) Connector { return connector },
+				OnFirstLoginSuccess:    func(string) error { close(accepted); <-resume; return nil },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			proxyCfg.baseConfigReads.Store(0)
+			runDone := make(chan error, 1)
+			go func() { runDone <- svr.Run(context.Background()) }()
+			select {
+			case <-accepted:
+			case <-time.After(5 * time.Second):
+				t.Fatal("login not accepted")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if prepareOnly {
+				svr.PrepareDrain()
+			} else if err := svr.Drain(ctx); err != nil {
+				t.Fatal(err)
+			}
+			close(resume)
+			select {
+			case <-runDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("drained service did not exit")
+			}
+			if err := <-serverErr; err != nil {
+				t.Fatal(err)
+			}
+			svr.ctlMu.RLock()
+			ctl := svr.ctl
+			svr.ctlMu.RUnlock()
+			if proxyCfg.baseConfigReads.Load() != 0 {
+				t.Fatal("raced login started proxy registration after drain")
+			}
+			if ctl != nil {
+				t.Fatal("in-flight login published a control after drain")
+			}
+			if !connector.closed.Load() {
+				t.Fatal("raced login connector not closed")
+			}
+		})
 	}
 }

@@ -549,6 +549,14 @@ func (svr *Service) UpdateConfigSource(
 	return nil
 }
 
+// PrepareDrain synchronously prevents another control from being published.
+// Call it before scheduling Drain; Drain still withdraws routing and waits for work.
+func (svr *Service) PrepareDrain() {
+	svr.lifecycleMu.Lock()
+	svr.closeRequested = true
+	svr.lifecycleMu.Unlock()
+}
+
 // Drain withdraws proxy routing and keeps existing work alive until it finishes
 // or ctx expires. Close can interrupt the drain. The service cannot reconnect.
 // With no active control, it closes the service immediately.
@@ -558,9 +566,7 @@ func (svr *Service) Drain(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("drain context is nil")
 	}
-	svr.lifecycleMu.Lock()
-	svr.closeRequested = true
-	svr.lifecycleMu.Unlock()
+	svr.PrepareDrain()
 	svr.ctlMu.RLock()
 	ctl := svr.ctl
 	svr.ctlMu.RUnlock()
