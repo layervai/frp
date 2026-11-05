@@ -172,6 +172,21 @@ func TestControlConfigRemovalClosesWorkAndReaddClearsRevocation(t *testing.T) {
 	if !ctl.workConnections.track(tracked, "readded") {
 		t.Fatal("initial work rejected")
 	}
+	changed := *cfg
+	changed.LocalPort = 10081
+	if err := ctl.UpdateAllConfigurer([]v1.ProxyConfigurer{&changed}, nil); err != nil {
+		t.Fatal(err)
+	}
+	sent := make(chan error, 1)
+	go func() { _, err := tracked.Write([]byte("x")); sent <- err }()
+	_ = workPeer.SetReadDeadline(time.Now().Add(time.Second))
+	var payload [1]byte
+	if _, err := io.ReadFull(workPeer, payload[:]); err != nil || payload[0] != 'x' {
+		t.Fatalf("plain-proxy reload interrupted existing work: %v", err)
+	}
+	if err := <-sent; err != nil {
+		t.Fatal(err)
+	}
 	ctl.CloseProxyConnections("readded")
 	if err := ctl.UpdateAllConfigurer(nil, nil); err != nil {
 		t.Fatal(err)

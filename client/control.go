@@ -341,7 +341,7 @@ func (ctl *Control) worker() {
 	close(ctl.doneCh)
 }
 
-// UpdateAllConfigurer closes work for changed or removed proxies before replacing handlers.
+// UpdateAllConfigurer closes removed work and changed plugin work before replacing handlers.
 func (ctl *Control) UpdateAllConfigurer(proxyCfgs []v1.ProxyConfigurer, visitorCfgs []v1.VisitorConfigurer) error {
 	ctl.updateMu.Lock()
 	defer ctl.updateMu.Unlock()
@@ -353,7 +353,9 @@ func (ctl *Control) UpdateAllConfigurer(proxyCfgs []v1.ProxyConfigurer, visitorC
 		next[cfg.GetBaseConfig().Name] = cfg
 	}
 	for _, previous := range ctl.pm.GetAllProxyStatus() {
-		if cfg, keep := next[previous.Name]; !keep || !reflect.DeepEqual(previous.Cfg, cfg) {
+		cfg, keep := next[previous.Name]
+		changedPlugin := previous.Cfg.GetBaseConfig().Plugin.Type != "" && !reflect.DeepEqual(previous.Cfg, cfg)
+		if !keep || changedPlugin {
 			// Release retained work before a removed plugin waits for its handlers.
 			ctl.workConnections.closeProxy(previous.Name)
 		}

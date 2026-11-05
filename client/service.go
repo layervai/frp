@@ -349,6 +349,12 @@ func (svr *Service) keepControllerWorking() {
 	// The interval for the first three retries in 1 minute will be very short, and then it will increase exponentially.
 	// The maximum interval is 20 seconds.
 	wait.BackoffUntil(func() (bool, error) {
+		svr.lifecycleMu.Lock()
+		closing := svr.closeRequested
+		svr.lifecycleMu.Unlock()
+		if closing {
+			return true, nil
+		}
 		// loopLoginUntilSuccess is another layer of loop that will continuously attempt to
 		// login to the server until successful.
 		svr.loopLoginUntilSuccess(20*time.Second, false)
@@ -546,6 +552,7 @@ func (svr *Service) UpdateConfigSource(
 // Drain withdraws proxy routing and keeps existing work alive until it finishes
 // or ctx expires. Close can interrupt the drain. The service cannot reconnect.
 // With no active control, it closes the service immediately.
+// A failed control returns net.ErrClosed so a lost connection is not hidden.
 func (svr *Service) Drain(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("drain context is nil")

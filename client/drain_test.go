@@ -282,3 +282,12 @@ func TestControlDrainDeadlineClosesWorkWhileUpdateLockIsBlocked(t *testing.T) {
 		t.Fatal("drain stayed blocked after update completed")
 	}
 }
+
+func TestServiceDrainReportsAlreadyFailedControl(t *testing.T) {
+	service := newGracefulCloseTestService()
+	defer service.ctl.Close()
+	service.ctl.closeSession()
+	if err := service.Drain(t.Context()); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("already failed control was hidden by drain: %v", err)
+	}
+}
