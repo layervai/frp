@@ -246,3 +246,39 @@ func TestControlDrainDeadlineClosesLiveWorkAndRejectsUpdate(t *testing.T) {
 		t.Fatal("draining control accepted configuration update")
 	}
 }
+
+func TestControlDrainDeadlineClosesWorkWhileUpdateLockIsBlocked(t *testing.T) {
+	ctl := newGracefulCloseTestService().ctl
+	defer ctl.Close()
+	conn, peer := net.Pipe()
+	defer peer.Close()
+	tracked := msg.NewConn(conn, msg.NewV1ReadWriter(conn))
+	if !ctl.workConnections.track(tracked, "blocked") {
+		t.Fatal("initial work rejected")
+	}
+	ctl.updateMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			ctl.updateMu.Unlock()
+		}
+	}()
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	drained := make(chan error, 1)
+	go func() { drained <- ctl.Drain(ctx) }()
+	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := peer.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("blocked update delayed authorization teardown: %v", err)
+	}
+	ctl.updateMu.Unlock()
+	locked = false
+	select {
+	case err := <-drained:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("blocked drain = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("drain stayed blocked after update completed")
+	}
+}
