@@ -151,52 +151,49 @@ func (c *Controller) GenSid() string {
 }
 
 func (c *Controller) HandleVisitor(m *msg.NatHoleVisitor, transporter transport.MessageTransporter, visitorUser string) {
-	if m.PreCheck {
-		c.mu.RLock()
-		cfg, ok := c.clientCfgs[m.ProxyName]
-		c.mu.RUnlock()
-		if !ok {
-			_ = transporter.Send(c.GenNatHoleResponse(m.TransactionID, nil, fmt.Sprintf("xtcp server for [%s] doesn't exist", m.ProxyName)))
-			return
-		}
-		if !slices.Contains(cfg.allowUsers, visitorUser) && !slices.Contains(cfg.allowUsers, "*") {
-			_ = transporter.Send(c.GenNatHoleResponse(m.TransactionID, nil, fmt.Sprintf("xtcp visitor user [%s] not allowed for [%s]", visitorUser, m.ProxyName)))
-			return
-		}
-		_ = transporter.Send(c.GenNatHoleResponse(m.TransactionID, nil, ""))
-		return
-	}
-
-	sid := c.GenSid()
-	session := &Session{
-		sid:                sid,
-		visitorMsg:         m,
-		visitorTransporter: transporter,
-		notifyCh:           make(chan struct{}, 1),
-	}
 	var (
 		clientCfg *ClientCfg
-		ok        bool
+		session   *Session
 	)
 	err := func() error {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 
+		var ok bool
 		clientCfg, ok = c.clientCfgs[m.ProxyName]
 		if !ok {
 			return fmt.Errorf("xtcp server for [%s] doesn't exist", m.ProxyName)
 		}
+		if !slices.Contains(clientCfg.allowUsers, visitorUser) && !slices.Contains(clientCfg.allowUsers, "*") {
+			return fmt.Errorf("xtcp visitor user [%s] not allowed for [%s]", visitorUser, m.ProxyName)
+		}
+		if m.PreCheck {
+			return nil
+		}
 		if !util.ConstantTimeEqString(m.SignKey, util.GetAuthKey(clientCfg.sk, m.Timestamp)) {
 			return fmt.Errorf("xtcp connection of [%s] auth failed", m.ProxyName)
 		}
-		c.sessions[sid] = session
+		session = &Session{
+			sid:                c.GenSid(),
+			visitorMsg:         m,
+			visitorTransporter: transporter,
+			notifyCh:           make(chan struct{}, 1),
+		}
+		c.sessions[session.sid] = session
 		return nil
 	}()
 	if err != nil {
-		log.Warnf("handle visitorMsg error: %v", err)
+		if !m.PreCheck {
+			log.Warnf("handle visitorMsg error: %v", err)
+		}
 		_ = transporter.Send(c.GenNatHoleResponse(m.TransactionID, nil, err.Error()))
 		return
 	}
+	if m.PreCheck {
+		_ = transporter.Send(c.GenNatHoleResponse(m.TransactionID, nil, ""))
+		return
+	}
+	sid := session.sid
 	log.Tracef("handle visitor message, sid [%s], server name: %s", sid, m.ProxyName)
 
 	defer func() {
