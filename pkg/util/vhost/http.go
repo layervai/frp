@@ -24,6 +24,8 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	libio "github.com/fatedier/golib/io"
@@ -37,6 +39,7 @@ var ErrNoRouteFound = errors.New("no route found")
 
 type HTTPReverseProxyOptions struct {
 	ResponseHeaderTimeoutS int64
+	TrustForwardedHost     bool
 }
 
 type HTTPReverseProxy struct {
@@ -59,6 +62,12 @@ func NewHTTPReverseProxy(option HTTPReverseProxyOptions, vhostRouter *Routers) *
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.Out.Header["X-Forwarded-For"] = r.In.Header["X-Forwarded-For"]
 			r.SetXForwarded()
+			if values := r.In.Header.Values("X-Forwarded-Host"); option.TrustForwardedHost && len(values) == 1 {
+				host := values[0]
+				if validForwardedHost(host) {
+					r.Out.Header.Set("X-Forwarded-Host", host)
+				}
+			}
 			req := r.Out
 			req.URL.Scheme = "http"
 			reqRouteInfo := req.Context().Value(RouteInfoKey).(*RequestRouteInfo)
@@ -308,4 +317,42 @@ func (rp *HTTPReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request)
 	} else {
 		rp.proxy.ServeHTTP(rw, newreq)
 	}
+}
+
+// Accept host characters only, never URL or HTML syntax from a forwarded header.
+func validForwardedHost(host string) bool {
+	if strings.Contains(host, ":") {
+		if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+			return net.ParseIP(host[1:len(host)-1]) != nil
+		}
+		name, port, err := net.SplitHostPort(host)
+		n, portErr := strconv.Atoi(port)
+		if err != nil || portErr != nil || n < 1 || n > 65535 {
+			return false
+		}
+		for _, c := range port {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+		host = name
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	if len(host) == 0 || len(host) > 253 {
+		return false
+	}
+	for label := range strings.SplitSeq(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, c := range label {
+			if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
 }

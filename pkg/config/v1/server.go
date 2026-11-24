@@ -47,6 +47,11 @@ type ServerConfig struct {
 	// VhostHTTPTimeout specifies the response header timeout for the Vhost
 	// HTTP server, in seconds. By default, this value is 60.
 	VhostHTTPTimeout int64 `json:"vhostHTTPTimeout,omitempty"`
+	// VhostHTTPTrustForwardedHost preserves the host supplied by trusted ingress.
+	// Enable only when the HTTP listener is restricted to a proxy that replaces
+	// client-supplied X-Forwarded-Host. Applies to every proxy on this listener;
+	// forwarded scheme/port behavior is unchanged. The default is false.
+	VhostHTTPTrustForwardedHost bool `json:"vhostHTTPTrustForwardedHost,omitempty"`
 	// VhostHTTPSPort specifies the port that the server listens for HTTPS
 	// Vhost requests. If this value is 0, the server will not listen for HTTPS
 	// requests.

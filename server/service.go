@@ -297,6 +297,7 @@ func NewService(cfg *v1.ServerConfig) (*Service, error) {
 	if cfg.VhostHTTPPort > 0 {
 		rp := vhost.NewHTTPReverseProxy(vhost.HTTPReverseProxyOptions{
 			ResponseHeaderTimeoutS: cfg.VhostHTTPTimeout,
+			TrustForwardedHost:     cfg.VhostHTTPTrustForwardedHost,
 		}, svr.httpVhostRouter)
 		svr.rc.HTTPReverseProxy = rp
 

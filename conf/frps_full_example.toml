@@ -55,6 +55,11 @@ vhostHTTPSPort = 443
 # Response header timeout(seconds) for vhost http server, default is 60s
 # vhostHTTPTimeout = 60
 
+# Enable only behind trusted ingress that replaces client X-Forwarded-Host.
+# Restrict the HTTP listener to that ingress; never enable on a public listener.
+# Applies to all HTTP proxies on this listener; scheme/port handling is unchanged.
+# vhostHTTPTrustForwardedHost = false
+
 # tcpmuxHTTPConnectPort specifies the port that the server listens for TCP
 # HTTP CONNECT requests. If the value is 0, the server will not multiplex TCP
 # requests on one single port. If it's not - it will listen on this value for
