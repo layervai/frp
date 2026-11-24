@@ -493,6 +493,39 @@ var _ = ginkgo.Describe("[Feature: HTTP]", func() {
 		framework.ExpectEqualValues(consts.TestString, string(msg))
 	})
 
+	for _, trusted := range []bool{false, true} {
+		ginkgo.It(fmt.Sprintf("vhostHTTPTrustForwardedHost=%t", trusted), func() {
+			vhostHTTPPort := f.AllocPort()
+			serverConf := getDefaultServerConf(vhostHTTPPort)
+			serverConf += fmt.Sprintf("\nvhostHTTPTrustForwardedHost = %t\n", trusted)
+			localPort := f.AllocPort()
+			f.RunServer("", httpserver.New(
+				httpserver.WithBindPort(localPort),
+				httpserver.WithHandler(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+					_, _ = w.Write([]byte(req.Header.Get("X-Forwarded-Host")))
+				})),
+			))
+			clientConf := consts.DefaultClientConfig + fmt.Sprintf(`
+				[[proxies]]
+				name = "forwarded-host"
+				type = "http"
+				localPort = %d
+				customDomains = ["routing.example.com"]
+			`, localPort)
+			f.RunProcesses(serverConf, []string{clientConf})
+			want := "routing.example.com"
+			if trusted {
+				want = "browser.example.com"
+			}
+			framework.NewRequestExpect(f).Port(vhostHTTPPort).
+				RequestModify(func(r *request.Request) {
+					r.HTTP().HTTPHost("routing.example.com").HTTPHeaders(map[string]string{
+						"X-Forwarded-Host": "browser.example.com",
+					})
+				}).ExpectResp([]byte(want)).Ensure()
+		})
+	}
+
 	ginkgo.It("vhostHTTPTimeout", func() {
 		vhostHTTPPort := f.AllocPort()
 		serverConf := getDefaultServerConf(vhostHTTPPort)
