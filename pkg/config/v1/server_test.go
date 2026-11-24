@@ -27,6 +27,7 @@ func TestServerConfigComplete(t *testing.T) {
 	err := c.Complete()
 	require.NoError(err)
 
+	require.False(c.VhostHTTPTrustForwardedHost)
 	require.EqualValues("token", c.Auth.Method)
 	require.Equal(true, lo.FromPtr(c.Transport.TCPMux))
 	require.Equal(true, lo.FromPtr(c.DetailedErrorsToClient))

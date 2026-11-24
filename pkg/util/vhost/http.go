@@ -37,6 +37,7 @@ var ErrNoRouteFound = errors.New("no route found")
 
 type HTTPReverseProxyOptions struct {
 	ResponseHeaderTimeoutS int64
+	TrustForwardedHost     bool
 }
 
 type HTTPReverseProxy struct {
@@ -59,6 +60,9 @@ func NewHTTPReverseProxy(option HTTPReverseProxyOptions, vhostRouter *Routers) *
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.Out.Header["X-Forwarded-For"] = r.In.Header["X-Forwarded-For"]
 			r.SetXForwarded()
+			if option.TrustForwardedHost && r.In.Header.Get("X-Forwarded-Host") != "" {
+				r.Out.Header.Set("X-Forwarded-Host", r.In.Header.Get("X-Forwarded-Host"))
+			}
 			req := r.Out
 			req.URL.Scheme = "http"
 			reqRouteInfo := req.Context().Value(RouteInfoKey).(*RequestRouteInfo)
