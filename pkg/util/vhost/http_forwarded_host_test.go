@@ -21,7 +21,9 @@ func TestQURLTrustedBrowserHostSurvivesFRPVhost(t *testing.T) {
 	defer backend.Close()
 	for _, trusted := range []bool{false, true} {
 		proxy := NewHTTPReverseProxy(HTTPReverseProxyOptions{TrustForwardedHost: trusted}, NewRouters())
-		err := proxy.Register(RouteConfig{Domain: routingHost, CreateConnFn: func(string) (net.Conn, error) { return net.Dial("tcp", strings.TrimPrefix(backend.URL, "http://")) }})
+		err := proxy.Register(RouteConfig{Domain: routingHost, CreateConnFn: func(string) (net.Conn, error) {
+			return net.Dial("tcp", strings.TrimPrefix(backend.URL, "http://"))
+		}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -101,5 +103,18 @@ func TestTrustedForwardedHostAbsoluteAppAsset(t *testing.T) {
 	asset := request(strings.TrimPrefix(page.Body.String(), "https://"+browserHost))
 	if asset.Code != http.StatusOK || asset.Body.String() != "window.privateAppLoaded = true;" {
 		t.Fatalf("asset: status=%d body=%q", asset.Code, asset.Body.String())
+	}
+}
+
+func TestValidForwardedHost(t *testing.T) {
+	for _, host := range []string{"app.example", "r_session.qurl.site", "app.example:8443", "127.0.0.1", "[::1]", "[::1]:8443"} {
+		if !validForwardedHost(host) {
+			t.Errorf("rejected valid host %q", host)
+		}
+	}
+	for _, host := range []string{"", "a,b", "a b", "x\"><script>.example", "a;b=c", "a%2eb", "app:0", "app:65536", "app:+80", "a..b", "user@app", "app/path"} {
+		if validForwardedHost(host) {
+			t.Errorf("accepted invalid host %q", host)
+		}
 	}
 }
