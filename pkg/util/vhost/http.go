@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"time"
 
 	libio "github.com/fatedier/golib/io"
@@ -60,8 +61,12 @@ func NewHTTPReverseProxy(option HTTPReverseProxyOptions, vhostRouter *Routers) *
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.Out.Header["X-Forwarded-For"] = r.In.Header["X-Forwarded-For"]
 			r.SetXForwarded()
-			if option.TrustForwardedHost && r.In.Header.Get("X-Forwarded-Host") != "" {
-				r.Out.Header.Set("X-Forwarded-Host", r.In.Header.Get("X-Forwarded-Host"))
+			if values := r.In.Header.Values("X-Forwarded-Host"); option.TrustForwardedHost && len(values) == 1 {
+				host := values[0]
+				parsed, err := url.Parse("http://" + host)
+				if err == nil && host != "" && !strings.ContainsAny(host, ", \t\r\n/\\?#@") && parsed.Host == host && parsed.Hostname() != "" {
+					r.Out.Header.Set("X-Forwarded-Host", host)
+				}
 			}
 			req := r.Out
 			req.URL.Scheme = "http"

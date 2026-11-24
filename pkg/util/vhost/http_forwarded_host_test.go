@@ -1,6 +1,7 @@
 package vhost
 
 import (
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -24,21 +25,35 @@ func TestQURLTrustedBrowserHostSurvivesFRPVhost(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, tc := range []struct{ name, forwarded string }{
-			{"qurl_ingress_host", browserHost},
-			{"client_header", "attacker.example"},
-			{"missing_header", ""},
+		for _, tc := range []struct {
+			name, forwarded string
+			invalid         bool
+		}{
+			{"qurl_ingress_host", browserHost, false},
+			{"client_header", "attacker.example", false},
+			{"missing_header", "", false},
+			{"comma_list", "attacker.example, " + browserHost, true},
+			{"duplicate_lines", browserHost, true},
+			{"path", "browser.example/app", true},
+			{"userinfo", "attacker@browser.example", true},
+			{"invalid_port", "browser.example:bad", true},
+			{"valid_port", "browser.example:8443", false},
 		} {
-			t.Run(tc.name, func(t *testing.T) {
+			t.Run(fmt.Sprintf("trusted=%t/%s", trusted, tc.name), func(t *testing.T) {
 				request := httptest.NewRequest("GET", "http://"+routingHost+"/", nil)
-				request.Header.Set("X-Forwarded-Host", tc.forwarded)
+				if tc.forwarded != "" {
+					request.Header.Set("X-Forwarded-Host", tc.forwarded)
+				}
+				if tc.name == "duplicate_lines" {
+					request.Header.Add("X-Forwarded-Host", "attacker.example")
+				}
 				response := httptest.NewRecorder()
 				proxy.ServeHTTP(response, request)
 				if response.Code != http.StatusOK {
 					t.Fatalf("proxy status %d", response.Code)
 				}
 				want := routingHost
-				if trusted && tc.forwarded != "" {
+				if trusted && tc.forwarded != "" && !tc.invalid {
 					want = tc.forwarded
 				}
 				if response.Body.String() != want {
@@ -62,6 +77,7 @@ func TestTrustedForwardedHostAbsoluteAppAsset(t *testing.T) {
 			io.WriteString(w, "window.privateAppLoaded = true;")
 			return
 		}
+		// Lerd sets HTTPS for its TLS tunnel; this test covers host preservation only.
 		io.WriteString(w, "https://"+r.Header.Get("X-Forwarded-Host")+"/app.js")
 	}))
 	defer backend.Close()
